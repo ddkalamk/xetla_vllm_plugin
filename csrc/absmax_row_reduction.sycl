@@ -1,0 +1,150 @@
+/*******************************************************************************
+ * Copyright (c) 2022-2023 Intel Corporation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
+
+#include <cfloat>
+#include "timing_utils.h"
+#include "xetla.hpp"
+
+using namespace gpu::xetla;
+using namespace gpu::xetla::subgroup;
+
+template <typename in_dtype, int twidth, int theight, int bwidth, int bheight>
+struct absmax_row_reduction {
+  static KERNEL_FUNC inline void run(
+      sycl::nd_item<1> it, in_dtype* a_base, int swidth, int sheight,
+      int spitch, int scale_bs, float* c_base) {
+    const int group_id = static_cast<int>(it.get_group(0));
+    const int local_id = static_cast<int>(it.get_local_id(0));
+    const int total_rows = sheight;
+    const int total_cols = swidth;
+    const int tiles_per_row = ((total_cols + twidth - 1) / twidth) / scale_bs;
+    // Each work-item in the group processes one row within the group block.
+    const int group_base = group_id * theight;
+    const int row = group_base + local_id;
+    if (row >= total_rows)
+      return;
+
+    // Use a per-thread tile of height=1 so threads do not overlap rows.
+    using row_tile_desc_t =
+        tile_desc_t<twidth, 1, twidth, 1, reg_layout::tiled>;
+    using row_tile_t = tile_t<in_dtype, row_tile_desc_t>;
+    using row_payload_t = mem_payload_t<
+        mem_desc_t<in_dtype, mem_layout::row_major, mem_space::global>,
+        row_tile_desc_t, msg_type_v<row_tile_desc_t, mem_space::global>,
+        gpu_arch::Xe>;
+#ifdef ENABLE_PREFETCH
+    using row_prefetch_payload_t = subgroup::prefetch_payload_t<
+        mem_desc_t<in_dtype, mem_layout::row_major, mem_space::global>,
+        row_tile_desc_t, twidth, gpu_arch::Xe>;
+    constexpr int pf_dist = 8;
+#endif
+    row_tile_t row_tile;
+    row_payload_t row_payload(a_base + row * spitch, swidth, 1, spitch, 0, 0);
+#ifdef ENABLE_PREFETCH
+    row_prefetch_payload_t row_payload_prefetch(
+        a_base + row * spitch, swidth, 1, spitch, 0, 0);
+#endif
+    // accumulator for this thread's row
+    xetla_vector<float, twidth> src_reg_f32;
+    xetla_mask<row_tile_t::tile_size_x> mask_max;
+
+#ifdef ENABLE_PREFETCH
+#pragma unroll
+    for (int i = 0; i < pf_dist; i++) {
+      subgroup::tile_prefetch<cache_hint::cached, cache_hint::cached>(
+          row_payload_prefetch);
+      row_payload_prefetch.template update_tdesc<tdesc_update_dir::x_dir>(
+          row_tile_t::tile_size_x);
+    }
+    SW_BARRIER();
+#endif
+
+    for (int igs = 0; igs < scale_bs; igs++) {
+      xetla_vector<float, twidth> acc_vec(FLT_EPSILON);
+#pragma unroll
+      for (int t = 0; t < tiles_per_row; ++t) {
+#ifdef ENABLE_PREFETCH
+        subgroup::tile_prefetch<cache_hint::cached, cache_hint::cached>(
+            row_payload_prefetch);
+#endif
+        subgroup::tile_load<cache_hint::cached, cache_hint::cached>(
+            row_tile, row_payload);
+        // advance by this row-tile width
+        row_payload.template update_tdesc<tdesc_update_dir::x_dir>(
+            row_tile_t::tile_size_x);
+#ifdef ENABLE_PREFETCH
+        row_payload_prefetch.template update_tdesc<tdesc_update_dir::x_dir>(
+            row_tile_t::tile_size_x);
+#endif
+        // convert to float (per-lane) and take absolute value correctly
+        src_reg_f32 = xetla_abs<float, row_tile_t::tile_size_x>(
+            xetla_cvt<float, in_dtype, row_tile_t::tile_size_x>(
+                row_tile.reg.xetla_select<row_tile_t::tile_size_x, 1>(0)));
+        mask_max = src_reg_f32 > acc_vec;
+        acc_vec.xetla_merge(src_reg_f32, acc_vec, mask_max);
+      }
+
+      // compute final row max
+      float row_max =
+          xetla_reduce<float, float, twidth, reduce_op::max>(acc_vec);
+      // compute reciprocal in double for higher accuracy and refine with 4 NR
+      // iterations
+      double row_max_d = static_cast<double>(row_max);
+      double invd = 1.0 / row_max_d;
+      invd = invd * (2.0 - row_max_d * invd);
+      invd = invd * (2.0 - row_max_d * invd);
+      invd = invd * (2.0 - row_max_d * invd);
+      invd = invd * (2.0 - row_max_d * invd);
+      // store final scale as float
+      c_base[igs * sheight + row] = static_cast<float>(127.0 * invd);
+    }
+  }
+};
+
+template <typename in_dtype, int twidth, int theight>
+class compute_scale_kernel;
+
+template <typename in_dtype, int twidth = 128, int theight = 32>
+sycl::event absmax_row_reduction_impl(
+    sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
+    in_dtype* A, float* C) {
+  const size_t local_size = theight; // threads per group: theight
+  const size_t num_groups =
+      (rows + theight - 1) / theight; // number of groups needed
+  const size_t global_size = num_groups * local_size;
+
+  sycl::event e_scale;
+  {
+    Timer t("absmax_row_reduction_submit");
+    e_scale = queue.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for<class compute_scale_kernel<in_dtype, twidth, theight>>(
+          sycl::nd_range<1>(
+              sycl::range<1>(global_size), sycl::range<1>(local_size)),
+          [=](sycl::nd_item<1> it) {
+            absmax_row_reduction<in_dtype, twidth, theight, twidth, theight>::
+                run(it, A, cols, rows, ld, scale_bs, C);
+          });
+    });
+  }
+
+  return e_scale;
+}
+
+sycl::event absmax_row_reduction_run(
+    sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
+    bf16* A, float* C) {
+  return absmax_row_reduction_impl(queue, rows, cols, ld, scale_bs, A, C);
+}

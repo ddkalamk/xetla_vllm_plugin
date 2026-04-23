@@ -1,0 +1,767 @@
+/*******************************************************************************
+ * Copyright (c) 2022-2023 Intel Corporation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
+
+#include <cxxabi.h>
+#include <map>
+#include <tuple>
+#include <typeinfo>
+#include <utility>
+#include "xetla.hpp"
+
+#include "timing_utils.h"
+
+// #define PROFILE_KERNEL
+
+#ifdef PROFILE_KERNEL
+void print_sycl_time(
+    sycl::event e, sycl::event start, sycl::event end, const char* tag) {
+  if (timing_enabled < 3)
+    return;
+  e.wait();
+  uint64_t elapsed =
+      end.get_profiling_info<sycl::info::event_profiling::command_start>() -
+      start.get_profiling_info<sycl::info::event_profiling::command_end>();
+  std::cout << tag << " Execution time: " << elapsed / 1000 << " (usec)\n";
+}
+#else
+void print_sycl_time(sycl::event e, const char* tag) {
+  if (timing_enabled < 3)
+    return;
+  e.wait();
+  uint64_t elapsed =
+      e.get_profiling_info<sycl::info::event_profiling::command_end>() -
+      e.get_profiling_info<sycl::info::event_profiling::command_start>();
+  std::cout << tag << " Execution time: " << elapsed / 1000 << " (usec)\n";
+}
+#endif
+
+using namespace sycl;
+using namespace gpu::xetla;
+
+namespace syclex = sycl::ext::oneapi::experimental;
+
+template <typename T>
+inline std::string get_class_name() {
+  auto cname = abi::__cxa_demangle(typeid(T).name(), 0, 0, NULL);
+  std::string name(cname);
+  free(cname);
+  return name;
+}
+
+// A class for forced loop unrolling at compile time
+// These macro utils are implemented
+// based on the initial code by pujiang.he@intel.com.
+template <int i>
+struct compile_time_for {
+  template <typename Lambda, typename... Args>
+  inline static void op(const Lambda& func, Args... args) {
+    compile_time_for<i - 1>::op(func, std::forward<Args>(args)...);
+    func(std::integral_constant<int, i - 1>{}, std::forward<Args>(args)...);
+  }
+};
+template <>
+struct compile_time_for<1> {
+  template <typename Lambda, typename... Args>
+  inline static void op(const Lambda& func, Args... args) {
+    func(std::integral_constant<int, 0>{}, std::forward<Args>(args)...);
+  }
+};
+template <>
+struct compile_time_for<0> {
+  // 0 loops, do nothing
+  template <typename Lambda, typename... Args>
+  inline static void op(const Lambda& func, Args... args) {}
+};
+
+template <
+    uint32_t WgM = 64, uint32_t SgM = 64, uint32_t WgN = 128, uint32_t SgN = 16,
+    uint32_t SgK = 32, bool UseExternalScaleA = false, bool EnableBias_ = false>
+class int2_bf16_base_gemm_config {
+ public:
+  static constexpr bool EnableBias = EnableBias_;
+  static constexpr size_t wg_tile_m = WgM;
+  static constexpr size_t wg_tile_n = WgN;
+  static constexpr size_t sg_tile_m = SgM;
+  static constexpr size_t sg_tile_n = SgN;
+  static constexpr size_t sg_tile_k = SgK;
+  static constexpr bool use_external_scale_a = UseExternalScaleA;
+  static constexpr int mma_xmx_m = SgM;
+  static constexpr size_t local_kslicing = 1;
+  static constexpr size_t global_kslicing = 1;
+
+  static constexpr uint32_t periodic_sync_interval = 1;
+  static constexpr uint32_t prefetch_distance = 4;
+
+  static constexpr gpu_arch arch_tag = gpu_arch::Xe;
+
+  using data_type_a = bf16;
+  using data_type_b = int2x16;
+  using data_type_c = bf16;
+  using data_type_acc = int32_t;
+  using data_type_mma_a = int8_t;
+  using data_type_mma_b = int8_t;
+
+  using tile_shape = gpu::xetla::group::tile_shape_t<
+      wg_tile_n, wg_tile_m, sg_tile_n, sg_tile_m>;
+
+  using mem_desc_a_t = gpu::xetla::mem_desc_t<
+      data_type_a, mem_layout::row_major, mem_space::global>;
+  using mem_desc_b_t = gpu::xetla::mem_desc_t<
+      data_type_b, mem_layout::row_major, mem_space::global>;
+  using mem_desc_c_t = gpu::xetla::mem_desc_t<
+      data_type_c, mem_layout::row_major, mem_space::global>;
+
+  // For int8 XMX operations
+  using compute_attr = gpu::xetla::group::compute_attr_t<
+      data_type_mma_a, data_type_mma_b, data_type_acc>;
+  using perf_tuning_knob = gpu::xetla::group::perf_tuning_knob_t<
+      sg_tile_k, prefetch_distance, periodic_sync_interval>;
+  // scale_gs is a runtime field in gemm arguments; compute_policy signature
+  // omits it here
+  using compute_policy = gpu::xetla::group::compute_policy_int2_bf16_dpas_xmx<
+      compute_attr, perf_tuning_knob, float, float, mma_xmx_m, arch_tag>;
+  using gemm_t = gpu::xetla::group::gemm_t<
+      compute_policy, tile_shape, mem_desc_a_t, mem_desc_b_t>;
+
+  using group_swizzle = gpu::xetla::kernel::group_swizzle_default<arch_tag>;
+  using bias_op_t = gpu::xetla::subgroup::bias_add_op_t<data_type_c, arch_tag>;
+  using none_op_t = gpu::xetla::subgroup::none_op_t;
+
+  // Select tile_op based on template parameters (compile-time constants)
+  using tile_op_t =
+      typename std::conditional<EnableBias, bias_op_t, none_op_t>::type;
+
+  // Use tile_op epilogue policy if any post-ops are enabled, otherwise use
+  // default
+  using epilogue_policy_t = typename std::conditional<
+      EnableBias,
+      gpu::xetla::group::epilogue_policy_tile_op<tile_op_t, arch_tag>,
+      gpu::xetla::group::epilogue_policy_default<arch_tag>>::type;
+
+  using epilogue_t = gpu::xetla::group::epilogue_t<
+      epilogue_policy_t, tile_shape, mem_desc_c_t>;
+
+  using gemm_op_t = gpu::xetla::kernel::gemm_universal_t<
+      gpu::xetla::kernel::dispatch_policy_int2_bf16_dpas_kslicing<
+          group_swizzle, global_kslicing, local_kslicing, use_external_scale_a>,
+      gemm_t, epilogue_t>;
+
+  static inline auto create_epilogue_args(
+      const size_t matrix_n, data_type_c* bias_ptr) {
+    if constexpr (EnableBias) {
+      // Only bias enabled
+      typename bias_op_t::shape_t bias_shape(matrix_n, 1, matrix_n);
+      typename bias_op_t::arguments_t bias_args(bias_ptr, bias_shape);
+      return typename epilogue_t::arguments_t(bias_args);
+    } else {
+      // No post-ops enabled
+      return typename epilogue_t::arguments_t();
+    }
+  }
+
+  static inline typename gemm_op_t::arguments_t get_gemm_arg(
+      const size_t matrix_m, const size_t matrix_n, const size_t matrix_k,
+      data_type_a* A, data_type_b* B, data_type_c* C, float* scale_A,
+      float* scale_B, data_type_c* bias, data_type_acc* Acc = nullptr,
+      uint32_t* Cnt = nullptr) {
+    uint32_t scale_a_ld = matrix_m;
+    uint32_t scale_b_ld = matrix_n;
+
+    if constexpr (use_external_scale_a) {
+      // External mode: pass scale_a pointer from device memory
+      if constexpr (EnableBias) {
+        auto epilogue_args = create_epilogue_args(matrix_n, bias);
+        return typename gemm_op_t::arguments_t(
+            matrix_m, matrix_k, matrix_n, A, matrix_k, B, matrix_n, C, matrix_n,
+            scale_A, scale_a_ld, scale_B, scale_b_ld, Acc, Cnt, epilogue_args);
+      } else {
+        return typename gemm_op_t::arguments_t(
+            matrix_m, matrix_k, matrix_n, A, matrix_k, B, matrix_n, C, matrix_n,
+            scale_A, scale_a_ld, scale_B, scale_b_ld, Acc, Cnt);
+      }
+    } else {
+      // Internal SLM mode: pass empty scale_a_base_t (computed on-the-fly in
+      // kernel)
+      typename gemm_op_t::scale_a_base_t empty_scale_a{};
+      if constexpr (EnableBias) {
+        auto epilogue_args = create_epilogue_args(matrix_n, bias);
+        return typename gemm_op_t::arguments_t(
+            matrix_m, matrix_k, matrix_n, A, matrix_k, B, matrix_n, C, matrix_n,
+            empty_scale_a, scale_a_ld, scale_B, scale_b_ld, Acc, Cnt,
+            epilogue_args);
+      } else {
+        return typename gemm_op_t::arguments_t(
+            matrix_m, matrix_k, matrix_n, A, matrix_k, B, matrix_n, C, matrix_n,
+            empty_scale_a, scale_a_ld, scale_B, scale_b_ld, Acc, Cnt);
+      }
+    }
+  }
+};
+
+#if 0
+// Template base class for int2_dequant (must be in header for template instantiation)
+template <uint32_t GKSlicing, uint32_t WgM = 64, uint32_t SgM = 64, uint32_t WgN = 128, uint32_t SgN = 16, uint32_t SgK = 32, uint32_t XMX_M = SgM, typename AccType = int32_t, typename CType = bf16, bool UseExternalScaleA = false>
+class int2_dequant_base {
+public:
+    static constexpr size_t wg_m = WgM;
+    static constexpr size_t wg_n = WgN;
+    static constexpr size_t sg_m = SgM;
+    static constexpr size_t sg_n = SgN;
+    static constexpr size_t sg_k = SgK;
+    static constexpr uint32_t mma_xmx_m = XMX_M;
+    static constexpr size_t num_buffer = 1;
+    static constexpr size_t local_kslicing = 1;
+    static constexpr size_t global_kslicing = GKSlicing;
+    static constexpr size_t scale_gs = 1;
+    static constexpr bool use_external_scale_a = UseExternalScaleA;
+    
+    using data_type_a = bf16;
+    using data_type_b = int2x16;
+    using data_type_c = CType;
+    using data_type_acc = AccType;
+};
+
+// Template base class for int2_dequant with configurable global_kslicing and tile sizes
+template<class Test, bool EnableBias_ = false, bool EnableSiLU_ = false>
+class int2_bf16_fused_gemm_config {
+public:
+    static constexpr bool EnableBias = EnableBias_;
+    static constexpr bool EnableSiLU = EnableSiLU_;
+    static constexpr bool use_external_scale_a = Test::use_external_scale_a;
+    static constexpr uint32_t global_kslicing = Test::global_kslicing;
+    static constexpr uint32_t local_kslicing = Test::local_kslicing;
+    // // runtime-selectable scale group size: if g_scale_gs != 0 use it, else fall back to Test::scale_gs
+    // uint32_t scale_gs = g_scale_gs ? g_scale_gs : Test::scale_gs;
+
+    static constexpr size_t wg_tile_m = Test::wg_m;
+    static constexpr size_t wg_tile_n = Test::wg_n;
+    static constexpr size_t sg_tile_m = Test::sg_m;
+    static constexpr size_t sg_tile_n = Test::sg_n;
+    static constexpr size_t sg_tile_k = Test::sg_k;
+
+    using data_type_a = typename Test::data_type_a;
+    using data_type_b = typename Test::data_type_b;
+    using data_type_acc = typename Test::data_type_acc; // Accumulator type (internal computation)
+    using data_type_c = typename Test::data_type_c; // Output C matrix type
+    
+    using tile_shape = xetla::group::tile_shape_t<wg_tile_n, wg_tile_m, sg_tile_n, sg_tile_m>;
+    static constexpr uint32_t periodic_sync_interval = 1;
+    static constexpr uint32_t prefetch_distance = 4;
+
+    using mem_desc_a_t = xetla::mem_desc_t<data_type_a, mem_layout::row_major, mem_space::global>;
+    using mem_desc_b_t = xetla::mem_desc_t<data_type_b, mem_layout::row_major, mem_space::global>;
+    using mem_desc_c_t = xetla::mem_desc_t<data_type_c, mem_layout::row_major, mem_space::global>;
+
+    // For int8 XMX operations
+    using data_type_mma_a = int8_t;
+    using data_type_mma_b = int8_t;
+    using compute_attr = xetla::group::compute_attr_t<data_type_mma_a, data_type_mma_b, data_type_acc>;
+    using perf_tuning_knob = xetla::group::perf_tuning_knob_t<sg_tile_k, prefetch_distance, periodic_sync_interval>;
+    // scale_gs is a runtime field in gemm arguments; compute_policy signature omits it here
+    using compute_policy = xetla::group::compute_policy_int2_bf16_dpas_xmx<compute_attr, perf_tuning_knob, float, float, static_cast<int>(Test::mma_xmx_m), arch_tag>;
+    using gemm_t = xetla::group::gemm_t<compute_policy, tile_shape, mem_desc_a_t, mem_desc_b_t>;
+
+    // Post-op fusion in kernel epilogue using compile-time template parameters
+    using bias_op_t = xetla::subgroup::bias_add_op_t<data_type_c, arch_tag>;
+    using silu_op_t = xetla::subgroup::silu_op_t;
+    using bias_silu_op_t = xetla::subgroup::chained_tile_op_t<bias_op_t, silu_op_t>;
+    using none_op_t = xetla::subgroup::none_op_t;
+    
+    // Select tile_op based on template parameters (compile-time constants)
+    using tile_op_t = typename std::conditional<EnableBias && EnableSiLU, bias_silu_op_t,
+        typename std::conditional<EnableBias, bias_op_t,
+        typename std::conditional<EnableSiLU, silu_op_t, none_op_t>::type>::type>::type;
+    
+    // Use tile_op epilogue policy if any post-ops are enabled, otherwise use default
+    using epilogue_policy_t = typename std::conditional<EnableBias || EnableSiLU,
+        xetla::group::epilogue_policy_tile_op<tile_op_t, arch_tag>,
+        xetla::group::epilogue_policy_default<arch_tag>>::type;
+    
+    using epilogue_t = xetla::group::epilogue_t<epilogue_policy_t, tile_shape, mem_desc_c_t>;
+    using group_swizzle = xetla::kernel::group_swizzle_default<arch_tag>;
+    constexpr bool use_external_scale_a = Test::use_external_scale_a;
+    using gemm_op_t = xetla::kernel::gemm_universal_t<gpu::xetla::kernel::dispatch_policy_int2_bf16_dpas_kslicing<group_swizzle, global_kslicing, local_kslicing, use_external_scale_a>, gemm_t, epilogue_t>;
+
+    // Helper lambda to create epilogue arguments based on enabled post-ops
+    auto create_epilogue_args(const size_t matrix_n, data_type_c* bias_ptr) {
+        if constexpr (EnableBias && EnableSiLU) {
+            // Both bias and SiLU enabled
+            typename bias_op_t::shape_t bias_shape(matrix_n, 1, matrix_n);
+            typename bias_op_t::arguments_t bias_args(bias_ptr, bias_shape);
+            typename silu_op_t::arguments_t silu_args{};
+            return typename epilogue_t::arguments_t(typename tile_op_t::arguments_t(bias_args, silu_args));
+        } else if constexpr (EnableBias) {
+            // Only bias enabled
+            typename bias_op_t::shape_t bias_shape(matrix_n, 1, matrix_n);
+            typename bias_op_t::arguments_t bias_args(bias_ptr, bias_shape);
+            return typename epilogue_t::arguments_t(bias_args);
+        } else if constexpr (EnableSiLU) {
+            // Only SiLU enabled
+            typename silu_op_t::arguments_t silu_args{};
+            return typename epilogue_t::arguments_t(silu_args);
+        } else {
+            // No post-ops enabled
+            return typename epilogue_t::arguments_t();
+        }
+    }
+
+    inline typename gemm_op_t::arguments_t get_gemm_arg(const size_t matrix_m, const size_t matrix_n, const size_t matrix_k, data_type_a *A, data_type_b *B, data_type_c *C, float *scale_A, float *scale_B, data_type_c *bias, data_type_acc *Acc = nullptr, uint32_t *Cnt = nullptr) {
+        uint32_t scale_a_ld = matrix_m;
+        uint32_t scale_b_ld = matrix_n;
+
+        if constexpr (use_external_scale_a) {
+            // External mode: pass scale_a pointer from device memory
+            if constexpr (EnableBias || EnableSiLU) {
+                auto epilogue_args = create_epilogue_args(matrix_n, bias);
+                return typename gemm_op_t::arguments_t(matrix_m, matrix_k, matrix_n, A, matrix_k, B, matrix_n, C, matrix_n, scale_A, scale_a_ld, scale_B, scale_b_ld, Acc, Cnt, epilogue_args);
+            } else {
+                return typename gemm_op_t::arguments_t(matrix_m, matrix_k, matrix_n, A, matrix_k, B, matrix_n, C, matrix_n, scale_A, scale_a_ld, scale_B, scale_b_ld, Acc, Cnt);
+            }
+        } else {
+            // Internal SLM mode: pass empty scale_a_base_t (computed on-the-fly in kernel)
+            typename gemm_op_t::scale_a_base_t empty_scale_a{};
+            if constexpr (EnableBias || EnableSiLU) {
+                auto epilogue_args = create_epilogue_args(matrix_n, bias);
+                return typename gemm_op_t::arguments_t(matrix_m, matrix_k, matrix_n, A, matrix_k, B, matrix_n, C, matrix_n, empty_scale_a, scale_a_ld, scale_B, scale_b_ld, Acc, Cnt, epilogue_args);
+            } else {
+                return typename gemm_op_t::arguments_t(matrix_m, matrix_k, matrix_n, A, matrix_k, B, matrix_n, C, matrix_n, empty_scale_a, scale_a_ld, scale_B, scale_b_ld, Acc, Cnt);
+            }
+        }
+    }
+};
+#endif
+
+template <class Test>
+sycl::event int2_bf16_fused_gemm_run_impl(
+    sycl::queue& queue, const size_t matrix_m, const size_t matrix_n,
+    const size_t matrix_k, typename Test::data_type_a* A,
+    typename Test::data_type_b* B, typename Test::data_type_c* C,
+    float* scale_A, float* scale_B, typename Test::data_type_c* bias,
+    typename Test::data_type_acc* Acc = nullptr, uint32_t* Cnt = nullptr) {
+  using namespace gpu;
+  using gemm_op_t = Test::gemm_op_t;
+
+  auto q = queue;
+  if (timing_enabled >= 3) {
+    sycl::device dev = queue.get_device();
+    sycl::context ctx = queue.get_context();
+    sycl::property_list queue_properties{
+        sycl::property::queue::in_order(),
+        sycl::property::queue::enable_profiling()};
+
+    // Create a new queue with profiling enabled, using the same device and
+    // context
+    sycl::queue profiling_queue{ctx, dev, queue_properties};
+
+    q = profiling_queue;
+  }
+  // size_t size_acc = gemm_op_t::get_acc_buf_size(matrix_m, matrix_n);
+  // size_t size_cnt = gemm_op_t::get_cnt_buf_size(matrix_m, matrix_n);
+
+  // size_t size_acc_bytes = size_acc * sizeof(data_type_acc);
+  // size_t size_cnt_bytes = size_cnt * sizeof(uint32_t);
+
+  // std::cout << "Matrix dimensions: " << matrix_m << "x" << matrix_k << " * "
+  // << matrix_k << "x" << matrix_n << "\n";
+
+  // Print tile size configuration:
+  // std::cout << "Tile size configuration:\n";
+  // std::cout << "  wg_m = " << Test::wg_tile_m << ", wg_n = " <<
+  // Test::wg_tile_n << "\n"; std::cout << "  sg_m = " << Test::sg_tile_m << ",
+  // sg_n = " << Test::sg_tile_n << ", sg_k = " << Test::sg_tile_k << "\n";
+  // std::cout << "  scale_gs = " << Test::scale_gs << "\n";
+
+  // set up gemm arguments for first set to check compatibility
+  typename gemm_op_t::arguments_t gemm_arg = Test::get_gemm_arg(
+      matrix_m, matrix_n, matrix_k, A, B, C, scale_A, scale_B, bias, Acc, Cnt);
+
+  if (!gemm_op_t::can_implement(gemm_arg)) {
+    std::cout << "The arguments cannot be supported, aborting ... "
+              << std::endl;
+    // FAIL();
+    exit(1);
+  }
+  sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
+
+  try {
+#ifdef PROFILE_KERNEL
+    auto start = syclex::submit_profiling_tag(queue);
+#endif
+    sycl::event e_esimd;
+    // set up gemm arguments for current set and submit
+    {
+      Timer t("int2_bf16_fused_gemm_submit");
+      e_esimd = q.submit([&](handler& cgh) {
+        cgh.parallel_for<Test>(nd_range, [=](nd_item<3> item) KERNEL_MAIN {
+          slm_barrier_init<gemm_op_t>();
+          gemm_op_t gemm_op;
+          gemm_op(item, gemm_arg);
+        });
+      });
+    }
+#ifdef PROFILE_KERNEL
+    auto end = syclex::submit_profiling_tag(queue);
+    print_sycl_time(e_esimd, start, end, "GEMM");
+#else
+    print_sycl_time(e_esimd, "GEMM");
+#endif
+    return e_esimd;
+
+  } catch (sycl::exception const& e) {
+    std::cout << "SYCL exception caught: " << e.what() << '\n';
+    // FAIL();
+    exit(1);
+  }
+}
+
+// Function to run test with the correct global_kslicing template and tile size
+// optimization
+// template<uint32_t WgM = 64, uint32_t SgM = 64, uint32_t WgN = 128, uint32_t
+// SgN = 16, uint32_t SgK = 32, bool UseExternalScaleA = false>
+template <
+    uint32_t WgM, uint32_t SgM, uint32_t WgN, uint32_t SgN, uint32_t SgK,
+    bool UseExternalScaleA>
+sycl::event int2_bf16_fused_gemm_bias_run(
+    sycl::queue& q, const size_t m, const size_t n, const size_t k, bf16* A,
+    int32_t* B, bf16* C, float* scale_A, float* scale_B, bf16* bias) {
+  const bool fuse_bias = (bias != nullptr);
+  if (fuse_bias) {
+    return int2_bf16_fused_gemm_run_impl<int2_bf16_base_gemm_config<
+        WgM, SgM, WgN, SgN, SgK, UseExternalScaleA, true>>(
+        q, m, n, k, A, (int2x16*)B, C, scale_A, scale_B, bias);
+  } else {
+    return int2_bf16_fused_gemm_run_impl<int2_bf16_base_gemm_config<
+        WgM, SgM, WgN, SgN, SgK, UseExternalScaleA, false>>(
+        q, m, n, k, A, (int2x16*)B, C, scale_A, scale_B, bias);
+  }
+}
+
+sycl::event int2_bf16_fused_gemm_run(
+    sycl::queue& q, const size_t m, const size_t n, const size_t k, bf16* A,
+    int32_t* B, bf16* C, float* scale_A, float* scale_B, bf16* bias) {
+  if (m > 1) {
+    return int2_bf16_fused_gemm_bias_run<32, 8, 256, 128, 32, true>(
+        q, m, n, k, A, B, C, scale_A, scale_B, bias);
+  } else {
+    return int2_bf16_fused_gemm_bias_run<1, 1, 128, 128, 32, true>(
+        q, m, n, k, A, B, C, scale_A, scale_B, bias);
+  }
+}
+
+sycl::event int2_bf16_fused_gemm_run_dynamic(
+    sycl::queue& q, const size_t m, const size_t n, const size_t k, bf16* A,
+    int32_t* B, bf16* C, float* scale_B, bf16* bias) {
+  if (m > 1) {
+    return int2_bf16_fused_gemm_bias_run<32, 8, 256, 128, 32, false>(
+        q, m, n, k, A, B, C, nullptr, scale_B, bias);
+  } else {
+    return int2_bf16_fused_gemm_bias_run<1, 1, 128, 128, 32, false>(
+        q, m, n, k, A, B, C, nullptr, scale_B, bias);
+  }
+}
+
+static constexpr std::pair<
+    std::pair<int, int>, std::tuple<int, int, int, int, int, int>>
+    best_gemm_configs_bmg[] = {
+        {{0, 0}, {32, 8, 64, 32, 32, 1}}, // default
+        {{4096, 2048}, {64, 8, 128, 128, 32, 1}},
+        {{2048, 2048}, {32, 8, 256, 128, 64, 1}},
+        {{8192, 2048}, {32, 8, 256, 128, 64, 1}},
+        {{16384, 2048}, {32, 8, 256, 128, 64, 1}},
+        {{2048, 8192}, {64, 8, 256, 128, 64, 1}},
+        {{2048, 16384}, {64, 8, 256, 128, 64, 1}},
+        {{2240, 1600}, {64, 8, 160, 160, 32, 1}},
+        {{1600, 1600}, {32, 8, 160, 160, 32, 1}},
+        {{4352, 1600}, {32, 8, 256, 128, 64, 1}},
+        {{8704, 1600}, {32, 8, 256, 128, 64, 1}},
+        {{1600, 4352}, {64, 8, 160, 160, 32, 1}},
+        {{1600, 8704}, {64, 8, 160, 160, 32, 1}},
+        {{6144, 4096}, {64, 8, 256, 128, 64, 1}},
+        {{4096, 4096}, {64, 8, 256, 128, 64, 1}},
+        {{14336, 4096}, {64, 8, 256, 128, 64, 1}},
+        {{28672, 4096}, {64, 8, 256, 128, 64, 1}},
+        {{4096, 14336}, {64, 8, 256, 128, 64, 1}},
+        {{4096, 28672}, {64, 8, 256, 128, 64, 1}},
+};
+static constexpr std::pair<
+    std::pair<int, int>, std::tuple<int, int, int, int, int, int>>
+    best_gemv_configs_bmg[] = {
+        {{0, 0}, {1, 1, 64, 16, 32, 0}},
+        {{4096, 2048}, {1, 1, 128, 16, 128, 0}},
+        {{2048, 2048}, {1, 1, 32, 16, 256, 0}},
+        {{8192, 2048}, {1, 1, 128, 32, 128, 0}},
+        {{16384, 2048}, {1, 1, 128, 32, 128, 0}},
+        {{2048, 8192}, {1, 1, 128, 32, 256, 0}},
+        {{2048, 16384}, {1, 1, 128, 32, 256, 0}},
+        {{2240, 1600}, {1, 1, 32, 16, 160, 0}},
+        {{1600, 1600}, {1, 1, 32, 16, 160, 0}},
+        {{4352, 1600}, {1, 1, 128, 16, 160, 0}},
+        {{8704, 1600}, {1, 1, 128, 16, 160, 0}},
+        {{1600, 4352}, {1, 1, 32, 32, 256, 0}},
+        {{1600, 8704}, {1, 1, 32, 32, 256, 0}},
+        {{6144, 4096}, {1, 1, 128, 16, 128, 0}},
+        {{4096, 4096}, {1, 1, 128, 16, 128, 0}},
+        {{14336, 4096}, {1, 1, 128, 32, 128, 0}},
+        {{28672, 4096}, {1, 1, 128, 32, 128, 0}},
+        {{4096, 14336}, {1, 1, 128, 16, 128, 0}},
+        {{4096, 28672}, {1, 1, 128, 16, 128, 0}},
+};
+// LNL configs
+static constexpr std::pair<
+    std::pair<int, int>, std::tuple<int, int, int, int, int, int>>
+    best_gemm_configs_lnl[] = {
+        {{0, 0}, {32, 8, 64, 32, 32, 1}}, // default
+        {{4096, 2048}, {32, 8, 256, 128, 64, 1}},
+        {{2048, 2048}, {32, 8, 128, 128, 32, 1}},
+        {{8192, 2048}, {64, 8, 128, 128, 32, 1}},
+        {{16384, 2048}, {64, 8, 128, 128, 32, 1}},
+        {{2048, 8192}, {64, 8, 256, 128, 32, 1}},
+        {{2048, 16384}, {64, 8, 256, 128, 32, 1}},
+        {{2240, 1600}, {64, 8, 160, 160, 32, 1}},
+        {{1600, 1600}, {64, 8, 160, 160, 32, 1}},
+        {{4352, 1600}, {16, 8, 256, 128, 32, 1}},
+        {{8704, 1600}, {16, 8, 256, 128, 32, 1}},
+        {{1600, 4352}, {64, 8, 160, 160, 32, 1}},
+        {{1600, 8704}, {64, 8, 160, 160, 32, 1}},
+        {{6144, 4096}, {16, 8, 256, 128, 32, 1}},
+        {{4096, 4096}, {32, 8, 256, 128, 32, 1}},
+        {{14336, 4096}, {128, 8, 128, 128, 32, 1}},
+        {{28672, 4096}, {128, 8, 128, 128, 32, 1}},
+        {{4096, 14336}, {128, 8, 128, 128, 64, 1}},
+        {{4096, 28672}, {128, 8, 128, 128, 64, 1}},
+};
+static constexpr std::pair<
+    std::pair<int, int>, std::tuple<int, int, int, int, int, int>>
+    best_gemv_configs_lnl[] = {
+        {{0, 0}, {1, 1, 64, 16, 32, 0}},
+        {{4096, 2048}, {1, 1, 128, 128, 32, 0}},
+        {{2048, 2048}, {1, 1, 64, 16, 128, 0}},
+        {{8192, 2048}, {1, 1, 128, 32, 32, 1}},
+        {{16384, 2048}, {1, 1, 128, 32, 32, 1}},
+        {{2048, 8192}, {1, 1, 32, 32, 128, 0}},
+        {{2048, 16384}, {1, 1, 32, 32, 128, 0}},
+        {{2240, 1600}, {1, 1, 80, 16, 160, 0}},
+        {{1600, 1600}, {1, 1, 64, 16, 160, 0}},
+        {{4352, 1600}, {1, 1, 128, 32, 160, 0}},
+        {{8704, 1600}, {1, 1, 128, 32, 160, 0}},
+        {{1600, 4352}, {1, 1, 64, 16, 256, 0}},
+        {{1600, 8704}, {1, 1, 64, 16, 256, 0}},
+        {{6144, 4096}, {1, 1, 32, 32, 32, 1}},
+        {{4096, 4096}, {1, 1, 128, 32, 32, 0}},
+        {{14336, 4096}, {1, 1, 128, 32, 32, 1}},
+        {{28672, 4096}, {1, 1, 128, 32, 32, 1}},
+        {{4096, 14336}, {1, 1, 32, 32, 32, 1}},
+        {{4096, 28672}, {1, 1, 32, 32, 32, 1}},
+};
+
+// PTL configs
+static constexpr std::pair<
+    std::pair<int, int>, std::tuple<int, int, int, int, int, int>>
+    best_gemm_configs_ptl[] = {
+        {{0, 0}, {32, 8, 64, 32, 32, 1}}, // default
+        {{4096, 2048}, {64, 8, 256, 128, 32, 1}},
+        {{2048, 2048}, {64, 8, 256, 128, 32, 1}},
+        {{8192, 2048}, {128, 8, 128, 128, 32, 1}},
+        {{16384, 2048}, {64, 8, 128, 128, 32, 1}},
+        {{2048, 8192}, {128, 8, 256, 128, 64, 1}},
+        {{2048, 16384}, {128, 8, 128, 128, 64, 1}},
+        {{2240, 1600}, {64, 8, 160, 160, 32, 1}},
+        {{1600, 1600}, {64, 8, 160, 160, 32, 1}},
+        {{4352, 1600}, {64, 8, 128, 128, 32, 1}},
+        {{8704, 1600}, {64, 8, 128, 128, 64, 1}},
+        {{1600, 4352}, {128, 8, 160, 160, 32, 1}},
+        {{1600, 8704}, {64, 8, 160, 160, 32, 1}},
+        {{6144, 4096}, {128, 8, 128, 128, 64, 1}},
+        {{4096, 4096}, {64, 8, 256, 128, 64, 1}},
+        {{14336, 4096}, {128, 8, 128, 128, 64, 1}},
+        {{28672, 4096}, {128, 8, 128, 128, 64, 1}},
+        {{4096, 14336}, {128, 8, 128, 128, 64, 1}},
+        {{4096, 28672}, {16, 8, 256, 128, 32, 1}},
+};
+static constexpr std::pair<
+    std::pair<int, int>, std::tuple<int, int, int, int, int, int>>
+    best_gemv_configs_ptl[] = {
+        {{0, 0}, {1, 1, 64, 16, 32, 0}},
+        {{4096, 2048}, {1, 1, 64, 32, 128, 0}},
+        {{2048, 2048}, {1, 1, 128, 16, 128, 0}},
+        {{8192, 2048}, {1, 1, 128, 32, 128, 0}},
+        {{16384, 2048}, {1, 1, 128, 64, 32, 0}},
+        {{2048, 8192}, {1, 1, 64, 16, 256, 0}},
+        {{2048, 16384}, {1, 1, 64, 16, 256, 0}},
+        {{2240, 1600}, {1, 1, 32, 16, 32, 0}},
+        {{1600, 1600}, {1, 1, 64, 16, 160, 0}},
+        {{4352, 1600}, {1, 1, 128, 16, 160, 0}},
+        {{8704, 1600}, {1, 1, 128, 32, 160, 0}},
+        {{1600, 4352}, {1, 1, 64, 16, 128, 0}},
+        {{1600, 8704}, {1, 1, 64, 32, 128, 0}},
+        {{6144, 4096}, {1, 1, 128, 32, 128, 0}},
+        {{4096, 4096}, {1, 1, 64, 32, 128, 0}},
+        {{14336, 4096}, {1, 1, 128, 64, 128, 0}},
+        {{28672, 4096}, {1, 1, 128, 32, 128, 0}},
+        {{4096, 14336}, {1, 1, 64, 32, 128, 0}},
+        {{4096, 28672}, {1, 1, 64, 32, 128, 0}},
+};
+
+typedef sycl::event (*ft)(
+    sycl::queue& q, const size_t m, const size_t n, const size_t k, bf16* A,
+    int32_t* B, bf16* C, float* scale_A, float* scale_B, bf16* bias);
+static std::map<std::tuple<int, int, int, int, int, int>, ft> inst_map;
+static std::map<std::pair<int, int>, std::tuple<int, int, int, int, int, int>>
+    best_gemm_configs, best_gemv_configs;
+static ft default_gemm_config = nullptr, default_gemv_config = nullptr;
+static bool initialized = false;
+
+template <typename T, T& list>
+void inst_helper(bool isGemm) {
+  constexpr int N = sizeof(list) / sizeof(list[0]);
+  compile_time_for<N>::op([&](auto idx) {
+    constexpr auto& f = list[idx].first;
+    constexpr auto& l = list[idx].second;
+    constexpr uint32_t WgM = std::get<0>(l);
+    constexpr uint32_t SgM = std::get<1>(l);
+    constexpr uint32_t WgN = std::get<2>(l);
+    constexpr uint32_t SgN = std::get<3>(l);
+    constexpr uint32_t SgK = std::get<4>(l);
+    constexpr bool UseExternalScaleA = std::get<5>(l);
+    auto fn = &int2_bf16_fused_gemm_bias_run<
+        WgM, SgM, WgN, SgN, SgK, UseExternalScaleA>;
+    // printf("addr = %p\n", fn);
+    inst_map[l] = fn;
+    if (isGemm)
+      best_gemm_configs[f] = l;
+    if constexpr (idx == 0)
+      default_gemm_config = fn;
+    else
+      best_gemv_configs[f] = l;
+    if constexpr (idx == 0)
+      default_gemv_config = fn;
+  });
+}
+
+#define inst(x, isGemm) inst_helper<decltype(x), x>(isGemm)
+
+std::string get_platform_name() {
+  std::string platform;
+  // Autodetect platform if not provided
+  std::vector<sycl::platform> platforms = sycl::platform::get_platforms();
+  for (const auto& plat : platforms) {
+    std::vector<sycl::device> devices = plat.get_devices();
+    for (const auto& device : devices) {
+      std::string dev_name = device.get_info<sycl::info::device::name>();
+      if (dev_name.find("B580") != std::string::npos) {
+        platform = "bmg";
+        std::cout << "Found BMG platform..." << std::endl;
+        break;
+      }
+      if (dev_name.find("258V") != std::string::npos) {
+        platform = "lnl";
+        std::cout << "Found LNL platform..." << std::endl;
+        break;
+      }
+      if (dev_name.find("0xb080") != std::string::npos) {
+        platform = "ptl";
+        std::cout << "Found PTL platform..." << std::endl;
+        break;
+      }
+    }
+    if (!platform.empty())
+      break;
+  }
+  if (platform.empty()) {
+    std::cout
+        << "Could not auto-detect GPU platform, defaulting to bmg configuration"
+        << std::endl;
+    platform = "bmg";
+  }
+  return platform;
+}
+
+void init_int2_bf16_fused_gemm_inst_map() {
+  auto platform = get_platform_name();
+  if (platform == "lnl") {
+    inst(best_gemm_configs_lnl, true);
+    inst(best_gemv_configs_lnl, false);
+  } else if (platform == "ptl") {
+    inst(best_gemm_configs_ptl, true);
+    inst(best_gemv_configs_ptl, false);
+  } else {
+    inst(best_gemm_configs_bmg, true);
+    inst(best_gemv_configs_bmg, false);
+  }
+  initialized = true;
+}
+
+#undef inst
+
+std::pair<ft, bool> get_int2_bf16_fused_gemm_func(int m, int n, int k) {
+  if (!initialized) {
+    init_int2_bf16_fused_gemm_inst_map();
+  }
+  const bool isGemm = m > 1;
+  bool externalScaleA = isGemm;
+  std::pair<int, int> key = {n, k};
+  std::tuple<int, int, int, int, int, int> config;
+  if (isGemm) {
+    auto it = best_gemm_configs.find(key);
+    if (it != best_gemm_configs.end()) {
+      config = it->second;
+    } else {
+      printf(
+          "No best gemm config found for m=%d,n=%d,k=%d, using default\n", m, n,
+          k);
+      config = std::make_tuple(64, 8, 256, 128, 64, 1);
+      best_gemm_configs[key] = config;
+      // throw std::runtime_error("No best gemm config found for given m,n");
+    }
+  } else {
+    auto it = best_gemv_configs.find(key);
+    if (it != best_gemv_configs.end()) {
+      config = it->second;
+    } else {
+      printf(
+          "No best gemv config found for m=%d,n=%d,k=%d, using default\n", m, n,
+          k);
+      config = std::make_tuple(1, 1, 128, 32, 128, 0);
+      best_gemv_configs[key] = config;
+      // throw std::runtime_error("No best gemv config found for given m,n");
+    }
+  }
+  int wg_m = std::min(m, std::gcd(m, std::get<0>(config)));
+  int sg_m = std::min(m, std::gcd(m, std::get<1>(config)));
+  int wg_n = std::min(n, std::gcd(n, std::get<2>(config)));
+  int sg_n = std::min(n, std::gcd(n, std::get<3>(config)));
+  int sg_k = std::min(k, std::gcd(k, std::get<4>(config)));
+  int external_scale_a_calc = std::get<5>(config);
+  config = std::make_tuple(wg_m, sg_m, wg_n, sg_n, sg_k, external_scale_a_calc);
+  externalScaleA = std::get<5>(config);
+
+  if (inst_map.find(config) != inst_map.end()) {
+    return std::make_pair(inst_map[config], externalScaleA);
+  } else {
+    printf(
+        "No instantiation found for given config {%d, %d, %d, %d, %d, %d}, using default mnk = {%d, %d, %d}\n",
+        std::get<0>(config), std::get<1>(config), std::get<2>(config),
+        std::get<3>(config), std::get<4>(config), std::get<5>(config), m, n, k);
+    if (isGemm) {
+      inst_map[config] = default_gemm_config;
+      return std::make_pair(default_gemm_config, true);
+    } else {
+      inst_map[config] = default_gemv_config;
+      return std::make_pair(default_gemv_config, false);
+    }
+    // throw std::runtime_error("No instantiation found for given config");
+  }
+}
