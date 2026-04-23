@@ -1,0 +1,3 @@
+[submodule "xetla"]
+	path = xetla
+	url = https://github.com/egeor/xetla.git
