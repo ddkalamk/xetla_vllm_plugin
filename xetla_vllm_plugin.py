@@ -81,9 +81,40 @@ def xetla_int2_bf16_fused_gemm_fake_impl(
     return out
 
 
+# ---- int2 weights with per-K-group fp16 scales (gs=128), fp16 activations ----
+INT2_F16_GROUP_SIZE = 128
+
+@torch.library.custom_op("xetla::int2_fp16_upcvt_gemm", mutates_args=())
+def xetla_int2_fp16_upcvt_gemm(
+    input: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """int2 weight x fp16 act GEMM with per-K-group fp16 scales (gs=128).
+
+    input  : fp16 [M, K]
+    weight : int32 [K/16, N]   (16 K-rows packed per int32, codes {0,+1,-1})
+    scale  : fp16  [K/128, N]
+    bias   : optional fp16 [N]
+    """
+    with Timer(input, weight):
+        out = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
+            input, weight, scale, None
+        )
+    if bias is not None:
+        out = out + bias.to(out.dtype)
+    return out
+
+@xetla_int2_fp16_upcvt_gemm.register_fake
+def _xetla_int2_fp16_upcvt_gemm_fake(
+    input: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return input.new_empty([input.shape[0], weight.shape[1]])
+
+
 def xetla_quant_method():
     quant_method =  os.environ.get("XETLA_QUANT_METHOD", "int2").lower()
-    if quant_method not in ["bf16", "int2"]:
+    if quant_method not in ["bf16", "int2", "int2_f16"]:
         raise ValueError(f"Unsupported xetla quantization method: {quant_method}")
     return quant_method
 
@@ -106,6 +137,34 @@ def quantize_to_int2(t):
     # print(f"Qint2: {t1.shape} {t1.amax()} {t1.amin()} {scale.shape}")
     return t1, scale
 
+def quantize_to_ternary_f16(t, group_size: int = INT2_F16_GROUP_SIZE):
+    """Quantize a [K, N] fp16/bfloat16 weight that is already a ternary
+    (-s, 0, +s) tensor with shared scale s every `group_size` rows along K.
+
+    Returns:
+        codes : int8 [K, N] in {-1, 0, +1}
+        scale : fp16 [K // group_size, N]
+    """
+    K, N = t.shape
+    assert K % group_size == 0, f"K ({K}) must be multiple of {group_size}"
+    tg = t.float().view(K // group_size, group_size, N)
+    scale = tg.abs().amax(dim=1)  # [K/gs, N]
+    safe = scale.clone()
+    safe[safe == 0] = 1.0
+    q = torch.round(tg / safe.unsqueeze(1))
+    q = torch.clamp(q, -1, 1).to(torch.int8)
+    codes = q.view(K, N)
+    return codes, scale.to(torch.float16)
+
+def pack_ternary_to_int2(codes):
+    """Pack int8 codes in {-1, 0, +1} into int2 codes {0, 1, 3} and then into
+    int32 words (16 K-rows per word) using the same vnni16 layout as the
+    bf16 path. Input: [K, N] int8. Output: [K/16, N] int32.
+    """
+    # int2 encoding: 0 -> 0, +1 -> 1, -1 -> 3 (== two's-complement int2 of -1).
+    # codes is signed int8 in {-1,0,1}; (codes & 3) gives {0,1,3}.
+    return pack_int2_vnni16((codes & 0x3))
+
 def dequantize_int2_to_bf16(t, scale):
     t1 = (t.to(torch.float) * scale).to(torch.bfloat16)
     return t1
@@ -113,6 +172,12 @@ def dequantize_int2_to_bf16(t, scale):
 class XetlaConfig(QuantizationConfig):
     def __init__(self) -> None:
         self.method = xetla_quant_method()
+        # Required by the GGUF model loader, which calls
+        # `vllm_config.quant_config.unquantized_modules.extend(...)` even when
+        # the active quant_config is not GGUFConfig (which happens whenever
+        # we load a .gguf file but request `quantization=xetla` so the xetla
+        # plugin re-quantizes weights to int2 with fp16 scales).
+        self.unquantized_modules: list[str] = []
         super().__init__()
 
     def __repr__(self) -> str:
@@ -141,6 +206,12 @@ class XetlaConfig(QuantizationConfig):
     @classmethod
     def override_quantization_method(
             cls, hf_quant_cfg, user_quant) -> Optional[QuantizationMethods]:
+        # Allow the user to opt into the xetla path even when the source
+        # checkpoint advertises a different quantization method (e.g. gguf).
+        # When the user explicitly asks for `xetla`, claim ownership so
+        # `_verify_quantization` does not raise a mismatch error.
+        if user_quant == "xetla":
+            return "xetla"
         return None
 
     def get_quant_method(self, layer: torch.nn.Module,
@@ -151,7 +222,12 @@ class XetlaConfig(QuantizationConfig):
             return XetlaEmbeddingMethod(self, True)
         elif isinstance(layer, VocabParallelEmbedding) and quantize_lm_heads:
             return XetlaEmbeddingMethod(self, False)
-        print(f"XetlaConfig.get_quant_method: Unsupported layer type {type(layer)} for layer {prefix}")
+        # Other layer types (notably `Attention`) are not handled by xetla;
+        # vLLM falls back to the default impl when we return None. Only print
+        # once per type when XETLA_DEBUG=1 to avoid spamming one line per
+        # transformer block at startup.
+        if int(os.environ.get("XETLA_DEBUG", "0")) > 0:
+            print(f"XetlaConfig.get_quant_method: passthrough for {type(layer).__name__} ({prefix})")
         return None
 
 class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
@@ -194,6 +270,29 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
             layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
             layer.input_scale = None
             layer.xetla_quantized = True
+        elif self.quant_config.method == "int2_f16":
+            # Only quantize the lm_head (inplace=True). Input embedding
+            # lookups still need a dense fp16 table, so leave VocabParallel-
+            # Embedding alone.
+            if not self.inplace:
+                return
+            weight = layer.weight.data  # [vocab_size, hidden_size]
+            dev = weight.device
+            # The lm_head is huge (e.g. 151680x4096). Doing the float()
+            # reshape/round on XPU temporarily allocates several GB which
+            # easily trips UR_RESULT_ERROR_DEVICE_LOST. Quantize on CPU and
+            # ship the small int2 + fp16 scale buffers back to the device.
+            wkn = weight.detach().to("cpu", dtype=torch.float16).t().contiguous()
+            codes, scale_f16 = quantize_to_ternary_f16(wkn, INT2_F16_GROUP_SIZE)
+            packed = pack_ternary_to_int2(codes)
+            print(f"Processing lm_head with method int2_f16: weight {tuple(weight.shape)} -> packed {tuple(packed.shape)}, scale {tuple(scale_f16.shape)}")
+            layer.weight = torch.nn.Parameter(
+                packed.to(dev).contiguous(), requires_grad=False
+            )
+            layer.scale = torch.nn.Parameter(
+                scale_f16.to(dev).contiguous(), requires_grad=False
+            )
+            layer.xetla_quantized = True
         else:
             pass
 
@@ -208,8 +307,14 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
             output = fp8_gemm_w8a16(x, weight.t(), weight_scale, bias)
             # print(f"XetlaEmbeddingMethod apply output shape: {output.shape}, dtype: {output.dtype}")
             return output
-        else:
-            return super().apply(layer, x, bias)
+        if self.quant_config.method == "int2_f16" and getattr(layer, "xetla_quantized", False):
+            x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+            out = xetla_int2_fp16_upcvt_gemm(
+                x16, layer.weight, layer.scale,
+                bias.to(torch.float16) if bias is not None else None,
+            )
+            return out.to(x.dtype)
+        return super().apply(layer, x, bias)
 
 
 class XetlaLinearMethod(LinearMethodBase):
@@ -243,6 +348,19 @@ class XetlaLinearMethod(LinearMethodBase):
             weight = layer.weight.data
             weight_int2, layer.scale = quantize_to_int2(weight.t())
             layer.weight.data = pack_int2_vnni16(weight_int2)
+        elif self.quant_config.method == "int2_f16":
+            # Bonsai-style ternary fp16 weight: every 128 K-entries share an
+            # fp16 scale and values are exactly s*{-1, 0, +1}. Recover that
+            # encoding losslessly so we can call the int2 x fp16-scale upcvt
+            # GEMM kernel.
+            weight = layer.weight.data  # [N_out, K_in], any float dtype
+            wkn = weight.t().contiguous().to(torch.float16)  # [K, N]
+            codes, scale_f16 = quantize_to_ternary_f16(wkn, INT2_F16_GROUP_SIZE)
+            packed = pack_ternary_to_int2(codes.to(weight.device))
+            layer.weight.data = packed.contiguous()
+            layer.scale = torch.nn.Parameter(
+                scale_f16.to(weight.device).contiguous(), requires_grad=False
+            )
         else:
             pass
 
@@ -258,12 +376,28 @@ class XetlaLinearMethod(LinearMethodBase):
                 # print("Using xetla int2 gemm x: ", x.shape, " weight: ", layer.weight.shape)
                 c = xetla_int2_bf16_fused_gemm(x, layer.weight, layer.scale, bias)
                 return c
+            elif self.quant_config.method == "int2_f16":
+                # Activations must be fp16 for this kernel.
+                x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+                c = xetla_int2_fp16_upcvt_gemm(
+                    x16, layer.weight, layer.scale,
+                    bias.to(torch.float16) if bias is not None else None,
+                )
+                return c.to(x.dtype)
             else:
                 return UnquantizedLinearMethod.apply(self, layer, x, bias)
 
 
 def register():
     print("Hello xetla plugin!")
-    
+    # Force-load the SYCL extension so its TORCH_LIBRARY / TORCH_LIBRARY_FRAGMENT
+    # blocks register `torch.ops.xetla_int2.*` in *every* process that loads
+    # the plugin (main + each engine worker). Without this the ops are missing
+    # in the spawned engine subprocess.
+    try:
+        import xetla_pt_ext  # noqa: F401
+    except Exception as e:
+        print(f"[xetla] WARNING: could not import xetla_pt_ext: {e}")
+
     register_quantization_config("xetla")(XetlaConfig)
     

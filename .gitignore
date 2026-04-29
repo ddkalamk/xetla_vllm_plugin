@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Build artifacts
+build/
+*.so
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Models / large data
+*.gguf
+*.safetensors
+*.bin
+
+# Local clones / external repos checked out for convenience
+vllm/
+Bonsai-demo/
+
+# Local scratch
+scripts/test_xetla_ops.py

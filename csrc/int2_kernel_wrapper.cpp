@@ -194,6 +194,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "SYCL int2_bf16_fused_gemm_run");
 }
 
+// Forward declaration of the int2 x fp16 upcvt GEMM torch wrapper. The
+// kernel itself lives in csrc/int2_fp16_upcvt_kernel.sycl, but its
+// op registration is here so that the constructor runs reliably at .so
+// load time (see comment in the .sycl file).
+torch::Tensor int2_fp16_upcvt_gemm_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
+    std::optional<torch::Tensor> C_out);
+
 TORCH_LIBRARY(xetla_int2, m) {
   m.def("int2_bf16_fused_gemm_run", &int2_bf16_fused_gemm_run_torch);
+  m.def("int2_fp16_upcvt_gemm_run", &int2_fp16_upcvt_gemm_run_torch);
 }
