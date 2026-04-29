@@ -95,11 +95,23 @@ def xetla_int2_fp16_upcvt_gemm(
     weight : int32 [K/16, N]   (16 K-rows packed per int32, codes {0,+1,-1})
     scale  : fp16  [K/128, N]
     bias   : optional fp16 [N]
+
+    Routes to the DPAS / int8-XMX kernel for prefill (M > 1) when N is a
+    multiple of 256 (the WGN tile of the DPAS variant); otherwise (and for
+    decode M == 1) routes to the upcvt / GEMV-tuned kernel.
     """
+    m = input.shape[0]
+    n = weight.shape[1]
+    use_dpas = (m > 1) and (n % 256 == 0)
     with Timer(input, weight):
-        out = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
-            input, weight, scale, None
-        )
+        if use_dpas:
+            out = torch.ops.xetla_int2.int2_fp16_dpas_gemm_run(
+                input, weight, scale, None
+            )
+        else:
+            out = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
+                input, weight, scale, None
+            )
     if bias is not None:
         out = out + bias.to(out.dtype)
     return out

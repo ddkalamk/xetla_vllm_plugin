@@ -202,7 +202,14 @@ torch::Tensor int2_fp16_upcvt_gemm_run_torch(
     torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
     std::optional<torch::Tensor> C_out);
 
+// Forward declaration of the int2 x fp16 DPAS GEMM torch wrapper. The kernel
+// implementation lives in csrc/int2_fp16_dpas_kernel.sycl.
+torch::Tensor int2_fp16_dpas_gemm_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
+    std::optional<torch::Tensor> C_out);
+
 TORCH_LIBRARY(xetla_int2, m) {
   m.def("int2_bf16_fused_gemm_run", &int2_bf16_fused_gemm_run_torch);
   m.def("int2_fp16_upcvt_gemm_run", &int2_fp16_upcvt_gemm_run_torch);
+  m.def("int2_fp16_dpas_gemm_run", &int2_fp16_dpas_gemm_run_torch);
 }

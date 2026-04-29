@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-model-len", type=int,
                    default=int(os.environ.get("CHAT_MAX_MODEL_LEN", "2048")))
     p.add_argument("--max-tokens", type=int,
-                   default=int(os.environ.get("CHAT_MAX_TOKENS", "128")))
+                   default=int(os.environ.get("CHAT_MAX_TOKENS", "1024")))
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--system", default="You are a helpful assistant.")
@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=os.environ.get("CHAT_NO_STREAM", "0") not in ("0", "", "false", "False"),
         help="Disable token-by-token streaming; print the full reply at the end.",
+    )
+    p.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        default=os.environ.get("CHAT_ENFORCE_EAGER", "0") not in ("0", "", "false", "False"),
+        help="Disable torch.compile / CUDA graphs. Useful when compile crashes.",
     )
     return p.parse_args()
 
@@ -73,6 +79,7 @@ def main() -> None:
         enable_prefix_caching=False,
         quantization=quant,
         dtype=args.dtype,
+        enforce_eager=args.enforce_eager,
     )
     sp = SamplingParams(
         temperature=args.temperature,

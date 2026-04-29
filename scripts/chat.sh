@@ -13,7 +13,7 @@ source "${ROOT_DIR}/.venv/bin/activate"
 export RenderCompressedBuffersEnabled=0
 export NEOReadDebugKeys=1
 export VLLM_XPU_ENABLE_XPU_GRAPH=1
-export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
+export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-opencl:1;level_zero:0}"
 
 # Use the xetla plugin's int2 weight x fp16 act kernels (per-128 K-group fp16
 # scales) for the Ternary-Bonsai GGUF.
