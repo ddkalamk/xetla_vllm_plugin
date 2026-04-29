@@ -1,0 +1,330 @@
+/*******************************************************************************
+ * int1 weight-only quantized GEMM with fp16 activations and per-K-group fp16
+ * scales (no scale_A, no zero-points). Mirrors the kernel exercised by
+ *   xetla/int1_fp16_upcvt_dpas_fast_test.
+ *
+ *   C[m,n] = sum_k  A[m,k] * (codeval(B[k,n]) * ScaleB[k/gs, n])
+ *
+ *   A      : fp16, row-major, [M, K]
+ *   B      : int1x32, K-packed, [K/32, N] (uint32_t per 32 K-rows of one N col)
+ *   ScaleB : fp16, row-major, [K/gs, N]      (gs = 128, fixed at compile time)
+ *   C      : fp16, row-major, [M, N]
+ *
+ * int1 codes:  bit 0 -> +1,  bit 1 -> -1.
+ *******************************************************************************/
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+#include <utility>
+
+#include "timing_utils.h"
+#include "xetla.hpp"
+
+using namespace gpu::xetla;
+using namespace sycl;
+
+namespace {
+
+// Fixed K-group for the fp16-scales upcvt kernel (matches the xetla test).
+static constexpr int kScaleGS = 128;
+
+// Unique kernel-name tag to avoid mangled-name collisions between
+// (WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned) instantiations.
+template <
+    int WGM, int WGN, int SGM, int SGN, int SGK, int KS, int LS,
+    bool kUnaligned>
+class int1_fp16_upcvt_kernel_tag;
+
+template <
+    int WGM, int WGN, int SGM, int SGN, int SGK, int KS, int LS,
+    bool kUnaligned>
+sycl::event int1_fp16_upcvt_gemm_impl(
+    sycl::queue& queue, const size_t M, const size_t N, const size_t K,
+    sycl::half* A_d, int32_t* B_d, sycl::half* C_d, sycl::half* ScaleB_d,
+    float* Acc_d, uint32_t* Cnt_d) {
+  using fp16_t = gpu::xetla::fp16;
+  using data_type_a = fp16_t;
+  using data_type_b = int1x32;
+  using data_type_c = fp16_t;
+  using data_type_acc = float;
+  using data_type_scale = fp16_t;
+
+  constexpr int wg_tile_m = WGM;
+  constexpr int wg_tile_n = WGN;
+  constexpr int sg_tile_m = SGM;
+  constexpr int sg_tile_n = SGN;
+  constexpr int sg_tile_k = SGK;
+  constexpr uint32_t prefetch_distance = 0;
+  constexpr uint32_t periodic_sync_interval = 0;
+  constexpr uint32_t global_kslicing = KS;
+  constexpr uint32_t local_kslicing = LS;
+
+  static constexpr gpu_arch arch_tag = gpu_arch::Xe;
+
+  using tile_shape = gpu::xetla::group::tile_shape_t<
+      wg_tile_n, wg_tile_m, sg_tile_n, sg_tile_m>;
+  using mem_desc_a_t = gpu::xetla::mem_desc_t<
+      data_type_a, mem_layout::row_major, mem_space::global>;
+  using mem_desc_b_t = gpu::xetla::mem_desc_t<
+      data_type_b, mem_layout::row_major, mem_space::global>;
+  using mem_desc_c_t = gpu::xetla::mem_desc_t<
+      data_type_c, mem_layout::row_major, mem_space::global>;
+
+  using compute_attr = gpu::xetla::group::compute_attr_t<
+      data_type_a, data_type_a, data_type_acc>;
+  using perf_tuning_knob = gpu::xetla::group::perf_tuning_knob_t<
+      sg_tile_k, prefetch_distance, periodic_sync_interval>;
+  using compute_policy = gpu::xetla::group::compute_policy_int1_fp16_upcvt_xmx<
+      compute_attr, perf_tuning_knob, data_type_scale, kScaleGS,
+      /*mma_xmx_m=*/SGM, arch_tag, /*use_unaligned_n=*/kUnaligned>;
+  using gemm_t = gpu::xetla::group::gemm_t<
+      compute_policy, tile_shape, mem_desc_a_t, mem_desc_b_t>;
+
+  using epilogue_policy_t = std::conditional_t<
+      kUnaligned, gpu::xetla::group::epilogue_policy_unaligned<arch_tag>,
+      gpu::xetla::group::epilogue_policy_default<arch_tag>>;
+  using mem_desc_c_epilogue_t = std::conditional_t<
+      kUnaligned,
+      gpu::xetla::mem_desc_t<
+          data_type_c, mem_layout::row_major, mem_space::global,
+          /*alignment=*/1>,
+      mem_desc_c_t>;
+  using epilogue_t = gpu::xetla::group::epilogue_t<
+      epilogue_policy_t, tile_shape, mem_desc_c_epilogue_t>;
+
+  using group_swizzle = gpu::xetla::kernel::group_swizzle_default<arch_tag>;
+  using gemm_op_t = gpu::xetla::kernel::gemm_universal_t<
+      gpu::xetla::kernel::dispatch_policy_int1_fp16_upcvt_kslicing<
+          group_swizzle, global_kslicing, local_kslicing>,
+      gemm_t, epilogue_t>;
+
+  uint32_t lda = static_cast<uint32_t>(K);
+  uint32_t ldb = static_cast<uint32_t>(N);
+  uint32_t ldc = static_cast<uint32_t>(N);
+  uint32_t lds = static_cast<uint32_t>(N);
+
+  typename gemm_op_t::arguments_t gemm_arg(
+      static_cast<uint32_t>(M), static_cast<uint32_t>(K),
+      static_cast<uint32_t>(N), A_d, lda, reinterpret_cast<int1x32*>(B_d), ldb,
+      C_d, ldc, ScaleB_d, lds, Acc_d, Cnt_d);
+
+  if (!gemm_op_t::can_implement(gemm_arg)) {
+    std::cout << "int1_fp16_upcvt: arguments not supported (M=" << M
+              << " N=" << N << " K=" << K << ")\n";
+    exit(1);
+  }
+  sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
+
+  using kernel_name_t =
+      int1_fp16_upcvt_kernel_tag<WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned>;
+
+  Timer t("int1_fp16_upcvt_submit");
+  return queue.submit([&](handler& cgh) {
+    cgh.parallel_for<kernel_name_t>(
+        nd_range, [=](nd_item<3> item) KERNEL_MAIN {
+          slm_barrier_init<gemm_op_t>();
+          gemm_op_t gemm_op;
+          gemm_op(item, gemm_arg);
+        });
+  });
+}
+
+// Per-process scratch (Acc, Cnt) reused across calls.
+struct Int1UpcvtScratch {
+  float* acc = nullptr;
+  uint32_t* cnt = nullptr;
+  size_t acc_bytes = 0;
+  size_t cnt_bytes = 0;
+};
+
+Int1UpcvtScratch& get_int1_scratch(
+    sycl::queue& q, size_t need_acc_bytes, size_t need_cnt_bytes) {
+  static Int1UpcvtScratch s;
+  if (s.acc_bytes < need_acc_bytes) {
+    if (s.acc)
+      sycl::free(s.acc, q.get_context());
+    s.acc = static_cast<float*>(sycl::aligned_alloc_device(
+        256, need_acc_bytes, q.get_device(), q.get_context()));
+    s.acc_bytes = need_acc_bytes;
+    q.memset(s.acc, 0, need_acc_bytes);
+  }
+  if (s.cnt_bytes < need_cnt_bytes) {
+    if (s.cnt)
+      sycl::free(s.cnt, q.get_context());
+    s.cnt = static_cast<uint32_t*>(sycl::aligned_alloc_device(
+        256, need_cnt_bytes, q.get_device(), q.get_context()));
+    s.cnt_bytes = need_cnt_bytes;
+    q.memset(s.cnt, 0, need_cnt_bytes);
+  }
+  return s;
+}
+
+template <
+    int WGM, int WGN, int SGM, int SGN, int SGK, int KS, int LS,
+    bool kUnaligned>
+sycl::event int1_upcvt_dispatch(
+    sycl::queue& q, size_t M, size_t N, size_t K, sycl::half* A, int32_t* B,
+    sycl::half* C, sycl::half* SB, float* acc, uint32_t* cnt) {
+  return int1_fp16_upcvt_gemm_impl<WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned>(
+      q, M, N, K, A, B, C, SB, acc, cnt);
+}
+
+template <
+    int WGM, int WGN, int SGM, int SGN, int SGK, int KS, int LS,
+    bool kUnaligned>
+std::pair<size_t, size_t> int1_upcvt_scratch_bytes(size_t M, size_t N) {
+  using fp16_t = gpu::xetla::fp16;
+  using data_type_a = fp16_t;
+  using data_type_b = int1x32;
+  using data_type_c = fp16_t;
+  using data_type_acc = float;
+  using data_type_scale = fp16_t;
+  static constexpr gpu_arch arch_tag = gpu_arch::Xe;
+  using tile_shape =
+      gpu::xetla::group::tile_shape_t<WGN, WGM, SGN, SGM>;
+  using mem_desc_a_t = gpu::xetla::mem_desc_t<
+      data_type_a, mem_layout::row_major, mem_space::global>;
+  using mem_desc_b_t = gpu::xetla::mem_desc_t<
+      data_type_b, mem_layout::row_major, mem_space::global>;
+  using mem_desc_c_t = gpu::xetla::mem_desc_t<
+      data_type_c, mem_layout::row_major, mem_space::global>;
+  using compute_attr = gpu::xetla::group::compute_attr_t<
+      data_type_a, data_type_a, data_type_acc>;
+  using perf_tuning_knob =
+      gpu::xetla::group::perf_tuning_knob_t<SGK, 0, 0>;
+  using compute_policy = gpu::xetla::group::compute_policy_int1_fp16_upcvt_xmx<
+      compute_attr, perf_tuning_knob, data_type_scale, kScaleGS, SGM, arch_tag,
+      kUnaligned>;
+  using gemm_t = gpu::xetla::group::gemm_t<
+      compute_policy, tile_shape, mem_desc_a_t, mem_desc_b_t>;
+  using epilogue_policy_t = std::conditional_t<
+      kUnaligned, gpu::xetla::group::epilogue_policy_unaligned<arch_tag>,
+      gpu::xetla::group::epilogue_policy_default<arch_tag>>;
+  using mem_desc_c_epilogue_t = std::conditional_t<
+      kUnaligned,
+      gpu::xetla::mem_desc_t<
+          data_type_c, mem_layout::row_major, mem_space::global, 1>,
+      mem_desc_c_t>;
+  using epilogue_t = gpu::xetla::group::epilogue_t<
+      epilogue_policy_t, tile_shape, mem_desc_c_epilogue_t>;
+  using group_swizzle = gpu::xetla::kernel::group_swizzle_default<arch_tag>;
+  using gemm_op_t = gpu::xetla::kernel::gemm_universal_t<
+      gpu::xetla::kernel::dispatch_policy_int1_fp16_upcvt_kslicing<
+          group_swizzle, KS, LS>,
+      gemm_t, epilogue_t>;
+  size_t acc_elems = gemm_op_t::get_acc_buf_size(M, N);
+  size_t cnt_elems = gemm_op_t::get_cnt_buf_size(M, N);
+  return {acc_elems * sizeof(data_type_acc), cnt_elems * sizeof(uint32_t)};
+}
+
+} // namespace
+
+// -- Public entry point: pick a precompiled variant based on (M, N) ----------
+//
+// Uses the M=1 GEMV-tuned tile tiers from int1_fp16_upcvt_dpas_fast_test
+// (wg_n in {32, 64, 128}, KS in {1, 2}, LS in {1, 2, 4}). Falls back to
+// (WGN=128, KS=1, LS=1) for M>1 (works correctly; not perf-tuned).
+sycl::event int1_fp16_upcvt_gemm_run(
+    sycl::queue& q, const size_t M, const size_t N, const size_t K,
+    sycl::half* A, int32_t* B, sycl::half* C, sycl::half* ScaleB) {
+  const bool aligned_n = (N % 4 == 0);
+
+  // Worst-case scratch across (KS, LS) combos used below.
+  auto bytes_aligned = int1_upcvt_scratch_bytes<
+      /*WGM*/ 1, /*WGN*/ 128, /*SGM*/ 1, /*SGN*/ 16, /*SGK*/ 128, /*KS*/ 2,
+      /*LS*/ 4, /*kUnaligned*/ false>(M, N);
+  auto bytes_unaligned = int1_upcvt_scratch_bytes<
+      /*WGM*/ 1, /*WGN*/ 128, /*SGM*/ 1, /*SGN*/ 16, /*SGK*/ 128, /*KS*/ 2,
+      /*LS*/ 4, /*kUnaligned*/ true>(M, N);
+  size_t need_acc =
+      std::max(bytes_aligned.first, bytes_unaligned.first);
+  size_t need_cnt =
+      std::max(bytes_aligned.second, bytes_unaligned.second);
+  auto& sc = get_int1_scratch(q, need_acc, need_cnt);
+
+#define DISPATCH(WGN_, KS_, LS_)                                              \
+  do {                                                                        \
+    if (aligned_n)                                                            \
+      return int1_upcvt_dispatch<                                             \
+          /*WGM*/ 1, WGN_, /*SGM*/ 1, /*SGN*/ 16, /*SGK*/ 128, KS_, LS_,      \
+          /*kUnaligned*/ false>(q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt); \
+    else                                                                      \
+      return int1_upcvt_dispatch<                                             \
+          /*WGM*/ 1, WGN_, /*SGM*/ 1, /*SGN*/ 16, /*SGK*/ 128, KS_, LS_,      \
+          /*kUnaligned*/ true>(q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt);  \
+  } while (0)
+
+  if (M == 1) {
+    // Tier table from xetla/int1_fp16_upcvt_dpas_fast_test (M=1, K=4096):
+    //   N <= 4096        : (32, 2, 4)
+    //   4096 < N <=  8192: (64, 1, 4)
+    //   8192 < N <= 16384: (64, 1, 2)
+    //   N >  16384       : (64, 1, 2)
+    if (N <= 4096) {
+      DISPATCH(32, 2, 4);
+    } else if (N <= 8192) {
+      DISPATCH(64, 1, 4);
+    } else {
+      DISPATCH(64, 1, 2);
+    }
+  }
+  // M>1 fallback (works correctly; not perf-tuned for prefill).
+  DISPATCH(128, 1, 1);
+#undef DISPATCH
+}
+
+// ---------------------------------------------------------------------------
+// Torch op binding.
+
+torch::Tensor int1_fp16_upcvt_gemm_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
+    std::optional<torch::Tensor> C_out = std::nullopt) {
+  RECORD_FUNCTION("int1_fp16_upcvt_gemm", {A, B});
+  Timer t_("int1_fp16_upcvt_gemm");
+  TORCH_CHECK(A.dtype() == torch::kHalf, "A must be fp16");
+  TORCH_CHECK(B.dtype() == torch::kInt32, "B must be int32 (int1x32)");
+  TORCH_CHECK(scale_B.dtype() == torch::kHalf, "scale_B must be fp16");
+  TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+  TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+  TORCH_CHECK(scale_B.is_contiguous(), "scale_B must be contiguous");
+  TORCH_CHECK(A.device().is_xpu(), "A must be on XPU");
+  TORCH_CHECK(B.device().is_xpu() && scale_B.device().is_xpu(), "B/scale on XPU");
+  TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && scale_B.dim() == 2,
+              "A,B,scale_B must be 2D");
+
+  long m = A.size(0);
+  long k = A.size(1);
+  long n = B.size(1);
+  TORCH_CHECK(k % 32 == 0, "k must be multiple of 32 (int1x32)");
+  TORCH_CHECK(k % 128 == 0, "k must be multiple of 128 (scale group size)");
+  TORCH_CHECK(B.size(0) == k / 32, "B.size(0) must be k/32");
+  TORCH_CHECK(scale_B.size(0) == k / 128, "scale_B.size(0) must be k/128");
+  TORCH_CHECK(scale_B.size(1) == n, "scale_B.size(1) must be n");
+
+  torch::Tensor C;
+  if (C_out.has_value()) {
+    TORCH_CHECK(C_out->dtype() == torch::kHalf, "C must be fp16");
+    TORCH_CHECK(C_out->is_contiguous() && C_out->device().is_xpu(),
+                "C must be contiguous XPU");
+    TORCH_CHECK(C_out->size(0) == m && C_out->size(1) == n, "C shape mismatch");
+    C = *C_out;
+  } else {
+    C = A.new_empty({m, n}, torch::kHalf);
+  }
+
+  auto q = c10::xpu::getCurrentXPUStream(A.device().index()).queue();
+  sycl::half* a_ptr = reinterpret_cast<sycl::half*>(A.data_ptr<at::Half>());
+  int32_t* b_ptr = B.data_ptr<int32_t>();
+  sycl::half* c_ptr = reinterpret_cast<sycl::half*>(C.data_ptr<at::Half>());
+  sycl::half* sb_ptr = reinterpret_cast<sycl::half*>(scale_B.data_ptr<at::Half>());
+
+  {
+    RECORD_FUNCTION("int1_fp16_upcvt_gemm_run", {});
+    Timer t__("int1_fp16_upcvt_gemm_run");
+    int1_fp16_upcvt_gemm_run(
+        q, static_cast<size_t>(m), static_cast<size_t>(n),
+        static_cast<size_t>(k), a_ptr, b_ptr, c_ptr, sb_ptr);
+  }
+  return C;
+}

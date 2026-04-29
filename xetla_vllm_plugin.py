@@ -124,9 +124,69 @@ def _xetla_int2_fp16_upcvt_gemm_fake(
     return input.new_empty([input.shape[0], weight.shape[1]])
 
 
+# ---- int1 weights with per-K-group fp16 scales (gs=128), fp16 activations ----
+INT1_F16_GROUP_SIZE = 128
+
+@torch.library.custom_op("xetla::int1_fp16_upcvt_gemm", mutates_args=())
+def xetla_int1_fp16_upcvt_gemm(
+    input: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """int1 weight x fp16 act GEMM with per-K-group fp16 scales (gs=128).
+
+    input  : fp16 [M, K]
+    weight : int32 [K/32, N]   (32 K-rows packed per int32, codes {0->+1,1->-1})
+    scale  : fp16  [K/128, N]
+    bias   : optional fp16 [N]
+    """
+    with Timer(input, weight):
+        out = torch.ops.xetla_int2.int1_fp16_upcvt_gemm_run(
+            input, weight, scale, None
+        )
+    if bias is not None:
+        out = out + bias.to(out.dtype)
+    return out
+
+@xetla_int1_fp16_upcvt_gemm.register_fake
+def _xetla_int1_fp16_upcvt_gemm_fake(
+    input: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return input.new_empty([input.shape[0], weight.shape[1]])
+
+
+def quantize_to_binary_f16(t, group_size: int = INT1_F16_GROUP_SIZE):
+    """Quantize a [K, N] fp16/bfloat16 weight that is already a binary
+    (-s, +s) tensor with shared scale s every `group_size` rows along K.
+
+    Returns:
+        codes : int8 [K, N] in {0, 1}  (0 -> +1, 1 -> -1, matching int1x32)
+        scale : fp16 [K // group_size, N]
+    """
+    K, N = t.shape
+    assert K % group_size == 0, f"K ({K}) must be multiple of {group_size}"
+    tg = t.float().view(K // group_size, group_size, N)
+    scale = tg.abs().amax(dim=1)  # [K/gs, N]
+    # Sign-bit code: positive (incl. 0) -> 0 (=+1), negative -> 1 (=-1).
+    codes = (t < 0).to(torch.int8)
+    return codes, scale.to(torch.float16)
+
+
+def pack_int1x32(codes):
+    """Pack int8 codes in {0,1} of shape [K, N] into uint32 words of shape
+    [K/32, N], where bit i of word at row r is the code for K-row r*32+i.
+    """
+    K, N = codes.shape
+    assert K % 32 == 0, f"K ({K}) must be multiple of 32"
+    c = codes.to(torch.int32).view(K // 32, 32, N)
+    shifts = torch.arange(32, dtype=torch.int32, device=codes.device).view(1, 32, 1)
+    packed = ((c & 1) << shifts).sum(dim=1).to(torch.int32)
+    return packed
+
+
 def xetla_quant_method():
     quant_method =  os.environ.get("XETLA_QUANT_METHOD", "int2").lower()
-    if quant_method not in ["bf16", "int2", "int2_f16"]:
+    if quant_method not in ["bf16", "int2", "int2_f16", "int1_f16"]:
         raise ValueError(f"Unsupported xetla quantization method: {quant_method}")
     return quant_method
 
@@ -305,6 +365,22 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
                 scale_f16.to(dev).contiguous(), requires_grad=False
             )
             layer.xetla_quantized = True
+        elif self.quant_config.method == "int1_f16":
+            if not self.inplace:
+                return
+            weight = layer.weight.data  # [vocab_size, hidden_size]
+            dev = weight.device
+            wkn = weight.detach().to("cpu", dtype=torch.float16).t().contiguous()
+            codes, scale_f16 = quantize_to_binary_f16(wkn, INT1_F16_GROUP_SIZE)
+            packed = pack_int1x32(codes)
+            print(f"Processing lm_head with method int1_f16: weight {tuple(weight.shape)} -> packed {tuple(packed.shape)}, scale {tuple(scale_f16.shape)}")
+            layer.weight = torch.nn.Parameter(
+                packed.to(dev).contiguous(), requires_grad=False
+            )
+            layer.scale = torch.nn.Parameter(
+                scale_f16.to(dev).contiguous(), requires_grad=False
+            )
+            layer.xetla_quantized = True
         else:
             pass
 
@@ -322,6 +398,13 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
         if self.quant_config.method == "int2_f16" and getattr(layer, "xetla_quantized", False):
             x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
             out = xetla_int2_fp16_upcvt_gemm(
+                x16, layer.weight, layer.scale,
+                bias.to(torch.float16) if bias is not None else None,
+            )
+            return out.to(x.dtype)
+        if self.quant_config.method == "int1_f16" and getattr(layer, "xetla_quantized", False):
+            x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+            out = xetla_int1_fp16_upcvt_gemm(
                 x16, layer.weight, layer.scale,
                 bias.to(torch.float16) if bias is not None else None,
             )
@@ -373,6 +456,20 @@ class XetlaLinearMethod(LinearMethodBase):
             layer.scale = torch.nn.Parameter(
                 scale_f16.to(weight.device).contiguous(), requires_grad=False
             )
+        elif self.quant_config.method == "int1_f16":
+            # Bonsai-8B-unpacked-style binary fp16 weight: every 128 K-entries
+            # share an fp16 scale and values are s*{-1, +1}. Re-quantize with
+            # the sign-bit and per-128-K absmax to feed the int1 upcvt GEMM.
+            weight = layer.weight.data  # [N_out, K_in], any float dtype
+            dev = weight.device
+            # Quantize on CPU to avoid a peak XPU allocation of K*N*4B.
+            wkn = weight.detach().to("cpu", dtype=torch.float16).t().contiguous()
+            codes, scale_f16 = quantize_to_binary_f16(wkn, INT1_F16_GROUP_SIZE)
+            packed = pack_int1x32(codes)
+            layer.weight.data = packed.to(dev).contiguous()
+            layer.scale = torch.nn.Parameter(
+                scale_f16.to(dev).contiguous(), requires_grad=False
+            )
         else:
             pass
 
@@ -392,6 +489,13 @@ class XetlaLinearMethod(LinearMethodBase):
                 # Activations must be fp16 for this kernel.
                 x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
                 c = xetla_int2_fp16_upcvt_gemm(
+                    x16, layer.weight, layer.scale,
+                    bias.to(torch.float16) if bias is not None else None,
+                )
+                return c.to(x.dtype)
+            elif self.quant_config.method == "int1_f16":
+                x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+                c = xetla_int1_fp16_upcvt_gemm(
                     x16, layer.weight, layer.scale,
                     bias.to(torch.float16) if bias is not None else None,
                 )

@@ -64,7 +64,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if not os.path.exists(args.model):
+    # Allow `--model` to be either a local path (file or directory) or a HF
+    # repo id (e.g. "prism-ml/Bonsai-8B-unpacked"). Only error out when the
+    # value looks like a path and the path is missing.
+    looks_like_path = (
+        os.path.isabs(args.model) or args.model.startswith(".") or
+        args.model.endswith(".gguf")
+    )
+    if looks_like_path and not os.path.exists(args.model):
         sys.exit(f"Model not found: {args.model}")
 
     print(f"Loading {args.model} (tokenizer={args.tokenizer}) ...", flush=True)
