@@ -61,7 +61,7 @@ XETLA_SUBMODULE_REPO="${XETLA_SUBMODULE_REPO:-}"
 
 # Fallback branch to check out if the pinned submodule commit is no longer
 # fetchable from the remote (the upstream fork sometimes rewrites history).
-# Set to empty string to disable the fallback and fail hard instead.
+# Empty => no fallback (fail hard like before).
 XETLA_SUBMODULE_FALLBACK_BRANCH="${XETLA_SUBMODULE_FALLBACK_BRANCH:-feature_int2_woq_f16_act_gs128}"
 
 # ---- 1. clone plugin --------------------------------------------------------
@@ -127,11 +127,16 @@ if [[ -f "$PATCH_FILE" ]]; then
     if (cd "$VLLM_DIR" && git apply --check vllm.patch >/dev/null 2>&1); then
         log "Applying vllm.patch on top of vendored vllm"
         (cd "$VLLM_DIR" && git apply vllm.patch)
+    elif (cd "$VLLM_DIR" && git apply --reverse --check vllm.patch >/dev/null 2>&1); then
+        log "vllm.patch already applied; skipping"
     else
-        log "vllm.patch already applied (or doesn't apply cleanly); skipping"
+        err "vllm.patch FAILED to apply cleanly to $VLLM_DIR (this will silently disable xetla quant hooks)"
+        (cd "$VLLM_DIR" && git apply --check vllm.patch) || true
+        exit 1
     fi
 else
-    log "WARNING: no vllm.patch found in plugin tree; xetla quant hooks may be missing"
+    err "FATAL: no vllm.patch found in plugin tree (looked in $PLUGIN_DIR/vllm/vllm.patch and $PLUGIN_DIR/vllm.patch); xetla quant hooks would be missing"
+    exit 1
 fi
 
 # ---- 4. install vllm + triton-xpu in the venv -------------------------------
