@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# From-scratch build of xetla_vllm_plugin + vendored vllm + xetla kernels
+# in a clean directory using a fresh venv.
+#
+# Usage:
+#   ./utils/setup_fresh.sh /path/to/empty/build/dir
+#
+# Or if invoked directly inside the destination dir, pass "." to use $PWD.
+#
+# Requirements (must be loaded BEFORE running this script):
+#   - source /swtools/intel-gpu/<ver>/intel_gpu_vars.sh
+#   - source /swtools/intel/<oneapi>/oneapi-vars.sh --force
+#   - python >= 3.10 in PATH (uv will prefer 3.12)
+#   - git, uv (or pip; uv is preferred)
+#
+# What this script does:
+#   1) Clones xetla_vllm_plugin (with the xetla submodule) into <DEST>/xetla_vllm_plugin
+#   2) Creates a fresh venv at <DEST>/xetla_vllm_plugin/.venv (Python 3.12 via uv)
+#   3) Clones ddkalamk/vllm (xetla_v0.19.0 branch) into <DEST>/xetla_vllm_plugin/vllm
+#      and (best-effort) applies the vendored vllm.patch on top
+#   4) Installs vllm (XPU target) and triton-xpu into the venv
+#   5) Builds the xetla plugin (PyTorch SYCL extension) into the venv
+
+set -euo pipefail
+
+err()  { printf '\033[31m[setup_fresh] %s\033[0m\n' "$*" >&2; }
+log()  { printf '\033[36m[setup_fresh] %s\033[0m\n' "$*"; }
+
+# ---- 0. validate environment & dest dir -------------------------------------
+DEST="${1:-}"
+if [[ -z "$DEST" ]]; then
+    err "Usage: $0 <destination-directory>"
+    exit 1
+fi
+mkdir -p "$DEST"
+DEST=$(cd "$DEST" && pwd)
+log "Destination: $DEST"
+
+if ! command -v icpx >/dev/null; then
+    err "icpx not in PATH; source intel_gpu_vars.sh and oneapi-vars.sh first."
+    exit 1
+fi
+log "icpx: $(icpx --version 2>&1 | head -1)"
+
+if ! command -v uv >/dev/null; then
+    log "uv not found; bootstrapping into ~/.local/bin"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
+PLUGIN_REPO="${PLUGIN_REPO:-https://github.com/ddkalamk/xetla_vllm_plugin.git}"
+PLUGIN_BRANCH="${PLUGIN_BRANCH:-feature/int2-fp16-bonsai-chat}"
+
+VLLM_REPO="${VLLM_REPO:-https://github.com/ddkalamk/vllm.git}"
+VLLM_BRANCH="${VLLM_BRANCH:-xetla_v0.19.0}"
+
+# ---- 1. clone plugin --------------------------------------------------------
+PLUGIN_DIR="$DEST/xetla_vllm_plugin"
+if [[ ! -d "$PLUGIN_DIR/.git" ]]; then
+    log "Cloning $PLUGIN_REPO ($PLUGIN_BRANCH) -> $PLUGIN_DIR"
+    git clone --recurse-submodules -b "$PLUGIN_BRANCH" "$PLUGIN_REPO" "$PLUGIN_DIR"
+else
+    log "Plugin already cloned; updating submodules"
+    git -C "$PLUGIN_DIR" submodule update --init --recursive
+fi
+
+cd "$PLUGIN_DIR"
+
+# ---- 2. fresh venv ----------------------------------------------------------
+if [[ ! -d "$PLUGIN_DIR/.venv" ]]; then
+    log "Creating venv (.venv) with Python 3.12 via uv"
+    uv venv --python 3.12 --seed --managed-python
+fi
+# shellcheck disable=SC1091
+source "$PLUGIN_DIR/.venv/bin/activate"
+python -V
+
+# ---- 3. vllm (vendored) -----------------------------------------------------
+VLLM_DIR="$PLUGIN_DIR/vllm"
+if [[ ! -d "$VLLM_DIR/.git" ]]; then
+    # If the plugin already ships a vendored vllm dir from cloning (it can,
+    # depending on how the upstream tracks it), wipe and re-clone cleanly.
+    rm -rf "$VLLM_DIR"
+    log "Cloning $VLLM_REPO ($VLLM_BRANCH) -> $VLLM_DIR"
+    git clone -b "$VLLM_BRANCH" "$VLLM_REPO" "$VLLM_DIR"
+else
+    log "vllm already present; leaving as-is"
+fi
+
+# Apply vendored vllm.patch (best-effort): the ddkalamk fork usually already
+# includes these hunks, so apply with --check first and skip if already merged.
+if [[ -f "$VLLM_DIR/vllm.patch" ]]; then
+    if (cd "$VLLM_DIR" && git apply --check vllm.patch >/dev/null 2>&1); then
+        log "Applying vllm.patch on top of vendored vllm"
+        (cd "$VLLM_DIR" && git apply vllm.patch)
+    else
+        log "vllm.patch already applied (or doesn't apply cleanly); skipping"
+    fi
+fi
+
+# ---- 4. install vllm + triton-xpu in the venv -------------------------------
+log "Installing vllm requirements (XPU)"
+pip install --upgrade pip
+pip install -v -r "$VLLM_DIR/requirements/xpu.txt"
+
+log "Installing vllm (editable, VLLM_TARGET_DEVICE=xpu)"
+VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -e "$VLLM_DIR" -v
+
+log "Replacing triton with triton-xpu==3.7.0"
+pip uninstall -y triton triton-xpu || true
+pip install triton-xpu==3.7.0 --extra-index-url https://download.pytorch.org/whl/xpu
+
+# ---- 5. build the xetla plugin (PyTorch SYCL extension) ---------------------
+log "Building xetla_vllm_plugin (PyTorch SYCL ext)"
+cd "$PLUGIN_DIR"
+python setup.py install
+
+log "Build complete."
+log ""
+log "Quick sanity check:"
+log "  source $PLUGIN_DIR/.venv/bin/activate"
+log "  python -c 'import torch, xetla_vllm_plugin, xetla_pt_ext; print(\"ok\")'"
+log ""
+log "To run the Bonsai chat demo (after placing the GGUF at $PLUGIN_DIR):"
+log "  cd $PLUGIN_DIR && bash scripts/chat.sh"
