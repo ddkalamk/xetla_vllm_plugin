@@ -54,15 +54,26 @@ PLUGIN_BRANCH="${PLUGIN_BRANCH:-feature/int2-fp16-bonsai-chat}"
 VLLM_REPO="${VLLM_REPO:-https://github.com/ddkalamk/vllm.git}"
 VLLM_BRANCH="${VLLM_BRANCH:-xetla_v0.19.0}"
 
+# Optional: override the xetla submodule URL (useful for local file:// builds
+# when the plugin's .gitmodules points to a remote that doesn't yet have the
+# required commits).
+XETLA_SUBMODULE_REPO="${XETLA_SUBMODULE_REPO:-}"
+
 # ---- 1. clone plugin --------------------------------------------------------
 PLUGIN_DIR="$DEST/xetla_vllm_plugin"
 if [[ ! -d "$PLUGIN_DIR/.git" ]]; then
     log "Cloning $PLUGIN_REPO ($PLUGIN_BRANCH) -> $PLUGIN_DIR"
-    git clone --recurse-submodules -b "$PLUGIN_BRANCH" "$PLUGIN_REPO" "$PLUGIN_DIR"
-else
-    log "Plugin already cloned; updating submodules"
-    git -C "$PLUGIN_DIR" submodule update --init --recursive
+    git clone -b "$PLUGIN_BRANCH" "$PLUGIN_REPO" "$PLUGIN_DIR"
 fi
+
+if [[ -n "$XETLA_SUBMODULE_REPO" ]]; then
+    log "Overriding xetla submodule URL -> $XETLA_SUBMODULE_REPO"
+    git -C "$PLUGIN_DIR" config -f .gitmodules submodule.xetla.url "$XETLA_SUBMODULE_REPO"
+    git -C "$PLUGIN_DIR" submodule sync xetla
+fi
+
+log "Initialising xetla submodule"
+git -C "$PLUGIN_DIR" -c protocol.file.allow=always submodule update --init --recursive xetla
 
 cd "$PLUGIN_DIR"
 
