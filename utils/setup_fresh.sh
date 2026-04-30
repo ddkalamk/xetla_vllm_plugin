@@ -98,15 +98,24 @@ else
     log "vllm already present; leaving as-is"
 fi
 
-# Apply vendored vllm.patch (best-effort): the ddkalamk fork usually already
-# includes these hunks, so apply with --check first and skip if already merged.
-if [[ -f "$VLLM_DIR/vllm.patch" ]]; then
+# Apply vendored vllm.patch (best-effort): the plugin tree carries vllm.patch
+# at vllm/vllm.patch (next to its vllm/ snapshot). Apply it on top of the
+# cloned upstream vllm.
+PATCH_FILE="$PLUGIN_DIR/vllm/vllm.patch"
+if [[ ! -f "$PATCH_FILE" ]]; then
+    # Some plugin checkouts may keep it at the repo root.
+    [[ -f "$PLUGIN_DIR/vllm.patch" ]] && PATCH_FILE="$PLUGIN_DIR/vllm.patch"
+fi
+if [[ -f "$PATCH_FILE" ]]; then
+    cp "$PATCH_FILE" "$VLLM_DIR/vllm.patch"
     if (cd "$VLLM_DIR" && git apply --check vllm.patch >/dev/null 2>&1); then
         log "Applying vllm.patch on top of vendored vllm"
         (cd "$VLLM_DIR" && git apply vllm.patch)
     else
         log "vllm.patch already applied (or doesn't apply cleanly); skipping"
     fi
+else
+    log "WARNING: no vllm.patch found in plugin tree; xetla quant hooks may be missing"
 fi
 
 # ---- 4. install vllm + triton-xpu in the venv -------------------------------
