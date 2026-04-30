@@ -59,6 +59,11 @@ VLLM_BRANCH="${VLLM_BRANCH:-xetla_v0.19.0}"
 # required commits).
 XETLA_SUBMODULE_REPO="${XETLA_SUBMODULE_REPO:-}"
 
+# Fallback branch to check out if the pinned submodule commit is no longer
+# fetchable from the remote (the upstream fork sometimes rewrites history).
+# Set to empty string to disable the fallback and fail hard instead.
+XETLA_SUBMODULE_FALLBACK_BRANCH="${XETLA_SUBMODULE_FALLBACK_BRANCH:-feature_int2_woq_f16_act_gs128}"
+
 # ---- 1. clone plugin --------------------------------------------------------
 PLUGIN_DIR="$DEST/xetla_vllm_plugin"
 if [[ ! -d "$PLUGIN_DIR/.git" ]]; then
@@ -73,7 +78,18 @@ if [[ -n "$XETLA_SUBMODULE_REPO" ]]; then
 fi
 
 log "Initialising xetla submodule"
-git -C "$PLUGIN_DIR" -c protocol.file.allow=always submodule update --init --recursive xetla
+if ! git -C "$PLUGIN_DIR" -c protocol.file.allow=always submodule update --init --recursive xetla; then
+    if [[ -n "$XETLA_SUBMODULE_FALLBACK_BRANCH" ]]; then
+        XETLA_URL=$(git -C "$PLUGIN_DIR" config -f .gitmodules submodule.xetla.url)
+        err "Pinned xetla submodule commit not fetchable; falling back to branch '$XETLA_SUBMODULE_FALLBACK_BRANCH' from $XETLA_URL"
+        rm -rf "$PLUGIN_DIR/xetla" "$PLUGIN_DIR/.git/modules/xetla"
+        git clone -b "$XETLA_SUBMODULE_FALLBACK_BRANCH" "$XETLA_URL" "$PLUGIN_DIR/xetla"
+        log "xetla now at $(git -C "$PLUGIN_DIR/xetla" rev-parse HEAD) (branch $XETLA_SUBMODULE_FALLBACK_BRANCH)"
+    else
+        err "xetla submodule init failed and no XETLA_SUBMODULE_FALLBACK_BRANCH set"
+        exit 1
+    fi
+fi
 
 cd "$PLUGIN_DIR"
 
