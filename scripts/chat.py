@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-model-len", type=int,
                    default=int(os.environ.get("CHAT_MAX_MODEL_LEN", "2048")))
     p.add_argument("--max-tokens", type=int,
-                   default=int(os.environ.get("CHAT_MAX_TOKENS", "1024")))
+                   default=int(os.environ.get("CHAT_MAX_TOKENS", "4096")))
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--system", default="You are a helpful assistant.")

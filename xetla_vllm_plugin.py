@@ -28,6 +28,168 @@ except:
 timing_enabled = int(os.environ.get("XETLA_TIMINGS", "0")) > 0
 quantize_lm_heads = int(os.environ.get("XETLA_QUANTIZE_LM_HEADS", "1")) > 0
 
+
+# ---- Pre-quantized sidecar (Option B) ---------------------------------------
+# When XETLA_PREQUANT_PATH points at a .safetensors file produced by
+# scripts/prequantize_gguf.py, process_weights_after_loading() will load each
+# layer's (qweight, scale) directly from disk and skip the GGUF dequant +
+# CPU re-quant pipeline. When XETLA_PREQUANT_DUMP_PATH is set, the plugin
+# captures every quantized layer it processes and flushes them to that path
+# right after model load.
+_xetla_prequant_load_path = os.environ.get("XETLA_PREQUANT_PATH", "") or None
+_xetla_prequant_dump_path = os.environ.get("XETLA_PREQUANT_DUMP_PATH", "") or None
+_xetla_prequant_cache: dict = {}   # lazy-loaded {key -> torch.Tensor}
+_xetla_prequant_meta: dict = {}    # parsed JSON from sidecar header
+_xetla_prequant_dump_buf: dict = {}  # {prefix: {qweight, scale, kind, dpas}}
+
+
+def _xetla_prequant_load_index() -> None:
+    """Open the sidecar safetensors file lazily and populate the meta dict."""
+    if not _xetla_prequant_load_path or _xetla_prequant_meta:
+        return
+    try:
+        from safetensors import safe_open  # noqa: WPS433
+        import json  # noqa: WPS433
+        with safe_open(_xetla_prequant_load_path, framework="pt") as f:
+            md = f.metadata() or {}
+            _xetla_prequant_meta.update({
+                "format_version": md.get("xetla_format_version", "1"),
+                "method": md.get("xetla_method", ""),
+                "keys": set(f.keys()),
+                "extra": json.loads(md.get("xetla_meta", "{}") or "{}"),
+            })
+        print(f"[xetla] sidecar loaded: {_xetla_prequant_load_path} "
+              f"({len(_xetla_prequant_meta['keys'])} tensors, "
+              f"method={_xetla_prequant_meta['method']})", flush=True)
+    except Exception as e:
+        print(f"[xetla] WARN: could not open prequant sidecar "
+              f"{_xetla_prequant_load_path}: {e}", flush=True)
+        _xetla_prequant_meta["keys"] = set()
+
+
+def _xetla_prequant_try_load(layer: torch.nn.Module, prefix: str,
+                             method: str, kind: str) -> bool:
+    """If a sidecar entry exists for `prefix`, populate the layer in-place
+    and return True. `kind` is 'linear' or 'lm_head'."""
+    if not _xetla_prequant_load_path:
+        return False
+    _xetla_prequant_load_index()
+    keys = _xetla_prequant_meta.get("keys", set())
+    qkey = f"{prefix}.qweight"
+    skey = f"{prefix}.scale"
+    if qkey not in keys or skey not in keys:
+        return False
+    if _xetla_prequant_meta.get("method") and \
+            _xetla_prequant_meta["method"] != method:
+        # Sidecar was produced for a different quant method.
+        return False
+    try:
+        from safetensors import safe_open  # noqa: WPS433
+        dev = layer.weight.data.device
+        with safe_open(_xetla_prequant_load_path, framework="pt") as f:
+            qw = f.get_tensor(qkey)
+            sc = f.get_tensor(skey)
+        layer.weight = torch.nn.Parameter(
+            qw.to(dev).contiguous(), requires_grad=False)
+        layer.scale = torch.nn.Parameter(
+            sc.to(dev).contiguous(), requires_grad=False)
+        layer.xetla_quantized = True
+        # Re-derive dispatch capability locally (no need to store).
+        if method == "int2_f16":
+            layer._xetla_dpas_capable = (qw.shape[1] & 255) == 0
+        else:
+            layer._xetla_dpas_capable = False
+        _xetla_pre_convert_bias(layer)
+        return True
+    except Exception as e:
+        print(f"[xetla] WARN: sidecar load failed for {prefix}: {e}",
+              flush=True)
+        return False
+
+
+def _xetla_prequant_dump_record(prefix: str, layer: torch.nn.Module,
+                                method: str, kind: str) -> None:
+    """Capture the just-quantized weights for later flush to disk."""
+    if not _xetla_prequant_dump_path or not prefix:
+        return
+    try:
+        qw = layer.weight.data.detach().to("cpu").contiguous()
+        sc = layer.scale.data.detach().to("cpu").contiguous()
+        _xetla_prequant_dump_buf[prefix] = {
+            "qweight": qw,
+            "scale": sc,
+            "method": method,
+            "kind": kind,
+        }
+    except Exception as e:
+        print(f"[xetla] WARN: dump capture failed for {prefix}: {e}",
+              flush=True)
+
+
+def _xetla_prequant_flush_dump() -> None:
+    """Write the accumulated buffer out as a single safetensors file."""
+    if not _xetla_prequant_dump_path or not _xetla_prequant_dump_buf:
+        return
+    try:
+        from safetensors.torch import save_file  # noqa: WPS433
+        import json  # noqa: WPS433
+        tensors: dict = {}
+        layers_meta: dict = {}
+        method_seen = ""
+        for prefix, rec in _xetla_prequant_dump_buf.items():
+            tensors[f"{prefix}.qweight"] = rec["qweight"]
+            tensors[f"{prefix}.scale"] = rec["scale"]
+            layers_meta[prefix] = {
+                "kind": rec["kind"],
+                "qweight_shape": list(rec["qweight"].shape),
+                "scale_shape": list(rec["scale"].shape),
+            }
+            method_seen = rec["method"]
+        meta = {
+            "xetla_format_version": "1",
+            "xetla_method": method_seen,
+            "xetla_meta": json.dumps({"layers": layers_meta}),
+        }
+        os.makedirs(os.path.dirname(_xetla_prequant_dump_path) or ".",
+                    exist_ok=True)
+        save_file(tensors, _xetla_prequant_dump_path, metadata=meta)
+        n = len(_xetla_prequant_dump_buf)
+        size_mb = os.path.getsize(_xetla_prequant_dump_path) / 1e6
+        print(f"[xetla] sidecar written: {_xetla_prequant_dump_path} "
+              f"({n} layers, {size_mb:.1f} MB, method={method_seen})",
+              flush=True)
+        _xetla_prequant_dump_buf.clear()
+    except Exception as e:
+        print(f"[xetla] ERROR: sidecar flush failed: {e}", flush=True)
+
+
+def _xetla_is_compiling() -> bool:
+    """Return True when running under torch.compile / Dynamo tracing.
+
+    The custom_op wrappers are needed in that case so the FX graph stays
+    closed; in eager and XPU-graph capture we can call the kernel directly
+    and shave the dispatcher frame off every call.
+    """
+    try:
+        return bool(torch.compiler.is_compiling())
+    except Exception:  # older torch
+        return False
+
+
+def _xetla_pre_convert_bias(layer: torch.nn.Module) -> None:
+    """B8: pre-convert the layer's bias to fp16 once at load time so the
+    per-call ``bias.to(torch.float16)`` becomes a no-op (same dtype, returns
+    self).  Safe for layers whose forward consumes bias in fp16 only.
+    """
+    b = getattr(layer, "bias", None)
+    if b is None:
+        return
+    if isinstance(b, torch.nn.Parameter):
+        if b.data.dtype != torch.float16:
+            b.data = b.data.to(torch.float16)
+    elif isinstance(b, torch.Tensor) and b.dtype != torch.float16:
+        layer.bias = b.to(torch.float16)
+
 class Timer:
     """A simple context manager for measuring execution time."""
     def __init__(self, *tensors):
@@ -185,7 +347,22 @@ def pack_int1x32(codes):
 
 
 def xetla_quant_method():
-    quant_method =  os.environ.get("XETLA_QUANT_METHOD", "int2").lower()
+    quant_method = os.environ.get("XETLA_QUANT_METHOD", "").lower()
+    # Auto-derive from the sidecar metadata if the user didn't pin a method
+    # but XETLA_PREQUANT_PATH is set. Avoids the silent
+    # "RuntimeError: A must be bf16" when the wrong default is used.
+    if not quant_method and _xetla_prequant_load_path:
+        try:
+            _xetla_prequant_load_index()
+            sc_method = _xetla_prequant_meta.get("method", "")
+            if sc_method:
+                print(f"[xetla] inferring XETLA_QUANT_METHOD={sc_method} "
+                      f"from sidecar metadata", flush=True)
+                quant_method = sc_method
+        except Exception:
+            pass
+    if not quant_method:
+        quant_method = "int2"
     if quant_method not in ["bf16", "int2", "int2_f16", "int1_f16"]:
         raise ValueError(f"Unsupported xetla quantization method: {quant_method}")
     return quant_method
@@ -289,11 +466,11 @@ class XetlaConfig(QuantizationConfig):
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> Optional["LinearMethodBase"]:
         if isinstance(layer, LinearBase):
-            return XetlaLinearMethod(self)
+            return XetlaLinearMethod(self, prefix=prefix)
         elif isinstance(layer, ParallelLMHead) and quantize_lm_heads:
-            return XetlaEmbeddingMethod(self, True)
+            return XetlaEmbeddingMethod(self, True, prefix=prefix)
         elif isinstance(layer, VocabParallelEmbedding) and quantize_lm_heads:
-            return XetlaEmbeddingMethod(self, False)
+            return XetlaEmbeddingMethod(self, False, prefix=prefix)
         # Other layer types (notably `Attention`) are not handled by xetla;
         # vLLM falls back to the default impl when we return None. Only print
         # once per type when XETLA_DEBUG=1 to avoid spamming one line per
@@ -309,9 +486,11 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: XetlaConfig, inplace: bool = False):
+    def __init__(self, quant_config: XetlaConfig, inplace: bool = False,
+                 prefix: str = ""):
         self.quant_config = quant_config
         self.inplace = inplace
+        self.prefix = prefix
         # self.quant_config.method = "int2"  # Embeddings use int2
         super().__init__()
 
@@ -328,6 +507,14 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not current_platform.is_xpu():
+            return
+
+        method = self.quant_config.method
+        # Sidecar load short-circuit (Option B). Only the inplace lm_head
+        # path is captured/restored; the input embedding stays dense fp16.
+        if (self.inplace and method in ("int2_f16", "int1_f16") and
+                _xetla_prequant_try_load(layer, self.prefix, method, "lm_head")):
+            print(f"[xetla] sidecar hit: {self.prefix} lm_head ({method})")
             return
 
         if self.quant_config.method == "int2":
@@ -365,6 +552,10 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
                 scale_f16.to(dev).contiguous(), requires_grad=False
             )
             layer.xetla_quantized = True
+            # B7: lm_head N is the (padded) vocab size; check DPAS capability.
+            layer._xetla_dpas_capable = (packed.shape[1] & 255) == 0
+            _xetla_pre_convert_bias(layer)
+            _xetla_prequant_dump_record(self.prefix, layer, "int2_f16", "lm_head")
         elif self.quant_config.method == "int1_f16":
             if not self.inplace:
                 return
@@ -381,6 +572,9 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
                 scale_f16.to(dev).contiguous(), requires_grad=False
             )
             layer.xetla_quantized = True
+            layer._xetla_dpas_capable = False
+            _xetla_pre_convert_bias(layer)
+            _xetla_prequant_dump_record(self.prefix, layer, "int1_f16", "lm_head")
         else:
             pass
 
@@ -397,18 +591,30 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
             return output
         if self.quant_config.method == "int2_f16" and getattr(layer, "xetla_quantized", False):
             x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
-            out = xetla_int2_fp16_upcvt_gemm(
-                x16, layer.weight, layer.scale,
-                bias.to(torch.float16) if bias is not None else None,
-            )
-            return out.to(x.dtype)
+            b16 = bias if bias is None or bias.dtype == torch.float16 else bias.to(torch.float16)
+            if not _xetla_is_compiling():
+                if x16.shape[0] > 1 and getattr(layer, "_xetla_dpas_capable", False):
+                    out = torch.ops.xetla_int2.int2_fp16_dpas_gemm_run(
+                        x16, layer.weight, layer.scale, None)
+                else:
+                    out = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
+                        x16, layer.weight, layer.scale, None)
+                if b16 is not None:
+                    out = out + b16
+            else:
+                out = xetla_int2_fp16_upcvt_gemm(x16, layer.weight, layer.scale, b16)
+            return out if out.dtype == x.dtype else out.to(x.dtype)
         if self.quant_config.method == "int1_f16" and getattr(layer, "xetla_quantized", False):
             x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
-            out = xetla_int1_fp16_upcvt_gemm(
-                x16, layer.weight, layer.scale,
-                bias.to(torch.float16) if bias is not None else None,
-            )
-            return out.to(x.dtype)
+            b16 = bias if bias is None or bias.dtype == torch.float16 else bias.to(torch.float16)
+            if not _xetla_is_compiling():
+                out = torch.ops.xetla_int2.int1_fp16_upcvt_gemm_run(
+                    x16, layer.weight, layer.scale, None)
+                if b16 is not None:
+                    out = out + b16
+            else:
+                out = xetla_int1_fp16_upcvt_gemm(x16, layer.weight, layer.scale, b16)
+            return out if out.dtype == x.dtype else out.to(x.dtype)
         return super().apply(layer, x, bias)
 
 
@@ -419,8 +625,9 @@ class XetlaLinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: XetlaConfig):
+    def __init__(self, quant_config: XetlaConfig, prefix: str = ""):
         self.quant_config = quant_config
+        self.prefix = prefix
         super().__init__()
 
     def create_weights(self, layer: torch.nn.Module,
@@ -437,13 +644,20 @@ class XetlaLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not current_platform.is_xpu():
             return
-       
-        print(f"Processing weights for layer {layer} with method {self.quant_config.method}")
-        if self.quant_config.method == "int2":
+
+        method = self.quant_config.method
+        # Sidecar load short-circuit (Option B).
+        if method in ("int2_f16", "int1_f16") and \
+                _xetla_prequant_try_load(layer, self.prefix, method, "linear"):
+            print(f"[xetla] sidecar hit: {self.prefix} ({method})")
+            return
+
+        print(f"Processing weights for layer {layer} with method {method}")
+        if method == "int2":
             weight = layer.weight.data
             weight_int2, layer.scale = quantize_to_int2(weight.t())
             layer.weight.data = pack_int2_vnni16(weight_int2)
-        elif self.quant_config.method == "int2_f16":
+        elif method == "int2_f16":
             # Bonsai-style ternary fp16 weight: every 128 K-entries share an
             # fp16 scale and values are exactly s*{-1, 0, +1}. Recover that
             # encoding losslessly so we can call the int2 x fp16-scale upcvt
@@ -456,7 +670,12 @@ class XetlaLinearMethod(LinearMethodBase):
             layer.scale = torch.nn.Parameter(
                 scale_f16.to(weight.device).contiguous(), requires_grad=False
             )
-        elif self.quant_config.method == "int1_f16":
+            # B7: cache the dispatch predicate (depends only on N).
+            layer._xetla_dpas_capable = (packed.shape[1] & 255) == 0
+            layer.xetla_quantized = True
+            _xetla_pre_convert_bias(layer)
+            _xetla_prequant_dump_record(self.prefix, layer, method, "linear")
+        elif method == "int1_f16":
             # Bonsai-8B-unpacked-style binary fp16 weight: every 128 K-entries
             # share an fp16 scale and values are s*{-1, +1}. Re-quantize with
             # the sign-bit and per-128-K absmax to feed the int1 upcvt GEMM.
@@ -470,6 +689,11 @@ class XetlaLinearMethod(LinearMethodBase):
             layer.scale = torch.nn.Parameter(
                 scale_f16.to(dev).contiguous(), requires_grad=False
             )
+            # int1 path has no DPAS variant.
+            layer._xetla_dpas_capable = False
+            layer.xetla_quantized = True
+            _xetla_pre_convert_bias(layer)
+            _xetla_prequant_dump_record(self.prefix, layer, method, "linear")
         else:
             pass
 
@@ -478,30 +702,170 @@ class XetlaLinearMethod(LinearMethodBase):
             x: torch.Tensor,
             bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-        # with Timer(x, layer.weight) as t:
-        if True:
-            if self.quant_config.method == "int2":
-                # import xetla_pt_ext
-                # print("Using xetla int2 gemm x: ", x.shape, " weight: ", layer.weight.shape)
-                c = xetla_int2_bf16_fused_gemm(x, layer.weight, layer.scale, bias)
-                return c
-            elif self.quant_config.method == "int2_f16":
-                # Activations must be fp16 for this kernel.
-                x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
-                c = xetla_int2_fp16_upcvt_gemm(
-                    x16, layer.weight, layer.scale,
-                    bias.to(torch.float16) if bias is not None else None,
-                )
-                return c.to(x.dtype)
-            elif self.quant_config.method == "int1_f16":
-                x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
-                c = xetla_int1_fp16_upcvt_gemm(
-                    x16, layer.weight, layer.scale,
-                    bias.to(torch.float16) if bias is not None else None,
-                )
-                return c.to(x.dtype)
+        method = self.quant_config.method
+        if method == "int2":
+            return xetla_int2_bf16_fused_gemm(x, layer.weight, layer.scale, bias)
+        if method == "int2_f16":
+            x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+            # B8: prefer the pre-converted layer.bias (always fp16 already).
+            b16 = bias if bias is None or bias.dtype == torch.float16 else bias.to(torch.float16)
+            # B7: under eager (no torch.compile tracing), skip the dispatch
+            # custom_op and call the right kernel directly using the cached
+            # capability flag. Saves ~5us per call from the dispatcher frame.
+            if not _xetla_is_compiling() and getattr(layer, "_xetla_dpas_capable", False) is not None:
+                if x16.shape[0] > 1 and layer._xetla_dpas_capable:
+                    c = torch.ops.xetla_int2.int2_fp16_dpas_gemm_run(
+                        x16, layer.weight, layer.scale, None)
+                else:
+                    c = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
+                        x16, layer.weight, layer.scale, None)
+                if b16 is not None:
+                    c = c + b16
             else:
-                return UnquantizedLinearMethod.apply(self, layer, x, bias)
+                c = xetla_int2_fp16_upcvt_gemm(x16, layer.weight, layer.scale, b16)
+            return c if c.dtype == x.dtype else c.to(x.dtype)
+        if method == "int1_f16":
+            x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+            b16 = bias if bias is None or bias.dtype == torch.float16 else bias.to(torch.float16)
+            if not _xetla_is_compiling():
+                c = torch.ops.xetla_int2.int1_fp16_upcvt_gemm_run(
+                    x16, layer.weight, layer.scale, None)
+                if b16 is not None:
+                    c = c + b16
+            else:
+                c = xetla_int1_fp16_upcvt_gemm(x16, layer.weight, layer.scale, b16)
+            return c if c.dtype == x.dtype else c.to(x.dtype)
+        return UnquantizedLinearMethod.apply(self, layer, x, bias)
+
+
+# ---- inline xetla GEMM profile shim (XETLA_PROFILE=1) ----------------------
+import atexit as _atexit
+import collections as _collections
+import signal as _signal
+import threading as _threading
+
+_xprof_lock = _threading.Lock()
+_xprof_stats: dict = {}
+_xprof_installed = False
+
+
+def _xprof_bytes(op_name: str, m: int, n: int, k: int) -> int:
+    fp16_b = 2
+    a = m * k * fp16_b
+    c = m * n * fp16_b
+    if "int2_fp16" in op_name:
+        b = k * n // 4
+        sb = (k // 128) * n * fp16_b
+    elif "int1_fp16" in op_name:
+        b = k * n // 8
+        sb = (k // 128) * n * fp16_b
+    elif "int2_bf16" in op_name:
+        b = k * n // 4
+        sb = (k // 128) * n * 4
+    else:
+        b = k * n // 4
+        sb = (k // 128) * n * fp16_b
+    return a + b + sb + c
+
+
+def _xprof_capturing() -> bool:
+    # Skip host-side sync when an XPU command graph is being recorded;
+    # queue.wait() is illegal during capture.
+    try:
+        return bool(torch.xpu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _xprof_wrap(op, op_name: str):
+    def wrapped(A, B, scale_B, *rest, **kw):
+        m = int(A.shape[0]); k = int(A.shape[1]); n = int(B.shape[1])
+        capturing = _xprof_capturing()
+        if not capturing:
+            torch.xpu.synchronize()
+        t0 = time.perf_counter()
+        out = op(A, B, scale_B, *rest, **kw)
+        if not capturing:
+            torch.xpu.synchronize()
+        dt = time.perf_counter() - t0
+        nbytes = _xprof_bytes(op_name, m, n, k)
+        with _xprof_lock:
+            key = (op_name, m, n, k)
+            s = _xprof_stats.setdefault(key, {"calls": 0, "time_s": 0.0, "bytes": 0})
+            s["calls"] += 1
+            s["time_s"] += dt
+            s["bytes"] += nbytes
+        return out
+    return wrapped
+
+
+def _xprof_print():
+    if not _xprof_stats:
+        print("\n=== xetla profile: no GEMM calls recorded ===\n", flush=True)
+        return
+    items = sorted(_xprof_stats.items(), key=lambda kv: -kv[1]["time_s"])
+    per_op = _collections.defaultdict(lambda: {"calls": 0, "time_s": 0.0, "bytes": 0})
+    for (op_name, m, n, k), s in items:
+        a = per_op[op_name]
+        a["calls"] += s["calls"]; a["time_s"] += s["time_s"]; a["bytes"] += s["bytes"]
+    grand_time = sum(s["time_s"] for s in _xprof_stats.values())
+    grand_calls = sum(int(s["calls"]) for s in _xprof_stats.values())
+    grand_bytes = sum(int(s["bytes"]) for s in _xprof_stats.values())
+    GB = 1e9
+    print("\n" + "=" * 100, flush=True)
+    print("=== xetla GEMM profile (per-op aggregate) ===", flush=True)
+    print("=" * 100, flush=True)
+    print(f"{'op_name':<36} {'calls':>10} {'total_ms':>12} {'avg_us':>10} {'GB/s':>10} {'%time':>8}", flush=True)
+    for op_name, a in sorted(per_op.items(), key=lambda kv: -kv[1]["time_s"]):
+        avg_us = a["time_s"] / a["calls"] * 1e6
+        gbps = a["bytes"] / a["time_s"] / GB if a["time_s"] > 0 else 0.0
+        pct = 100 * a["time_s"] / grand_time if grand_time > 0 else 0.0
+        print(f"{op_name:<36} {int(a['calls']):>10} {a['time_s']*1e3:>12.2f} {avg_us:>10.1f} {gbps:>10.1f} {pct:>7.2f}%", flush=True)
+    print(f"{'TOTAL':<36} {grand_calls:>10} {grand_time*1e3:>12.2f}", flush=True)
+    print("\n" + "=" * 100, flush=True)
+    print("=== xetla GEMM profile (per-shape breakdown) ===", flush=True)
+    print("=" * 100, flush=True)
+    print(f"{'op_name':<36} {'M':>6} {'N':>8} {'K':>8} {'calls':>8} {'total_ms':>10} {'avg_us':>9} {'GB/s':>8} {'%time':>7}", flush=True)
+    for (op_name, m, n, k), s in items:
+        avg_us = s["time_s"] / s["calls"] * 1e6
+        gbps = s["bytes"] / s["time_s"] / GB if s["time_s"] > 0 else 0.0
+        pct = 100 * s["time_s"] / grand_time if grand_time > 0 else 0.0
+        print(f"{op_name:<36} {m:>6} {n:>8} {k:>8} {int(s['calls']):>8} {s['time_s']*1e3:>10.2f} {avg_us:>9.1f} {gbps:>8.1f} {pct:>6.2f}%", flush=True)
+    print(f"\nGEMM total wall time: {grand_time*1e3:.2f} ms across {grand_calls} calls, "
+          f"{grand_bytes/GB:.2f} GB moved, avg eff = {grand_bytes/grand_time/GB:.1f} GB/s", flush=True)
+    print("=" * 100, flush=True)
+
+
+def _install_xetla_profile():
+    global _xprof_installed
+    if _xprof_installed:
+        return
+    if int(os.environ.get("XETLA_PROFILE", "0")) <= 0:
+        return
+    ns = torch.ops.xetla_int2
+    candidates = [
+        "int2_fp16_upcvt_gemm_run",
+        "int2_fp16_dpas_gemm_run",
+        "int1_fp16_upcvt_gemm_run",
+        "int2_bf16_fused_gemm_run",
+    ]
+    installed = []
+    for name in candidates:
+        op = getattr(ns, name, None)
+        if op is None:
+            continue
+        setattr(ns, name, _xprof_wrap(op, name))
+        installed.append(name)
+    if installed:
+        print(f"[xetla profile] wrapped: {', '.join(installed)}", flush=True)
+        _atexit.register(_xprof_print)
+        try:
+            _signal.signal(_signal.SIGTERM, lambda *_: (_xprof_print(), os._exit(0)))
+        except Exception:
+            pass
+        _xprof_installed = True
+    else:
+        print("[xetla profile] no ops found to wrap", flush=True)
 
 
 def register():
@@ -514,6 +878,46 @@ def register():
         import xetla_pt_ext  # noqa: F401
     except Exception as e:
         print(f"[xetla] WARNING: could not import xetla_pt_ext: {e}")
+
+    # Optional GEMM profiling shim: set XETLA_PROFILE=1 to enable.
+    try:
+        _install_xetla_profile()
+    except Exception as e:
+        print(f"[xetla] WARNING: could not install xetla_profile: {e}")
+
+    # Sidecar dump hook: wrap the model-level process_weights_after_loading
+    # so we can flush the captured (qweight, scale) pairs to a single
+    # safetensors file once the whole model has been quantized. Several
+    # loaders do `from ...utils import process_weights_after_loading`, so
+    # we patch every module that re-exports the binding.
+    if _xetla_prequant_dump_path:
+        try:
+            import vllm.model_executor.model_loader.utils as _mu  # noqa: WPS433
+            _orig_pwal = _mu.process_weights_after_loading
+
+            def _wrapped_pwal(*args, **kwargs):
+                _orig_pwal(*args, **kwargs)
+                _xetla_prequant_flush_dump()
+
+            _mu.process_weights_after_loading = _wrapped_pwal
+            # Patch every loader that imported the symbol by name.
+            for _modname in (
+                "vllm.model_executor.model_loader.base_loader",
+                "vllm.model_executor.model_loader.gguf_loader",
+                "vllm.model_executor.model_loader.tensorizer_loader",
+                "vllm.model_executor.model_loader",
+                "vllm.model_executor.models.utils",
+                "vllm.model_executor.models.mllama4",
+            ):
+                try:
+                    _m = __import__(_modname, fromlist=["*"])
+                except Exception:
+                    continue
+                if hasattr(_m, "process_weights_after_loading"):
+                    _m.process_weights_after_loading = _wrapped_pwal
+            print(f"[xetla] sidecar dump enabled -> {_xetla_prequant_dump_path}")
+        except Exception as e:
+            print(f"[xetla] WARN: could not install sidecar dump hook: {e}")
 
     register_quantization_config("xetla")(XetlaConfig)
     
