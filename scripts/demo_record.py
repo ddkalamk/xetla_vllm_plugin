@@ -223,27 +223,33 @@ def main() -> None:
             if out.finished:
                 final_text = text
                 n_tokens = len(o0.token_ids)
-    elapsed = time.perf_counter() - t0
-    decode_elapsed = (
-        time.perf_counter() - first_tok_t
-        if first_tok_t is not None and n_tokens > 1
-        else elapsed
-    )
-    decode_tps = (n_tokens - 1) / decode_elapsed if decode_elapsed > 0 and n_tokens > 1 else 0.0
+    t_end = time.perf_counter()
+    elapsed = t_end - t0
+
+    # Decode throughput: inter-token rate after the first token (excludes
+    # prefill/TTFT).
+    if first_tok_t is not None and n_tokens > 1:
+        decode_elapsed = t_end - first_tok_t
+        decode_tps = (n_tokens - 1) / decode_elapsed if decode_elapsed > 0 else 0.0
+    else:
+        decode_elapsed = elapsed
+        decode_tps = 0.0
 
     # Stat line.
     cast.write("\r\n\r\n")
     cast.write(
         f"{BOLD}{GREEN}[{args.label}]{RESET} "
-        f"{n_tokens} tokens in {elapsed:.2f}s  "
+        f"{n_tokens} tokens in {decode_elapsed:.2f}s  "
         f"{BOLD}{decode_tps:.2f} tok/s{RESET} (decode)\r\n"
     )
 
     # Hold on the final frame for a beat.
     time.sleep(1.5)
     cast.close()
-    print(f"[demo] Done: {n_tokens} tokens, {decode_tps:.2f} tok/s decode -> {args.out}",
-          file=sys.stderr)
+    print(
+        f"[demo] Done: {n_tokens} tokens, {decode_tps:.2f} tok/s decode -> {args.out}",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":
