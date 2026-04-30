@@ -134,8 +134,8 @@ sycl::event absmax_row_reduction_impl(
           sycl::nd_range<1>(
               sycl::range<1>(global_size), sycl::range<1>(local_size)),
           [=](sycl::nd_item<1> it) {
-            absmax_row_reduction<in_dtype, twidth, theight, twidth, theight>::
-                run(it, A, cols, rows, ld, scale_bs, C);
+        absmax_row_reduction<in_dtype, twidth, theight, twidth, theight>::run(
+            it, A, cols, rows, ld, scale_bs, C);
           });
     });
   }
@@ -146,5 +146,11 @@ sycl::event absmax_row_reduction_impl(
 sycl::event absmax_row_reduction_run(
     sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
     bf16* A, float* C) {
+  return absmax_row_reduction_impl(queue, rows, cols, ld, scale_bs, A, C);
+}
+
+sycl::event absmax_row_reduction_run(
+    sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
+    fp16* A, float* C) {
   return absmax_row_reduction_impl(queue, rows, cols, ld, scale_bs, A, C);
 }

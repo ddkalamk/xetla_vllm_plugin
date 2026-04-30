@@ -1,0 +1,45 @@
+/*******************************************************************************
+ * Copyright (c) 2022-2023 Intel Corporation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *******************************************************************************/
+
+#include "int2_cint_fused_kernel_impl.h"
+
+using namespace sycl;
+using namespace gpu::xetla;
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+using fp16 = sycl::half;
+
+template <typename DT>
+using ft_int2 = sycl::event (*)(
+    sycl::queue& q, const size_t m, const size_t n, const size_t k, DT* A,
+    int32_t* B, DT* C, float* scale_A, float* scale_B, DT* bias,
+    size_t num_groups);
+
+template <typename DT>
+std::pair<ft_int2<DT>, bool> get_woq_cint_fused_gemm_func(int m, int n, int k) {
+  using Dispatcher = int2_cint_fused_kernel::Int2GemmDispatcher<DT, float>;
+  static_assert(
+      std::is_same_v<typename Dispatcher::ft, ft_int2<DT>>,
+      "Dispatcher::ft must match ft_int2<DT>");
+  return Dispatcher::get_func(m, n, k);
+}
+
+// Explicit instantiations for supported activation dtypes.
+template std::pair<ft_int2<bf16>, bool> get_woq_cint_fused_gemm_func<bf16>(
+    int m, int n, int k);
+
+template std::pair<ft_int2<fp16>, bool> get_woq_cint_fused_gemm_func<fp16>(
+    int m, int n, int k);

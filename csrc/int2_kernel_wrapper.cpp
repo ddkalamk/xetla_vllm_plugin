@@ -27,6 +27,7 @@ std::chrono::high_resolution_clock::time_point ref_time_point_ =
     std::chrono::high_resolution_clock::now();
 
 using bf16 = sycl::ext::oneapi::bfloat16;
+using fp16 = sycl::half;
 
 // sycl::event int2_bf16_gemm_run(sycl::queue &q, const size_t m, const size_t
 // n, const size_t k, bf16 *A, int32_t *B, bf16 *C, float *scale_A, float*
@@ -36,26 +37,47 @@ sycl::event absmax_row_reduction_run(
     sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
     bf16* A, float* C);
 
-sycl::event int2_bf16_fused_gemm_run_dynamic(
-    sycl::queue& q, const size_t m, const size_t n, const size_t k, bf16* A,
-    int32_t* B, bf16* C, float* scale_B, bf16* bias);
-sycl::event int2_bf16_fused_gemm_run(
-    sycl::queue& q, const size_t m, const size_t n, const size_t k, bf16* A,
-    int32_t* B, bf16* C, float* scale_A, float* scale_B, bf16* bias);
+sycl::event absmax_row_reduction_run(
+    sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
+    fp16* A, float* C);
 
-typedef sycl::event (*ft)(
-    sycl::queue& q, const size_t m, const size_t n, const size_t k, bf16* A,
-    int32_t* B, bf16* C, float* scale_A, float* scale_B, bf16* bias);
-std::pair<ft, bool> get_int2_bf16_fused_gemm_func(int m, int n, int k);
+template <typename DT>
+struct int2_dt_traits;
 
-torch::Tensor int2_bf16_fused_gemm_run_torch(
+template <>
+struct int2_dt_traits<bf16> {
+  using torch_t = at::BFloat16;
+  static constexpr auto torch_dtype = torch::kBFloat16;
+  static constexpr const char* name = "bf16";
+};
+
+template <>
+struct int2_dt_traits<fp16> {
+  using torch_t = at::Half;
+  static constexpr auto torch_dtype = torch::kHalf;
+  static constexpr const char* name = "fp16";
+};
+
+template <typename DT>
+using ft_int2 = sycl::event (*)(
+    sycl::queue& q, const size_t m, const size_t n, const size_t k, DT* A,
+    int32_t* B, DT* C, float* scale_A, float* scale_B, DT* bias,
+    size_t num_groups);
+
+template <typename DT>
+std::pair<ft_int2<DT>, bool> get_woq_cint_fused_gemm_func(int m, int n, int k);
+
+template <typename DT>
+torch::Tensor int2_fused_gemm_run_torch_impl(
     torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
-    std::optional<torch::Tensor> bias = std::nullopt,
-    std::optional<torch::Tensor> C_out = std::nullopt) {
-  RECORD_FUNCTION("int2_bf16_fused_gemm", {A, B});
-  Timer t_("int2_bf16_fused_gemm");
+    std::optional<torch::Tensor> bias, std::optional<torch::Tensor> C_out) {
+  using traits = int2_dt_traits<DT>;
+  using torch_t = typename traits::torch_t;
+  constexpr auto kDT = traits::torch_dtype;
+  RECORD_FUNCTION("int2_woq_fused_gemm", {A, B});
+  Timer t_("int2_woq_fused_gemm");
   // Check input types
-  TORCH_CHECK(A.dtype() == torch::kBFloat16, "A must be bf16");
+  TORCH_CHECK(A.dtype() == kDT, std::string("A must be ") + traits::name);
   TORCH_CHECK(B.dtype() == torch::kInt32, "B must be int32 (int2x16)");
   TORCH_CHECK(scale_B.dtype() == torch::kFloat, "scale_B must be float");
   TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
@@ -68,11 +90,11 @@ torch::Tensor int2_bf16_fused_gemm_run_torch(
   TORCH_CHECK(A.dim() == 2, "A must be 2D");
   TORCH_CHECK(B.dim() == 2, "B must be 2D");
   TORCH_CHECK(scale_B.dim() == 2, "scale_B must be 2D");
-  TORCH_CHECK(scale_B.size(0) == 1, "scale_B first dimension must be 1");
   TORCH_CHECK(
       scale_B.size(1) == B.size(1),
       "scale_B second dimension must match B's second dimension");
   long m, n, k;
+  long num_groups;
   auto a_sizes = A.sizes();
   auto b_sizes = B.sizes();
   m = a_sizes[0];
@@ -80,11 +102,13 @@ torch::Tensor int2_bf16_fused_gemm_run_torch(
   n = b_sizes[1];
   TORCH_CHECK(k % 16 == 0, "k must be multiple of 16");
   TORCH_CHECK(b_sizes[0] == k / 16, "B's first dimension must be k/16");
+  num_groups = scale_B.size(0);
 
   // Allocate output tensor
   torch::Tensor C;
   if (C_out.has_value()) {
-    TORCH_CHECK(C_out->dtype() == torch::kBFloat16, "C must be bf16");
+    TORCH_CHECK(
+        C_out->dtype() == kDT, std::string("C must be ") + traits::name);
     TORCH_CHECK(C_out->is_contiguous(), "C must be contiguous");
     TORCH_CHECK(C_out->device().is_xpu(), "C must be on XPU");
     TORCH_CHECK(
@@ -98,93 +122,71 @@ torch::Tensor int2_bf16_fused_gemm_run_torch(
         "C second dimension must match B's second dimension");
     C = *C_out;
   } else {
-    C = A.new_empty({m, n}, torch::kBFloat16);
+    C = A.new_empty({m, n}, kDT);
   }
 
-  // A = at::ones_like(A) * 1.2f;
-  // B = at::full_like(B, 0x55555555);
-  // scale_B = at::ones_like(scale_B) * 0.5f;
-  // auto scale_A = A.new_empty({1, m}, torch::kFloat);
-  // auto scale_A1 = 127.0f / torch::amax(torch::abs(A), /*dim=*/1,
-  // /*keepdim=*/true).t().to(torch::kFloat); auto scale_A = A.new_ones({1, m},
-  // torch::kFloat);
-
-  // Create SYCL queue
-  // sycl::queue q;
   auto q = c10::xpu::getCurrentXPUStream(A.device().index()).queue();
 
   // Get raw pointers
-  bf16* a_ptr = (bf16*)(A.data_ptr<at::BFloat16>());
+  DT* a_ptr = (DT*)(A.data_ptr<torch_t>());
   int32_t* b_ptr = B.data_ptr<int32_t>();
-  bf16* c_ptr = (bf16*)(C.data_ptr<at::BFloat16>());
+  DT* c_ptr = (DT*)(C.data_ptr<torch_t>());
+  DT* bias_ptr = bias.has_value() ? (DT*)(bias->data_ptr<torch_t>()) : nullptr;
+
   float* scale_B_ptr = scale_B.data_ptr<float>();
-  bf16* bias_ptr =
-      bias.has_value() ? (bf16*)(bias->data_ptr<at::BFloat16>()) : nullptr;
 
-#if 1
-  auto [gemm_func, externalScaleA] = get_int2_bf16_fused_gemm_func(m, n, k);
+  auto[gemm_func, externalScaleA] = get_woq_cint_fused_gemm_func<DT>(m, n, k);
   if (externalScaleA) {
-    auto scale_A = A.new_empty({1, m}, torch::kFloat);
+    auto scale_A = A.new_empty({num_groups, m}, torch::kFloat);
     float* scale_A_ptr = scale_A.data_ptr<float>();
-
-    // Compute scale_A as the absolute max of each row of A
     {
       RECORD_FUNCTION("absmax_row_reduction_run", {});
       Timer t_("absmax_row_reduction_run");
-      absmax_row_reduction_run(q, m, k, k, 1, a_ptr, scale_A_ptr);
+      absmax_row_reduction_run(q, m, k, k, num_groups, a_ptr, scale_A_ptr);
     }
-    // q.wait();
-    // std::cout << "scale_A (after absmax): " << scale_A << "\n";
-    // std::cout << "scale_A1 (computed in PyTorch): " << scale_A1 << "\n";
-    // Run GEMM
     {
-      RECORD_FUNCTION("int2_bf16_fused_gemm_run", {});
-      Timer t_("int2_bf16_fused_gemm_run");
+      RECORD_FUNCTION("int2_woq_fused_gemm_run", {});
+      Timer t_("int2_woq_fused_gemm_run");
       gemm_func(
-          q, m, n, k, a_ptr, b_ptr, c_ptr, scale_A_ptr, scale_B_ptr, bias_ptr);
+          q, m, n, k, a_ptr, b_ptr, c_ptr, scale_A_ptr, scale_B_ptr, bias_ptr,
+          num_groups);
     }
   } else {
-    {
-      RECORD_FUNCTION("int2_bf16_fused_gemm_run_dynamic", {});
-      Timer t_("int2_bf16_fused_gemm_run_dynamic");
-      gemm_func(
-          q, m, n, k, a_ptr, b_ptr, c_ptr, nullptr, scale_B_ptr, bias_ptr);
-    }
+    RECORD_FUNCTION("int2_woq_fused_gemm_run_dynamic", {});
+    Timer t_("int2_woq_fused_gemm_run_dynamic");
+    gemm_func(
+        q, m, n, k, a_ptr, b_ptr, c_ptr, nullptr, scale_B_ptr, bias_ptr,
+        num_groups);
   }
-#else
-  if (m > 1) {
-    auto scale_A = A.new_empty({1, m}, torch::kFloat);
-    float* scale_A_ptr = scale_A.data_ptr<float>();
-
-    // Compute scale_A as the absolute max of each row of A
-    {
-      RECORD_FUNCTION("absmax_row_reduction_run", {});
-      Timer t_("absmax_row_reduction_run");
-      absmax_row_reduction_run(q, m, k, k, 1, a_ptr, scale_A_ptr);
-    }
-    // q.wait();
-    // std::cout << "scale_A (after absmax): " << scale_A << "\n";
-    // std::cout << "scale_A1 (computed in PyTorch): " << scale_A1 << "\n";
-    // Run GEMM
-    {
-      RECORD_FUNCTION("int2_bf16_fused_gemm_run", {});
-      Timer t_("int2_bf16_fused_gemm_run");
-      int2_bf16_fused_gemm_run(
-          q, m, n, k, a_ptr, b_ptr, c_ptr, scale_A_ptr, scale_B_ptr, bias_ptr);
-    }
-  } else {
-    {
-      RECORD_FUNCTION("int2_bf16_fused_gemm_run_dynamic", {});
-      Timer t_("int2_bf16_fused_gemm_run_dynamic");
-      int2_bf16_fused_gemm_run_dynamic(
-          q, m, n, k, a_ptr, b_ptr, c_ptr, scale_B_ptr, bias_ptr);
-    }
-  }
-#endif
-
-  // q.wait();
 
   return C;
+}
+
+torch::Tensor int2_bf16_fused_gemm_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
+    std::optional<torch::Tensor> bias = std::nullopt,
+    std::optional<torch::Tensor> C_out = std::nullopt) {
+  return int2_fused_gemm_run_torch_impl<bf16>(A, B, scale_B, bias, C_out);
+}
+
+torch::Tensor int2_fp16_fused_gemm_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
+    std::optional<torch::Tensor> bias = std::nullopt,
+    std::optional<torch::Tensor> C_out = std::nullopt) {
+  return int2_fused_gemm_run_torch_impl<fp16>(A, B, scale_B, bias, C_out);
+}
+
+torch::Tensor int2_woq_fused_gemm_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
+    std::optional<torch::Tensor> bias = std::nullopt,
+    std::optional<torch::Tensor> C_out = std::nullopt) {
+  if (A.dtype() == torch::kBFloat16) {
+    return int2_bf16_fused_gemm_run_torch(A, B, scale_B, bias, C_out);
+  } else if (A.dtype() == torch::kHalf) {
+    return int2_fp16_fused_gemm_run_torch(A, B, scale_B, bias, C_out);
+  } else {
+    TORCH_CHECK(false, "Unsupported data type for A");
+  }
 }
 
 // PyTorch binding
@@ -192,8 +194,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "int2_bf16_fused_gemm_run", &int2_bf16_fused_gemm_run_torch,
       "SYCL int2_bf16_fused_gemm_run");
+  m.def(
+      "int2_fp16_fused_gemm_run", &int2_fp16_fused_gemm_run_torch,
+      "SYCL int2_fp16_fused_gemm_run");
+  m.def(
+      "int2_woq_fused_gemm_run", &int2_woq_fused_gemm_run_torch,
+      "SYCL int2_woq_fused_gemm_run");
 }
 
 TORCH_LIBRARY(xetla_int2, m) {
   m.def("int2_bf16_fused_gemm_run", &int2_bf16_fused_gemm_run_torch);
+  m.def("int2_fp16_fused_gemm_run", &int2_fp16_fused_gemm_run_torch);
+  m.def("int2_woq_fused_gemm_run", &int2_woq_fused_gemm_run_torch);
 }
