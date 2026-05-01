@@ -39,6 +39,10 @@ sycl::event absmax_row_reduction_run(
 
 sycl::event absmax_row_reduction_run(
     sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
+    bf16* A, bf16* C);
+
+sycl::event absmax_row_reduction_run(
+    sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
     fp16* A, float* C);
 
 sycl::event absmax_row_reduction_run(
@@ -79,6 +83,12 @@ template <>
 struct scale_dtype_traits<float> {
   using torch_t = float;
   static constexpr auto torch_dtype = torch::kFloat;
+};
+
+template <>
+struct scale_dtype_traits<bf16> {
+  using torch_t = at::BFloat16;
+  static constexpr auto torch_dtype = torch::kBFloat16;
 };
 
 template <>
@@ -191,6 +201,13 @@ torch::Tensor int2_bf16_fused_gemm_run_torch(
     torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
     std::optional<torch::Tensor> bias = std::nullopt,
     std::optional<torch::Tensor> C_out = std::nullopt) {
+  TORCH_CHECK(
+      scale_B.dtype() == torch::kFloat || scale_B.dtype() == torch::kBFloat16,
+      "scale_B must be float or bf16 for bf16 activations");
+  if (scale_B.dtype() == torch::kBFloat16) {
+    return int2_fused_gemm_run_torch_impl<bf16, bf16>(
+        A, B, scale_B, bias, C_out);
+  }
   return int2_fused_gemm_run_torch_impl<bf16, float>(
       A, B, scale_B, bias, C_out);
 }

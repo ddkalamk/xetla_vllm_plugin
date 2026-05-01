@@ -42,6 +42,9 @@ std::pair<ft_int2<DT, ScaleT>, bool> get_woq_cint_fused_gemm_func(
 template std::pair<ft_int2<bf16, float>, bool>
 get_woq_cint_fused_gemm_func<bf16, float>(int m, int n, int k);
 
+template std::pair<ft_int2<bf16, bf16>, bool>
+get_woq_cint_fused_gemm_func<bf16, bf16>(int m, int n, int k);
+
 template std::pair<ft_int2<fp16, float>, bool>
 get_woq_cint_fused_gemm_func<fp16, float>(int m, int n, int k);
 

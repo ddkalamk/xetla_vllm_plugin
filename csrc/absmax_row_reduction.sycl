@@ -156,6 +156,12 @@ sycl::event absmax_row_reduction_run(
 
 sycl::event absmax_row_reduction_run(
     sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
+    bf16* A, bf16* C) {
+  return absmax_row_reduction_impl(queue, rows, cols, ld, scale_bs, A, C);
+}
+
+sycl::event absmax_row_reduction_run(
+    sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
     fp16* A, float* C) {
   return absmax_row_reduction_impl(queue, rows, cols, ld, scale_bs, A, C);
 }
