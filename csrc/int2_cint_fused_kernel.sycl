@@ -22,24 +22,28 @@ using namespace gpu::xetla;
 using bf16 = sycl::ext::oneapi::bfloat16;
 using fp16 = sycl::half;
 
-template <typename DT>
+template <typename DT, typename ScaleT>
 using ft_int2 = sycl::event (*)(
     sycl::queue& q, const size_t m, const size_t n, const size_t k, DT* A,
-    int32_t* B, DT* C, float* scale_A, float* scale_B, DT* bias,
+    int32_t* B, DT* C, ScaleT* scale_A, ScaleT* scale_B, DT* bias,
     size_t num_groups);
 
-template <typename DT>
-std::pair<ft_int2<DT>, bool> get_woq_cint_fused_gemm_func(int m, int n, int k) {
-  using Dispatcher = int2_cint_fused_kernel::Int2GemmDispatcher<DT, float>;
+template <typename DT, typename ScaleT>
+std::pair<ft_int2<DT, ScaleT>, bool> get_woq_cint_fused_gemm_func(
+    int m, int n, int k) {
+  using Dispatcher = int2_cint_fused_kernel::Int2GemmDispatcher<DT, ScaleT>;
   static_assert(
-      std::is_same_v<typename Dispatcher::ft, ft_int2<DT>>,
-      "Dispatcher::ft must match ft_int2<DT>");
+      std::is_same_v<typename Dispatcher::ft, ft_int2<DT, ScaleT>>,
+      "Dispatcher::ft must match ft_int2<DT, ScaleT>");
   return Dispatcher::get_func(m, n, k);
 }
 
-// Explicit instantiations for supported activation dtypes.
-template std::pair<ft_int2<bf16>, bool> get_woq_cint_fused_gemm_func<bf16>(
-    int m, int n, int k);
+// Explicit instantiations for supported (activation, scale) dtype combos.
+template std::pair<ft_int2<bf16, float>, bool>
+get_woq_cint_fused_gemm_func<bf16, float>(int m, int n, int k);
 
-template std::pair<ft_int2<fp16>, bool> get_woq_cint_fused_gemm_func<fp16>(
-    int m, int n, int k);
+template std::pair<ft_int2<fp16, float>, bool>
+get_woq_cint_fused_gemm_func<fp16, float>(int m, int n, int k);
+
+template std::pair<ft_int2<fp16, fp16>, bool>
+get_woq_cint_fused_gemm_func<fp16, fp16>(int m, int n, int k);

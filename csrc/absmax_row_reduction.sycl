@@ -21,11 +21,13 @@
 using namespace gpu::xetla;
 using namespace gpu::xetla::subgroup;
 
-template <typename in_dtype, int twidth, int theight, int bwidth, int bheight>
+template <
+    typename in_dtype, typename out_dtype, int twidth, int theight, int bwidth,
+    int bheight>
 struct absmax_row_reduction {
   static KERNEL_FUNC inline void run(
       sycl::nd_item<1> it, in_dtype* a_base, int swidth, int sheight,
-      int spitch, int scale_bs, float* c_base) {
+      int spitch, int scale_bs, out_dtype* c_base) {
     const int group_id = static_cast<int>(it.get_group(0));
     const int local_id = static_cast<int>(it.get_local_id(0));
     const int total_rows = sheight;
@@ -108,19 +110,20 @@ struct absmax_row_reduction {
       invd = invd * (2.0 - row_max_d * invd);
       invd = invd * (2.0 - row_max_d * invd);
       invd = invd * (2.0 - row_max_d * invd);
-      // store final scale as float
-      c_base[igs * sheight + row] = static_cast<float>(127.0 * invd);
+      // store final scale (cast to out_dtype)
+      c_base[igs * sheight + row] = static_cast<out_dtype>(127.0 * invd);
     }
   }
 };
 
-template <typename in_dtype, int twidth, int theight>
+template <typename in_dtype, typename out_dtype, int twidth, int theight>
 class compute_scale_kernel;
 
-template <typename in_dtype, int twidth = 128, int theight = 32>
+template <
+    typename in_dtype, typename out_dtype, int twidth = 128, int theight = 32>
 sycl::event absmax_row_reduction_impl(
     sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
-    in_dtype* A, float* C) {
+    in_dtype* A, out_dtype* C) {
   const size_t local_size = theight; // threads per group: theight
   const size_t num_groups =
       (rows + theight - 1) / theight; // number of groups needed
@@ -130,12 +133,14 @@ sycl::event absmax_row_reduction_impl(
   {
     Timer t("absmax_row_reduction_submit");
     e_scale = queue.submit([&](sycl::handler& cgh) {
-      cgh.parallel_for<class compute_scale_kernel<in_dtype, twidth, theight>>(
+      cgh.parallel_for<class compute_scale_kernel<
+          in_dtype, out_dtype, twidth, theight>>(
           sycl::nd_range<1>(
               sycl::range<1>(global_size), sycl::range<1>(local_size)),
           [=](sycl::nd_item<1> it) {
-        absmax_row_reduction<in_dtype, twidth, theight, twidth, theight>::run(
-            it, A, cols, rows, ld, scale_bs, C);
+        absmax_row_reduction<
+            in_dtype, out_dtype, twidth, theight, twidth, theight>::
+            run(it, A, cols, rows, ld, scale_bs, C);
           });
     });
   }
@@ -152,5 +157,11 @@ sycl::event absmax_row_reduction_run(
 sycl::event absmax_row_reduction_run(
     sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
     fp16* A, float* C) {
+  return absmax_row_reduction_impl(queue, rows, cols, ld, scale_bs, A, C);
+}
+
+sycl::event absmax_row_reduction_run(
+    sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
+    fp16* A, fp16* C) {
   return absmax_row_reduction_impl(queue, rows, cols, ld, scale_bs, A, C);
 }

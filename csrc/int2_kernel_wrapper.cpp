@@ -41,6 +41,10 @@ sycl::event absmax_row_reduction_run(
     sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
     fp16* A, float* C);
 
+sycl::event absmax_row_reduction_run(
+    sycl::queue& queue, const int rows, const int cols, int ld, int scale_bs,
+    fp16* A, fp16* C);
+
 template <typename DT>
 struct int2_dt_traits;
 
@@ -58,28 +62,47 @@ struct int2_dt_traits<fp16> {
   static constexpr const char* name = "fp16";
 };
 
-template <typename DT>
+template <typename DT, typename ScaleT>
 using ft_int2 = sycl::event (*)(
     sycl::queue& q, const size_t m, const size_t n, const size_t k, DT* A,
-    int32_t* B, DT* C, float* scale_A, float* scale_B, DT* bias,
+    int32_t* B, DT* C, ScaleT* scale_A, ScaleT* scale_B, DT* bias,
     size_t num_groups);
 
-template <typename DT>
-std::pair<ft_int2<DT>, bool> get_woq_cint_fused_gemm_func(int m, int n, int k);
+template <typename DT, typename ScaleT>
+std::pair<ft_int2<DT, ScaleT>, bool> get_woq_cint_fused_gemm_func(
+    int m, int n, int k);
 
-template <typename DT>
+template <typename ScaleT>
+struct scale_dtype_traits;
+
+template <>
+struct scale_dtype_traits<float> {
+  using torch_t = float;
+  static constexpr auto torch_dtype = torch::kFloat;
+};
+
+template <>
+struct scale_dtype_traits<fp16> {
+  using torch_t = at::Half;
+  static constexpr auto torch_dtype = torch::kHalf;
+};
+
+template <typename DT, typename ScaleT>
 torch::Tensor int2_fused_gemm_run_torch_impl(
     torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
     std::optional<torch::Tensor> bias, std::optional<torch::Tensor> C_out) {
   using traits = int2_dt_traits<DT>;
   using torch_t = typename traits::torch_t;
+  using scale_traits = scale_dtype_traits<ScaleT>;
+  using scale_torch_t = typename scale_traits::torch_t;
   constexpr auto kDT = traits::torch_dtype;
+  constexpr auto kScaleDT = scale_traits::torch_dtype;
   RECORD_FUNCTION("int2_woq_fused_gemm", {A, B});
   Timer t_("int2_woq_fused_gemm");
   // Check input types
   TORCH_CHECK(A.dtype() == kDT, std::string("A must be ") + traits::name);
   TORCH_CHECK(B.dtype() == torch::kInt32, "B must be int32 (int2x16)");
-  TORCH_CHECK(scale_B.dtype() == torch::kFloat, "scale_B must be float");
+  TORCH_CHECK(scale_B.dtype() == kScaleDT, "scale_B dtype mismatch");
   TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
   TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
   TORCH_CHECK(scale_B.is_contiguous(), "scale_B must be contiguous");
@@ -133,12 +156,14 @@ torch::Tensor int2_fused_gemm_run_torch_impl(
   DT* c_ptr = (DT*)(C.data_ptr<torch_t>());
   DT* bias_ptr = bias.has_value() ? (DT*)(bias->data_ptr<torch_t>()) : nullptr;
 
-  float* scale_B_ptr = scale_B.data_ptr<float>();
+  ScaleT* scale_B_ptr = (ScaleT*)scale_B.data_ptr<scale_torch_t>();
 
-  auto[gemm_func, externalScaleA] = get_woq_cint_fused_gemm_func<DT>(m, n, k);
+  auto[gemm_func, externalScaleA] =
+      get_woq_cint_fused_gemm_func<DT, ScaleT>(m, n, k);
   if (externalScaleA) {
-    auto scale_A = A.new_empty({num_groups, m}, torch::kFloat);
-    float* scale_A_ptr = scale_A.data_ptr<float>();
+    auto scale_A = A.new_empty({num_groups, m}, kScaleDT);
+    ScaleT* scale_A_ptr =
+        (ScaleT*)scale_A.template data_ptr<scale_torch_t>();
     {
       RECORD_FUNCTION("absmax_row_reduction_run", {});
       Timer t_("absmax_row_reduction_run");
@@ -166,14 +191,23 @@ torch::Tensor int2_bf16_fused_gemm_run_torch(
     torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
     std::optional<torch::Tensor> bias = std::nullopt,
     std::optional<torch::Tensor> C_out = std::nullopt) {
-  return int2_fused_gemm_run_torch_impl<bf16>(A, B, scale_B, bias, C_out);
+  return int2_fused_gemm_run_torch_impl<bf16, float>(
+      A, B, scale_B, bias, C_out);
 }
 
 torch::Tensor int2_fp16_fused_gemm_run_torch(
     torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
     std::optional<torch::Tensor> bias = std::nullopt,
     std::optional<torch::Tensor> C_out = std::nullopt) {
-  return int2_fused_gemm_run_torch_impl<fp16>(A, B, scale_B, bias, C_out);
+  TORCH_CHECK(
+      scale_B.dtype() == torch::kFloat || scale_B.dtype() == torch::kHalf,
+      "scale_B must be float or fp16 for fp16 activations");
+  if (scale_B.dtype() == torch::kHalf) {
+    return int2_fused_gemm_run_torch_impl<fp16, fp16>(
+        A, B, scale_B, bias, C_out);
+  }
+  return int2_fused_gemm_run_torch_impl<fp16, float>(
+      A, B, scale_B, bias, C_out);
 }
 
 torch::Tensor int2_woq_fused_gemm_run_torch(
