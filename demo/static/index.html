@@ -93,7 +93,10 @@
   .kv b { color: var(--text); font-weight: 500; text-align: right; word-break: break-all; }
   .err { color: var(--err); font-size: 13px; margin-top: 8px; }
   #dropzone.drag { outline: 2px dashed var(--accent); outline-offset: -8px; }
-  @media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { display: none; } }
+  /* Narrow panes (VS Code preview, split editors): keep the controls, just
+     shrink them. Only drop the sidebar when there is genuinely no room. */
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr 250px; } aside { padding: 12px; } }
+  @media (max-width: 620px) { main { grid-template-columns: 1fr; } aside { display: none; } }
 </style>
 </head>
 <body>
@@ -161,7 +164,7 @@ const history = [];          // [{role, content, images:[dataURL]}]
 let pending = [];            // staged image data URLs
 let busy = false;
 let cfg = {};
-const totals = { turns: 0, tokens: 0, decode_s: 0 };
+const totals = { turns: 0, tokens: 0, decode_tokens: 0, decode_s: 0 };
 
 const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
@@ -195,10 +198,17 @@ async function loadConfig() {
   if (!imgOk) $("hint").textContent = "Enter to send · Shift+Enter for a newline · image input disabled";
 }
 
+// Turn a model path into something readable. HF cache dirs end in a commit
+// hash (…/models--org--Name/snapshots/<sha>), so fall back to the repo name.
 function shortName(m) {
   if (!m) return "—";
-  const parts = String(m).split("/");
-  return parts[parts.length - 1] || m;
+  const parts = String(m).split("/").filter(Boolean);
+  const last = parts[parts.length - 1] || m;
+  if (!/^[0-9a-f]{16,}$/i.test(last)) return last;
+  const hub = parts.find((p) => p.startsWith("models--"));
+  if (hub) return hub.replace(/^models--/, "").split("--").pop();
+  const i = parts.lastIndexOf("snapshots");
+  return i > 0 ? parts[i - 1] : last;
 }
 
 function setState(state, text) {
@@ -259,8 +269,10 @@ function statsHtml(m) {
 function updateSession(m) {
   totals.turns += 1;
   totals.tokens += m.output_tokens || 0;
+  // Match the per-turn decode_tps definition: (tokens - 1) / decode time.
+  totals.decode_tokens += Math.max(0, (m.output_tokens || 0) - 1);
   totals.decode_s += m.decode_s || 0;
-  const avg = totals.decode_s > 0 ? (totals.tokens / totals.decode_s).toFixed(2) : "—";
+  const avg = totals.decode_s > 0 ? (totals.decode_tokens / totals.decode_s).toFixed(2) : "—";
   $("session").innerHTML = [
     ["turns", totals.turns],
     ["output tokens", totals.tokens],
