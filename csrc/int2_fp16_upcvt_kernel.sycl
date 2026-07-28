@@ -294,23 +294,28 @@ sycl::event int2_fp16_upcvt_gemm_run(
     else if (K == 4096 && N == 151680) { DISPATCH(32, 1, 4); }
     else if (K == 12288 && N == 4096)  { DISPATCH(32, 1, 8); }
     // ----- Bonsai-27B (Qwen3.5) GEMV shapes. The generic tiers below put
-    // these on wg_n=64/128; moving them to the same (32, 1, 4) tier that wins
-    // for the 8B is worth +10.6% end-to-end decode on a B70
+    // these on wg_n=64/128; moving them all to the (32, 1, 4) tier that wins
+    // for the 8B was worth +10.6% end-to-end decode on a B70
     // (42.9 -> 47.4 tok/s), with identical accuracy (mean_rel 1.77e-4).
-    // Isolated per-shape timings are too noisy to rank these tiers -- this
-    // was chosen on the end-to-end measurement. 64 decoder layers:
-    // 48 GDN (linear_attn) + 16 full attention.
-    //   (5120,  34816)  mlp.gate_up_proj
-    //   (17408,  5120)  mlp.down_proj
-    //   (5120,  16384)  linear_attn.in_proj_qkvz
-    //   (6144,   5120)  linear_attn.out_proj / self_attn.o_proj
-    //   (5120,  14336)  self_attn.qkv_proj
-    //   (5120, 248320)  lm_head
-    else if (K == 5120 && N == 34816)   { DISPATCH(32, 1, 4); }
+    //
+    // The local-kslicing factor was then refined per shape with the standalone
+    // driver (xetla/int2_fp16_upcvt_dpas_fast_test, --wgn/--ks/--ls), which
+    // rotates over enough distinct buffer sets (>=4 GB footprint) to defeat
+    // the caches and report honest DRAM bandwidth. 200 iters x 3 repeats,
+    // spread across repeats < 1%. Effective GiB/s at wg_n=32, KS=1:
+    //                                        LS=2     LS=4     LS=8
+    //   (5120,  34816)  mlp.gate_up_proj     373.1    390.8   *400.2
+    //   (17408,  5120)  mlp.down_proj        258.5   *406.1    324.5
+    //   (5120,  16384)  in_proj_qkvz        *434.7    427.4    409.6
+    //   (6144,   5120)  out_proj / o_proj    239.4   *361.5    292.1
+    //   (5120,  14336)  self_attn.qkv_proj  *429.7    373.4    367.7
+    //   (5120, 248320)  lm_head              432.2   *436.0    429.0
+    // 64 decoder layers: 48 GDN (linear_attn) + 16 full attention.
+    else if (K == 5120 && N == 34816)   { DISPATCH(32, 1, 8); }
     else if (K == 17408 && N == 5120)   { DISPATCH(32, 1, 4); }
-    else if (K == 5120 && N == 16384)   { DISPATCH(32, 1, 4); }
+    else if (K == 5120 && N == 16384)   { DISPATCH(32, 1, 2); }
     else if (K == 6144 && N == 5120)    { DISPATCH(32, 1, 4); }
-    else if (K == 5120 && N == 14336)   { DISPATCH(32, 1, 4); }
+    else if (K == 5120 && N == 14336)   { DISPATCH(32, 1, 2); }
     else if (K == 5120 && N == 248320)  { DISPATCH(32, 1, 4); }
     // Generic GEMV fallback tiers (kept from upcvt test driver).
     else if (N <= 4096) {
