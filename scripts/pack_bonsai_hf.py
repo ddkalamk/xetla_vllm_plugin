@@ -59,6 +59,11 @@ FUSE_MAP: dict[str, tuple[str, int]] = {
 # leaf modules that map 1:1 onto a vLLM linear layer
 SINGLE = {"o_proj", "down_proj", "out_proj"}
 
+# Embedding tables. Bonsai stores these ternary too (whitepaper sec. 4.3), but
+# they are looked up row-wise rather than fed to a GEMM, so they get a
+# row-major packed layout instead of the vnni16 one.
+EMBEDDINGS = {"embed_tokens"}
+
 # never even look at these (vision tower is HQQ-4bit, not ternary)
 SKIP_SUBSTR = ("visual.", "vision_tower.", "mmproj")
 
@@ -75,6 +80,8 @@ def parse_args() -> argparse.Namespace:
                    help="Max allowed deviation from an exact ternary code.")
     p.add_argument("--no-lm-head", action="store_true",
                    help="Leave lm_head dense instead of packing it.")
+    p.add_argument("--no-embeddings", action="store_true",
+                   help="Leave embed_tokens dense instead of packing it.")
     p.add_argument("--threads", type=int, default=0,
                    help="torch CPU threads (0 = leave default).")
     p.add_argument("--limit-layers", type=int, default=0,
@@ -158,6 +165,42 @@ def quantize_ternary(w_nk: torch.Tensor, tol: float):
     return packed, scale16, max_dev
 
 
+def quantize_ternary_embedding(w_vh: torch.Tensor, tol: float):
+    """Pack an embedding table [vocab, hidden] for row-wise lookup.
+
+    Groups run along `hidden` (the same axis a GEMM would call K), but the
+    result stays row-major so that fetching one token is a contiguous read:
+
+        qweight : int32 [vocab, hidden/16]
+        scale   : fp16  [vocab, hidden/128]
+
+    Returns (None, None, max_dev) when the table is not ternary.
+    """
+    v, h = w_vh.shape
+    if h % GROUP_SIZE != 0:
+        return None, None, float("inf")
+
+    w = w_vh.to(torch.float32)
+    g = w.view(v, h // GROUP_SIZE, GROUP_SIZE)
+    scale = g.abs().amax(dim=2)                       # [vocab, h/gs]
+    safe = torch.where(scale == 0, torch.ones_like(scale), scale)
+    r = g / safe.unsqueeze(2)
+    codes = torch.round(r)
+    max_dev = (r - codes).abs().max().item()
+    if max_dev > tol or codes.abs().max().item() > 1:
+        return None, None, max_dev
+
+    codes = codes.to(torch.int8).view(v, h)
+    c = (codes & 0x3).to(torch.int32).view(v, h // PACK_K, PACK_K)
+    shifts = torch.arange(PACK_K, dtype=torch.int32) * 2
+    packed = (c << shifts).sum(dim=-1).to(torch.int32)  # [vocab, h/16]
+
+    scale16 = scale.to(torch.float16)
+    if torch.isinf(scale16).any():
+        raise ValueError("scale overflows fp16")
+    return packed, scale16, max_dev
+
+
 def main() -> None:
     args = parse_args()
     if args.threads:
@@ -172,6 +215,7 @@ def main() -> None:
     # ---- group checkpoint tensors into vLLM modules ----------------------
     # groups: vllm_module_prefix -> list of (position, checkpoint tensor name)
     groups: dict[str, list[tuple[int, str]]] = {}
+    embeddings: dict[str, str] = {}
     for name in shard_of:
         if not name.endswith(".weight"):
             continue
@@ -197,6 +241,10 @@ def main() -> None:
         elif leaf in SINGLE:
             target = f"{dst_prefix}{rel_parent}.{leaf}"
             groups.setdefault(target, []).append((0, name))
+        elif leaf in EMBEDDINGS and not args.no_embeddings:
+            target = f"{dst_prefix}{rel_parent}.{leaf}" if rel_parent \
+                else f"{dst_prefix}{leaf}"
+            embeddings[target] = name
 
     if args.limit_layers:
         keep = {f"layers.{i}." for i in range(args.limit_layers)}
@@ -276,6 +324,30 @@ def main() -> None:
 
     for fh in open_shards.values():
         fh.__exit__(None, None, None)
+
+    # ---- embeddings (row-major layout, packed for lookup) -----------------
+    for prefix, name in sorted(embeddings.items()):
+        path = shard_of[name]
+        with safe_open(path, framework="pt") as fh:
+            w = fh.get_tensor(name)
+        packed, scale, dev = quantize_ternary_embedding(w, args.tol)
+        if packed is None:
+            skipped.append((prefix, dev))
+            print(f"[pack] SKIP  {prefix} (embedding not ternary, "
+                  f"max_dev={dev:.3g})", flush=True)
+            continue
+        if not args.inspect:
+            tensors[f"{prefix}.qweight"] = packed.contiguous()
+            tensors[f"{prefix}.scale"] = scale.contiguous()
+        layers_meta[prefix] = {
+            "kind": "embedding",
+            "qweight_shape": list(packed.shape),
+            "scale_shape": list(scale.shape),
+        }
+        dense_mb = w.numel() * 2 / 1e6
+        packed_mb = (packed.numel() * 4 + scale.numel() * 2) / 1e6
+        print(f"[pack] embedding {prefix}: {tuple(w.shape)} "
+              f"{dense_mb:.0f} MB -> {packed_mb:.0f} MB", flush=True)
 
     print(f"[pack] packed {len(layers_meta)} modules, "
           f"skipped {len(skipped)} non-ternary modules")

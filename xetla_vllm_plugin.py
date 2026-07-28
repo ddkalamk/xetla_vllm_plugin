@@ -393,6 +393,37 @@ def pack_int1x32(codes):
     return packed
 
 
+def pack_int2_rowwise(codes):
+    """Pack int8 codes in {-1,0,+1} of shape [rows, cols] into int32 words of
+    shape [rows, cols/16], 16 consecutive column entries per word.
+
+    This is the layout used for embedding tables: unlike the vnni16 GEMM
+    layout, one row stays contiguous so a token lookup is a single linear
+    read.
+    """
+    rows, cols = codes.shape
+    assert cols % 16 == 0, f"cols ({cols}) must be multiple of 16"
+    c = (codes & 0x3).to(torch.int32).view(rows, cols // 16, 16)
+    shifts = (torch.arange(16, dtype=torch.int32, device=codes.device) * 2)
+    return (c << shifts).sum(dim=-1).to(torch.int32)
+
+
+def unpack_int2_rowwise(packed, scale, group_size: int = INT2_F16_GROUP_SIZE):
+    """Inverse of `pack_int2_rowwise`, applying the per-group fp16 scales.
+
+    packed : int32 [rows, cols/16]
+    scale  : fp16  [rows, cols/group_size]
+    returns  fp16  [rows, cols]
+    """
+    rows = packed.shape[0]
+    shifts = (torch.arange(16, dtype=torch.int32, device=packed.device) * 2)
+    codes = (packed.unsqueeze(-1) >> shifts) & 0x3
+    # int2 two's complement: 3 -> -1
+    codes = torch.where(codes == 3, codes - 4, codes)
+    vals = codes.reshape(rows, -1).to(torch.float16)
+    return vals * scale.repeat_interleave(group_size, dim=1)
+
+
 def xetla_quant_method():
     quant_method = os.environ.get("XETLA_QUANT_METHOD", "").lower()
     # Auto-derive from the sidecar metadata if the user didn't pin a method
@@ -544,28 +575,94 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
         # self.quant_config.method = "int2"  # Embeddings use int2
         super().__init__()
 
-    # def create_weights(self, layer: torch.nn.Module,
-    #                    input_size_per_partition: int,
-    #                    output_partition_sizes: list[int], input_size: int,
-    #                    output_size: int, params_dtype: torch.dtype,
-    #                    **extra_weight_attrs):
-    #     # We just reuse UnquantizedLinearMethod to create weights
-    #     UnquantizedEmbeddingMethod.create_weights(self, layer, input_size_per_partition,
-    #                                            output_partition_sizes, input_size,
-    #                                            output_size, params_dtype,
-    #                                            **extra_weight_attrs)
+    def create_weights(self, layer: torch.nn.Module,
+                       input_size_per_partition: int,
+                       output_partition_sizes: list[int], input_size: int,
+                       output_size: int, params_dtype: torch.dtype,
+                       **extra_weight_attrs):
+        # Same trick as XetlaLinearMethod: when the sidecar already holds the
+        # packed table, allocate the parameter on `meta` so the dense fp16
+        # table (2.5 GB for a 248k x 5120 vocab) is never materialized. The
+        # shape is preserved so VocabParallelEmbedding's sharded weight_loader
+        # still validates, and its copies become no-ops.
+        method = self.quant_config.method
+        if (not self.inplace and method == "int2_f16"
+                and _xetla_prequant_lookup(self.prefix, method) is not None):
+            from vllm.model_executor.parameter import ModelWeightParameter
+            from vllm.model_executor.utils import set_weight_attrs
+            weight_loader = extra_weight_attrs.pop("weight_loader")
+            weight = ModelWeightParameter(
+                data=torch.empty(sum(output_partition_sizes),
+                                 input_size_per_partition,
+                                 dtype=params_dtype, device="meta"),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight", weight)
+            set_weight_attrs(weight, extra_weight_attrs)
+            layer._xetla_meta_placeholder = True
+            return
+        UnquantizedEmbeddingMethod.create_weights(
+            self, layer, input_size_per_partition, output_partition_sizes,
+            input_size, output_size, params_dtype, **extra_weight_attrs)
+
+    def embedding(self, layer: torch.nn.Module,
+                  input_: torch.Tensor) -> torch.Tensor:
+        """Look up rows of a packed ternary embedding table.
+
+        Only the selected rows are unpacked, so this touches
+        `len(input_) * hidden / 4` bytes instead of holding a dense fp16
+        table resident.
+        """
+        if not getattr(layer, "xetla_embed_packed", False):
+            return super().embedding(layer, input_)
+        flat = input_.reshape(-1)
+        out = unpack_int2_rowwise(layer.weight.data[flat],
+                                  layer.scale.data[flat])
+        return out.view(*input_.shape, -1)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not current_platform.is_xpu():
             return
 
         method = self.quant_config.method
-        # Sidecar load short-circuit (Option B). Only the inplace lm_head
-        # path is captured/restored; the input embedding stays dense fp16.
+        # Sidecar load short-circuit (Option B).
         if (self.inplace and method in ("int2_f16", "int1_f16") and
                 _xetla_prequant_try_load(layer, self.prefix, method, "lm_head")):
             print(f"[xetla] sidecar hit: {self.prefix} lm_head ({method})")
             return
+
+        # Input embedding: the table is ternary in Bonsai checkpoints, but it
+        # is looked up rather than multiplied, so it uses the row-major packed
+        # layout and is unpacked per token in embedding().
+        if not self.inplace and method == "int2_f16":
+            lookup = _xetla_prequant_lookup(self.prefix, method)
+            if lookup is not None:
+                try:
+                    from safetensors import safe_open  # noqa: WPS433
+                    dev = _xetla_target_device(layer)
+                    with safe_open(_xetla_prequant_load_path,
+                                   framework="pt") as f:
+                        qw = f.get_tensor(f"{lookup}.qweight")
+                        sc = f.get_tensor(f"{lookup}.scale")
+                    layer.weight = torch.nn.Parameter(
+                        qw.to(dev).contiguous(), requires_grad=False)
+                    layer.scale = torch.nn.Parameter(
+                        sc.to(dev).contiguous(), requires_grad=False)
+                    layer.xetla_embed_packed = True
+                    layer.xetla_quantized = True
+                    print(f"[xetla] sidecar hit: {self.prefix} embedding "
+                          f"({method}), packed {tuple(qw.shape)}", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[xetla] WARN: packed embedding load failed for "
+                          f"{self.prefix}: {e}", flush=True)
+                return
+            if getattr(layer, "_xetla_meta_placeholder", False):
+                raise RuntimeError(
+                    f"[xetla] sidecar entry for {self.prefix} vanished "
+                    "between create_weights() and "
+                    "process_weights_after_loading()")
 
         if self.quant_config.method == "int2":
             print(f"Processing weights for layer {layer} with method fp8 (inplace={self.inplace})")
@@ -997,17 +1094,21 @@ def _maybe_disable_triton_stride_versioning() -> None:
 
 
 def _xetla_quantize_lm_head(model: torch.nn.Module) -> None:
-    """Quantize ``ParallelLMHead`` modules that vLLM built without a quant_config.
+    """Quantize embedding tables that vLLM built without a quant_config.
 
     Several models -- Qwen3.5 / Qwen3-Next (Bonsai-27B) among them -- construct
-    ``ParallelLMHead`` without passing ``quant_config``, so
-    ``XetlaConfig.get_quant_method()`` is never consulted for it and the head
-    stays dense fp16.  For Bonsai that head is ternary in the checkpoint and it
-    is by far the largest single tensor read per decoded token
-    (248320 x 5120 x 2 B = 2.5 GB, ~27% of the decode traffic), so wire it to
-    the xetla path here, after the weights have been loaded.
+    ``ParallelLMHead`` and ``VocabParallelEmbedding`` without passing
+    ``quant_config`` (the input embedding is built without a ``prefix`` too),
+    so ``XetlaConfig.get_quant_method()`` is never consulted for them and both
+    stay dense fp16.  For Bonsai both tables are ternary in the checkpoint
+    (whitepaper sec. 4.3) and together they are ~5 GB, so wire them to the
+    xetla path here, after the weights have been loaded.
 
-    Set ``XETLA_QUANTIZE_LM_HEADS=0`` to keep the head dense.
+    The LM head is the larger win for speed (it is read in full for every
+    decoded token); the input embedding is a pure memory win, since only the
+    looked-up rows are ever touched.
+
+    Set ``XETLA_QUANTIZE_LM_HEADS=0`` to keep both dense.
     """
     if not quantize_lm_heads or not current_platform.is_xpu():
         return
@@ -1020,29 +1121,33 @@ def _xetla_quantize_lm_head(model: torch.nn.Module) -> None:
         return
 
     for name, module in model.named_modules():
-        if not isinstance(module, ParallelLMHead):
+        if not isinstance(module, VocabParallelEmbedding):
             continue
+        is_lm_head = isinstance(module, ParallelLMHead)
         if isinstance(getattr(module, "quant_method", None), XetlaEmbeddingMethod):
             continue  # already handled through get_quant_method()
         if getattr(module, "xetla_quantized", False):
             continue
         if _xetla_prequant_load_path and \
                 _xetla_prequant_lookup(name, method) is None:
-            # Sidecar in use but it has no packed head: leave it dense rather
+            # Sidecar in use but it has no packed table: leave it dense rather
             # than silently re-quantizing something that may not be ternary.
-            print(f"[xetla] lm_head {name}: not in sidecar, kept dense",
-                  flush=True)
+            print(f"[xetla] {name}: not in sidecar, kept dense", flush=True)
+            continue
+        if not is_lm_head and not _xetla_prequant_load_path:
+            # The input embedding is only packed from a sidecar; there is no
+            # on-the-fly path for it.
             continue
         try:
-            qm = XetlaEmbeddingMethod(config, inplace=True, prefix=name)
+            qm = XetlaEmbeddingMethod(config, inplace=is_lm_head, prefix=name)
             qm.process_weights_after_loading(module)
             if getattr(module, "xetla_quantized", False):
                 module.quant_method = qm
-                print(f"[xetla] lm_head {name} quantized ({method}), "
+                kind = "lm_head" if is_lm_head else "embedding"
+                print(f"[xetla] {kind} {name} quantized ({method}), "
                       f"packed {tuple(module.weight.shape)}", flush=True)
         except Exception as e:  # noqa: BLE001
-            print(f"[xetla] WARN: could not quantize lm_head {name}: {e}",
-                  flush=True)
+            print(f"[xetla] WARN: could not quantize {name}: {e}", flush=True)
 
 
 def register():

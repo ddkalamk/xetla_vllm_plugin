@@ -88,7 +88,7 @@ def main():
     print(f"decode               : {n} tokens in {decode_s:.2f} s = "
           f"{(n - 1) / decode_s:.2f} tok/s")
     print("=" * 70)
-    print(text[:600])
+    print(text)
 
 
 if __name__ == "__main__":
