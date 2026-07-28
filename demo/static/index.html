@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bonsai int2 Chat Studio</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #11161d; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #2f81f7; --accent2: #3fb950;
+    --warn: #d29922; --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); display: flex; flex-direction: column;
+  }
+  header {
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 0 0 auto;
+  }
+  header h1 { font-size: 17px; margin: 0 10px 0 0; font-weight: 600; }
+  .badge {
+    font-size: 12px; color: var(--muted); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; white-space: nowrap;
+  }
+  .badge b { color: var(--text); font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.loading { background: var(--warn); } .dot.ready { background: var(--accent2); }
+  .dot.busy { background: var(--accent); } .dot.failed { background: var(--err); }
+  main { display: grid; grid-template-columns: 1fr 300px; flex: 1 1 auto; min-height: 0; }
+  .chatcol { display: flex; flex-direction: column; min-width: 0; }
+  #log { flex: 1 1 auto; overflow-y: auto; padding: 22px 24px; display: flex; flex-direction: column; gap: 16px; }
+  .msg { max-width: 820px; display: flex; flex-direction: column; gap: 6px; }
+  .msg.user { align-self: flex-end; align-items: flex-end; }
+  .who { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  .bubble {
+    border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px;
+    background: var(--panel2); white-space: pre-wrap; word-wrap: break-word; line-height: 1.55;
+  }
+  .msg.user .bubble { background: #16283f; border-color: #1f3b5c; }
+  .bubble code { background: #0b0f14; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  .bubble pre { background: #0b0f14; padding: 10px; border-radius: 8px; overflow-x: auto; margin: 8px 0; }
+  .thumbs { display: flex; gap: 8px; flex-wrap: wrap; }
+  .thumbs img { max-height: 150px; border-radius: 8px; border: 1px solid var(--border); }
+  details.think { border: 1px solid var(--border); border-radius: 10px; background: #0f141a; padding: 8px 12px; }
+  details.think summary { cursor: pointer; color: var(--muted); font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+  details.think .body { color: var(--muted); font-size: 13px; white-space: pre-wrap; margin-top: 8px; line-height: 1.5; }
+  .stats { display: flex; gap: 8px; flex-wrap: wrap; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 5px 9px; font-size: 12px; color: var(--muted);
+  }
+  .stat b { color: var(--text); font-size: 13px; }
+  .stat.hero { border-color: #234; } .stat.hero b { color: var(--accent2); font-size: 14px; }
+  .live { font-size: 12px; color: var(--muted); }
+  .composer { border-top: 1px solid var(--border); padding: 12px 20px 16px; flex: 0 0 auto; }
+  .attachbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .chip { position: relative; }
+  .chip img { height: 56px; border-radius: 8px; border: 1px solid var(--border); display: block; }
+  .chip .x {
+    position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; line-height: 16px;
+    border-radius: 50%; background: var(--err); color: #fff; font-size: 12px; text-align: center;
+    cursor: pointer; border: none;
+  }
+  .inputrow { display: flex; gap: 10px; align-items: flex-end; }
+  textarea#prompt {
+    flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 10px; padding: 11px 12px; font-size: 14px; font-family: inherit;
+    resize: none; min-height: 46px; max-height: 220px; line-height: 1.5;
+  }
+  button {
+    padding: 11px 18px; font-size: 14px; font-weight: 600; color: #fff;
+    background: var(--accent); border: none; border-radius: 10px; cursor: pointer; white-space: nowrap;
+  }
+  button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); font-weight: 500; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 7px; }
+  aside { border-left: 1px solid var(--border); padding: 18px; overflow-y: auto; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 10px; }
+  .section { border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 16px; background: var(--panel2); }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 5px; }
+  label:first-of-type { margin-top: 0; }
+  input[type=number], input[type=text], textarea#system, select {
+    width: 100%; background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px; font-size: 13px; font-family: inherit;
+  }
+  textarea#system { resize: vertical; min-height: 60px; }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); margin-top: 12px; }
+  .check input { width: auto; }
+  .kv { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; }
+  .kv b { color: var(--text); font-weight: 500; text-align: right; word-break: break-all; }
+  .err { color: var(--err); font-size: 13px; margin-top: 8px; }
+  #dropzone.drag { outline: 2px dashed var(--accent); outline-offset: -8px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>🌳 Bonsai int2 Chat</h1>
+  <span class="badge" id="b-state"><span class="dot loading"></span>loading</span>
+  <span class="badge" id="b-model">model —</span>
+  <span class="badge" id="b-quant">quant —</span>
+  <span class="badge" id="b-device">device —</span>
+  <span class="badge" id="b-mem">memory —</span>
+  <span class="badge" id="b-last">last turn —</span>
+</header>
+
+<main>
+  <div class="chatcol" id="dropzone">
+    <div id="log"></div>
+
+    <div class="composer">
+      <div class="attachbar" id="attachbar"></div>
+      <div class="inputrow">
+        <button class="secondary" id="attach" title="Attach images">🖼️</button>
+        <input type="file" id="file" accept="image/*" multiple hidden />
+        <textarea id="prompt" placeholder="Ask something — or drop / paste an image…" rows="1"></textarea>
+        <button id="send">Send</button>
+        <button id="stop" class="secondary" style="display:none">Stop</button>
+      </div>
+      <div class="hint" id="hint">Enter to send · Shift+Enter for a newline</div>
+      <div class="err" id="err"></div>
+    </div>
+  </div>
+
+  <aside>
+    <div class="section">
+      <h2>Sampling</h2>
+      <label for="maxtok">Max new tokens</label>
+      <input id="maxtok" type="number" min="1" max="32768" value="512" />
+      <label for="temp">Temperature</label>
+      <input id="temp" type="number" min="0" max="2" step="0.05" value="0.7" />
+      <label for="topp">Top-p</label>
+      <input id="topp" type="number" min="0" max="1" step="0.05" value="0.9" />
+      <div class="check"><input id="thinking" type="checkbox" /><label for="thinking" style="margin:0">Thinking mode</label></div>
+    </div>
+
+    <div class="section">
+      <h2>System prompt</h2>
+      <textarea id="system">You are a helpful assistant.</textarea>
+      <button class="secondary" id="reset" style="width:100%;margin-top:10px">Clear conversation</button>
+    </div>
+
+    <div class="section">
+      <h2>Engine</h2>
+      <div id="engineinfo"></div>
+    </div>
+
+    <div class="section">
+      <h2>Session totals</h2>
+      <div id="session"></div>
+    </div>
+  </aside>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const history = [];          // [{role, content, images:[dataURL]}]
+let pending = [];            // staged image data URLs
+let busy = false;
+let cfg = {};
+const totals = { turns: 0, tokens: 0, decode_s: 0 };
+
+const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+/* ------------------------------------------------------------------ config */
+async function loadConfig() {
+  try {
+    cfg = await (await fetch("/config")).json();
+  } catch (e) { setState("failed", "backend unreachable"); return; }
+  $("b-model").innerHTML = "model <b>" + esc(shortName(cfg.model || "—")) + "</b>";
+  $("b-quant").innerHTML = "quant <b>" + esc(cfg.quant_method || cfg.quantization || "—") + "</b>";
+  $("b-device").innerHTML = "device <b>" + esc(cfg.device || "—") + "</b>";
+  if (cfg.used_gib != null) $("b-mem").innerHTML = `memory <b>${cfg.used_gib} / ${cfg.total_gib} GiB</b>`;
+  setState(cfg.ready ? "ready" : "loading", cfg.ready ? "ready" : "loading model…");
+
+  const rows = [
+    ["model", shortName(cfg.model)],
+    ["quantization", (cfg.quantization || "-") + (cfg.prequantized ? " (sidecar)" : "")],
+    ["method", cfg.quant_method],
+    ["dtype", cfg.dtype],
+    ["context", cfg.max_model_len],
+    ["KV cache", cfg.kv_cache_tokens ? cfg.kv_cache_tokens.toLocaleString() + " tok" : "—"],
+    ["load time", cfg.load_seconds != null ? cfg.load_seconds + " s" : "—"],
+    ["images", cfg.supports_images ? "up to " + cfg.max_images : "not supported"],
+  ];
+  $("engineinfo").innerHTML = rows
+    .map(([k, v]) => `<div class="kv"><span>${esc(k)}</span><b>${esc(String(v ?? "—"))}</b></div>`).join("");
+
+  const imgOk = cfg.supports_images;
+  $("attach").disabled = !imgOk;
+  $("attach").title = imgOk ? "Attach images" : "This model/engine has no image input";
+  if (!imgOk) $("hint").textContent = "Enter to send · Shift+Enter for a newline · image input disabled";
+}
+
+function shortName(m) {
+  if (!m) return "—";
+  const parts = String(m).split("/");
+  return parts[parts.length - 1] || m;
+}
+
+function setState(state, text) {
+  $("b-state").innerHTML = `<span class="dot ${state}"></span>${esc(text || state)}`;
+}
+
+/* ------------------------------------------------------------- rendering */
+function addMessage(role, text, images) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + role;
+  wrap.innerHTML = `<div class="who">${role === "user" ? "you" : "bonsai"}</div>`;
+  if (images && images.length) {
+    const t = document.createElement("div");
+    t.className = "thumbs";
+    images.forEach((src) => { const i = new Image(); i.src = src; t.appendChild(i); });
+    wrap.appendChild(t);
+  }
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.textContent = text || "";
+  wrap.appendChild(bubble);
+  $("log").appendChild(wrap);
+  $("log").scrollTop = $("log").scrollHeight;
+  return { wrap, bubble };
+}
+
+// Split "<think>…</think> answer" into a collapsible reasoning block.
+function renderAssistant(bubble, raw) {
+  const open = raw.indexOf("<think>");
+  if (open === -1) { bubble.textContent = raw; return; }
+  const close = raw.indexOf("</think>");
+  const think = close === -1 ? raw.slice(open + 7) : raw.slice(open + 7, close);
+  const rest = close === -1 ? "" : raw.slice(close + 8);
+  bubble.innerHTML =
+    `<details class="think"${close === -1 ? " open" : ""}>` +
+    `<summary>reasoning${close === -1 ? " (thinking…)" : ""}</summary>` +
+    `<div class="body">${esc(think.trim())}</div></details>` +
+    (rest.trim() ? `<div style="margin-top:10px">${esc(rest.trim())}</div>` : "");
+}
+
+function statsHtml(m) {
+  const items = [];
+  if (m.decode_tps != null) items.push(["hero", m.decode_tps + " tok/s", "decode"]);
+  if (m.ttft_ms != null) items.push(["", m.ttft_ms + " ms", "TTFT"]);
+  items.push(["", m.output_tokens, "output tokens"]);
+  if (m.decode_s != null) items.push(["", m.decode_s + " s", "decode time"]);
+  if (m.prompt_tokens) items.push(["", m.prompt_tokens, "prompt tokens"]);
+  if (m.prefill_tps != null) items.push(["", m.prefill_tps + " tok/s", "prefill"]);
+  if (m.overall_tps != null) items.push(["", m.overall_tps + " tok/s", "end-to-end"]);
+  items.push(["", m.total_s + " s", "total"]);
+  if (m.images) items.push(["", m.images, m.images === 1 ? "image" : "images"]);
+  if (m.finish_reason && m.finish_reason !== "stop") items.push(["", esc(m.finish_reason), "finish"]);
+  return `<div class="stats">` +
+    items.map(([cls, v, k]) => `<div class="stat ${cls}"><b>${v}</b> ${esc(k)}</div>`).join("") +
+    `</div>`;
+}
+
+function updateSession(m) {
+  totals.turns += 1;
+  totals.tokens += m.output_tokens || 0;
+  totals.decode_s += m.decode_s || 0;
+  const avg = totals.decode_s > 0 ? (totals.tokens / totals.decode_s).toFixed(2) : "—";
+  $("session").innerHTML = [
+    ["turns", totals.turns],
+    ["output tokens", totals.tokens],
+    ["avg decode", avg + " tok/s"],
+  ].map(([k, v]) => `<div class="kv"><span>${k}</span><b>${v}</b></div>`).join("");
+}
+
+/* ----------------------------------------------------------- attachments */
+function renderAttachments() {
+  $("attachbar").innerHTML = "";
+  pending.forEach((src, i) => {
+    const chip = document.createElement("div");
+    chip.className = "chip";
+    const img = new Image(); img.src = src;
+    const x = document.createElement("button");
+    x.className = "x"; x.textContent = "×";
+    x.onclick = () => { pending.splice(i, 1); renderAttachments(); };
+    chip.appendChild(img); chip.appendChild(x);
+    $("attachbar").appendChild(chip);
+  });
+}
+
+function addFiles(files) {
+  if (!cfg.supports_images) return;
+  for (const f of files) {
+    if (!f.type.startsWith("image/")) continue;
+    if (pending.length >= (cfg.max_images || 4)) { $("err").textContent = `At most ${cfg.max_images} images.`; break; }
+    const reader = new FileReader();
+    reader.onload = () => { pending.push(reader.result); renderAttachments(); };
+    reader.readAsDataURL(f);
+  }
+}
+
+/* ------------------------------------------------------------------- chat */
+async function send() {
+  const text = $("prompt").value.trim();
+  if ((!text && !pending.length) || busy) return;
+  $("err").textContent = "";
+
+  const images = pending.slice();
+  pending = []; renderAttachments();
+  $("prompt").value = ""; autosize();
+  addMessage("user", text, images);
+  history.push({ role: "user", content: text, images });
+
+  const { bubble } = addMessage("assistant", "");
+  const live = document.createElement("div");
+  live.className = "live"; live.textContent = "thinking…";
+  bubble.parentElement.appendChild(live);
+
+  busy = true;
+  $("send").disabled = true; $("stop").style.display = "inline-block";
+  setState("busy", "generating");
+
+  const messages = [];
+  const sys = $("system").value.trim();
+  if (sys) messages.push({ role: "system", content: sys, images: [] });
+  for (const m of history) messages.push({ role: m.role, content: m.content, images: m.images || [] });
+
+  const body = {
+    messages,
+    max_tokens: Number($("maxtok").value),
+    temperature: Number($("temp").value),
+    top_p: Number($("topp").value),
+    thinking: $("thinking").checked,
+  };
+
+  let acc = "";
+  const t0 = performance.now();
+  try {
+    const resp = await fetch("/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      let detail = resp.statusText;
+      try { detail = (await resp.json()).detail || detail; } catch (e) {}
+      throw new Error(detail);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let firstAt = null;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        const ev = /^event: (.*)$/m.exec(chunk);
+        const dt = /^data: (.*)$/m.exec(chunk);
+        if (!ev || !dt) continue;
+        const payload = JSON.parse(dt[1]);
+        if (ev[1] === "delta") {
+          if (firstAt === null) firstAt = performance.now();
+          acc += payload.text;
+          renderAssistant(bubble, acc);
+          const secs = (performance.now() - firstAt) / 1000;
+          if (secs > 0.3) live.textContent = `≈ ${(acc.length / 4 / secs).toFixed(1)} tok/s (live estimate)`;
+          $("log").scrollTop = $("log").scrollHeight;
+        } else if (ev[1] === "stats") {
+          live.outerHTML = statsHtml(payload);
+          updateSession(payload);
+          $("b-last").innerHTML = payload.decode_tps != null
+            ? `last turn <b>${payload.decode_tps} tok/s</b>` : "last turn —";
+        }
+      }
+    }
+    history.push({ role: "assistant", content: acc, images: [] });
+  } catch (e) {
+    $("err").textContent = String(e.message || e);
+    if (live.parentElement) live.textContent = "";
+    if (!acc) bubble.textContent = "(failed)";
+  } finally {
+    busy = false;
+    $("send").disabled = false; $("stop").style.display = "none";
+    setState("ready", "ready");
+    void t0;
+    $("log").scrollTop = $("log").scrollHeight;
+  }
+}
+
+async function stop() { await fetch("/abort", { method: "POST" }); }
+
+function autosize() {
+  const el = $("prompt");
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 220) + "px";
+}
+
+/* ----------------------------------------------------------------- wiring */
+$("send").addEventListener("click", send);
+$("stop").addEventListener("click", stop);
+$("attach").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
+$("prompt").addEventListener("input", autosize);
+$("prompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("prompt").addEventListener("paste", (e) => {
+  const items = [...(e.clipboardData?.items || [])].filter((i) => i.kind === "file");
+  if (items.length) { addFiles(items.map((i) => i.getAsFile()).filter(Boolean)); e.preventDefault(); }
+});
+$("reset").addEventListener("click", () => {
+  history.length = 0; pending = []; renderAttachments();
+  $("log").innerHTML = ""; $("err").textContent = "";
+});
+const dz = $("dropzone");
+dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("drag"); });
+dz.addEventListener("dragleave", () => dz.classList.remove("drag"));
+dz.addEventListener("drop", (e) => {
+  e.preventDefault(); dz.classList.remove("drag");
+  addFiles(e.dataTransfer.files);
+});
+
+(async function init() {
+  await loadConfig();
+  if (!cfg.ready) {
+    const timer = setInterval(async () => {
+      await loadConfig();
+      if (cfg.ready) clearInterval(timer);
+    }, 3000);
+  }
+})();
+</script>
+</body>
+</html>

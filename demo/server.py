@@ -1,0 +1,422 @@
+# SPDX-License-Identifier: Apache-2.0
+"""FastAPI backend for the xetla int2 Bonsai chat studio (Intel XPU).
+
+Keeps one warm vLLM engine in-process and streams tokens to a single-page UI,
+reporting the observed decode throughput (tok/s) after every prompt.
+
+Endpoints:
+  GET  /            -> the single-page chat UI (static/index.html)
+  GET  /health      -> readiness probe
+  GET  /config      -> model / quantization / device / memory summary
+  POST /chat        -> Server-Sent Events: token deltas, then per-turn metrics
+  POST /abort       -> stop the in-flight generation
+
+Configuration is entirely environment driven so the same server can host any
+model the plugin supports:
+
+  DEMO_MODEL            HF dir or repo id                (required)
+  DEMO_TOKENIZER        defaults to DEMO_MODEL
+  DEMO_QUANT            xetla | none                     (xetla)
+  DEMO_DTYPE            float16
+  DEMO_MAX_MODEL_LEN    8192
+  DEMO_GPU_MEM_UTIL     0.85
+  DEMO_MAX_IMAGES       max images per prompt            (4)
+  DEMO_MAX_IMAGE_SIDE   downscale longest side to        (1024)
+  DEMO_TEXT_ONLY        1 disables image inputs          (0)
+  DEMO_ENFORCE_EAGER    1 disables torch.compile         (0)
+  DEMO_WARMUP           1 pays the first-token JIT cost  (1)
+
+The xetla plugin itself is configured as usual via XETLA_QUANT_METHOD /
+XETLA_PREQUANT_PATH; see demo/serve.sh.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import io
+import json
+import os
+import threading
+import time
+from pathlib import Path
+from typing import Any, Iterator
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+# A single decoded image is capped at this many bytes before resizing, so a
+# malicious/oversized upload cannot exhaust host memory.
+MAX_IMAGE_BYTES = 24 * 1024 * 1024
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+class Config:
+    """Resolved demo configuration, read once at startup."""
+
+    def __init__(self) -> None:
+        self.model = os.environ.get("DEMO_MODEL", "")
+        self.tokenizer = os.environ.get("DEMO_TOKENIZER") or self.model
+        quant = os.environ.get("DEMO_QUANT", "xetla")
+        self.quant = None if quant.lower() in ("", "none") else quant
+        self.dtype = os.environ.get("DEMO_DTYPE", "float16")
+        self.max_model_len = int(os.environ.get("DEMO_MAX_MODEL_LEN", "8192"))
+        self.gpu_mem_util = float(os.environ.get("DEMO_GPU_MEM_UTIL", "0.85"))
+        self.text_only = _env_bool("DEMO_TEXT_ONLY", False)
+        self.max_images = 0 if self.text_only else int(os.environ.get("DEMO_MAX_IMAGES", "4"))
+        self.max_image_side = int(os.environ.get("DEMO_MAX_IMAGE_SIDE", "1024"))
+        self.enforce_eager = _env_bool("DEMO_ENFORCE_EAGER", False)
+        self.warmup = _env_bool("DEMO_WARMUP", True)
+
+
+CFG = Config()
+
+
+# ---------------------------------------------------------------------------
+# Request/response models
+# ---------------------------------------------------------------------------
+class Message(BaseModel):
+    role: str = Field(..., pattern="^(system|user|assistant)$")
+    content: str = ""
+    # data: URLs (or bare base64) for user messages, at most CFG.max_images.
+    images: list[str] = Field(default_factory=list)
+
+
+class ChatRequest(BaseModel):
+    messages: list[Message] = Field(..., min_length=1)
+    max_tokens: int = Field(512, ge=1, le=32768)
+    temperature: float = Field(0.7, ge=0.0, le=2.0)
+    top_p: float = Field(0.9, ge=0.0, le=1.0)
+    thinking: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
+class ChatEngine:
+    """Wraps one warm vLLM engine; serializes turns (single GPU)."""
+
+    def __init__(self, cfg: Config) -> None:
+        if not cfg.model:
+            raise RuntimeError("DEMO_MODEL is not set")
+        from vllm import LLM
+
+        self.cfg = cfg
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+
+        extra: dict[str, Any] = {}
+        if cfg.text_only:
+            extra["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+        else:
+            extra["limit_mm_per_prompt"] = {"image": cfg.max_images, "video": 0}
+
+        t0 = time.perf_counter()
+        self.llm = LLM(
+            model=cfg.model,
+            tokenizer=cfg.tokenizer,
+            max_model_len=cfg.max_model_len,
+            gpu_memory_utilization=cfg.gpu_mem_util,
+            trust_remote_code=True,
+            enable_prefix_caching=False,
+            quantization=cfg.quant,
+            dtype=cfg.dtype,
+            enforce_eager=cfg.enforce_eager,
+            **extra,
+        )
+        self.load_seconds = time.perf_counter() - t0
+        self.engine = self.llm.llm_engine
+        self.tokenizer = self.llm.get_tokenizer()
+        self.supports_images = (not cfg.text_only) and _model_has_vision(self.llm)
+
+    # -- prompt building ---------------------------------------------------
+    def build_prompt(self, req: ChatRequest) -> tuple[Any, int]:
+        """Return (vLLM prompt, image count) for the conversation."""
+        chat: list[dict[str, Any]] = []
+        images: list[Any] = []
+        for msg in req.messages:
+            if msg.images and msg.role == "user" and self.supports_images:
+                parts: list[dict[str, Any]] = []
+                for data_url in msg.images[: self.cfg.max_images]:
+                    images.append(_decode_image(data_url, self.cfg.max_image_side))
+                    parts.append({"type": "image"})
+                if msg.content:
+                    parts.append({"type": "text", "text": msg.content})
+                chat.append({"role": msg.role, "content": parts})
+            else:
+                chat.append({"role": msg.role, "content": msg.content})
+
+        if len(images) > self.cfg.max_images:
+            raise HTTPException(
+                status_code=400,
+                detail=f"At most {self.cfg.max_images} images per conversation",
+            )
+
+        kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+        try:
+            text = self.tokenizer.apply_chat_template(
+                chat, enable_thinking=req.thinking, **kwargs)
+        except TypeError:
+            # Template without an enable_thinking parameter.
+            text = self.tokenizer.apply_chat_template(chat, **kwargs)
+
+        if not images:
+            return text, 0
+        return {"prompt": text, "multi_modal_data": {"image": images}}, len(images)
+
+    # -- generation --------------------------------------------------------
+    def stream(self, req: ChatRequest) -> Iterator[str]:
+        from vllm import SamplingParams
+
+        prompt, n_images = self.build_prompt(req)
+        params = SamplingParams(
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+        )
+
+        # One GPU, one engine: one turn at a time.
+        with self._lock:
+            self._stop.clear()
+            req_id = f"chat-{time.time_ns()}"
+            self.engine.add_request(req_id, prompt, params)
+
+            t_start = time.perf_counter()
+            t_first: float | None = None
+            sent = 0
+            n_out = 0
+            n_prompt = 0
+            finish_reason = None
+            aborted = False
+            try:
+                while self.engine.has_unfinished_requests():
+                    if self._stop.is_set() and not aborted:
+                        self.engine.abort_request(req_id)
+                        aborted = True
+                    for out in self.engine.step():
+                        if out.request_id != req_id:
+                            continue
+                        completion = out.outputs[0]
+                        text = completion.text
+                        if len(text) > sent:
+                            if t_first is None:
+                                t_first = time.perf_counter()
+                            yield _sse("delta", {"text": text[sent:]})
+                            sent = len(text)
+                        n_out = len(completion.token_ids)
+                        n_prompt = len(getattr(out, "prompt_token_ids", None) or ()) or n_prompt
+                        if out.finished:
+                            finish_reason = completion.finish_reason
+            except GeneratorExit:
+                # Browser navigated away / stopped reading: drop the request.
+                self.engine.abort_request(req_id)
+                raise
+            t_end = time.perf_counter()
+
+        yield _sse("stats", _metrics(
+            t_start=t_start, t_first=t_first, t_end=t_end,
+            n_prompt=n_prompt, n_out=n_out, n_images=n_images,
+            finish_reason="aborted" if aborted else finish_reason,
+        ))
+        yield _sse("done", {})
+
+    def abort(self) -> None:
+        self._stop.set()
+
+    def warmup(self) -> None:
+        try:
+            for _ in self.stream(ChatRequest(
+                    messages=[Message(role="user", content="hi")],
+                    max_tokens=8, temperature=0.0, thinking=False)):
+                pass
+        except Exception:  # noqa: BLE001 - warmup must never block startup
+            pass
+
+
+def _metrics(*, t_start: float, t_first: float | None, t_end: float,
+             n_prompt: int, n_out: int, n_images: int,
+             finish_reason: str | None) -> dict[str, Any]:
+    """Per-turn timings. `decode_tps` is the observed inter-token rate, i.e.
+    it excludes prefill: (tokens - 1) / (end - first token)."""
+    ttft = (t_first - t_start) if t_first else None
+    decode_s = (t_end - t_first) if t_first else None
+    decode_tps = ((n_out - 1) / decode_s) if (decode_s and n_out > 1) else None
+    prefill_tps = (n_prompt / ttft) if (ttft and n_prompt) else None
+    total_s = t_end - t_start
+    return {
+        "decode_tps": round(decode_tps, 2) if decode_tps else None,
+        "ttft_ms": round(ttft * 1e3, 1) if ttft else None,
+        "decode_s": round(decode_s, 2) if decode_s else None,
+        "total_s": round(total_s, 2),
+        "output_tokens": n_out,
+        "prompt_tokens": n_prompt,
+        "prefill_tps": round(prefill_tps, 1) if prefill_tps else None,
+        "images": n_images,
+        "finish_reason": finish_reason,
+        "overall_tps": round(n_out / total_s, 2) if total_s > 0 and n_out else None,
+    }
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _decode_image(data_url: str, max_side: int):
+    """Decode a browser data: URL into a downscaled RGB PIL image."""
+    from PIL import Image
+
+    payload = data_url.split(",", 1)[1] if data_url.startswith("data:") else data_url
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Malformed image data") from exc
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image too large")
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+    except Exception as exc:  # noqa: BLE001 - any decoder failure is a bad upload
+        raise HTTPException(status_code=400, detail="Unsupported image format") from exc
+
+    image = image.convert("RGB")
+    longest = max(image.size)
+    if max_side and longest > max_side:
+        scale = max_side / longest
+        image = image.resize(
+            (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+            Image.LANCZOS,
+        )
+    return image
+
+
+def _model_has_vision(llm: Any) -> bool:
+    try:
+        hf_config = llm.llm_engine.vllm_config.model_config.hf_config
+    except Exception:  # noqa: BLE001
+        return False
+    if getattr(hf_config, "language_model_only", False):
+        return False
+    return getattr(hf_config, "vision_config", None) is not None
+
+
+def _device_name() -> str:
+    try:
+        import torch
+
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return torch.xpu.get_device_properties(0).name
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_properties(0).name
+    except Exception:  # noqa: BLE001
+        pass
+    return "cpu"
+
+
+def _memory_gib() -> dict[str, Any]:
+    try:
+        import torch
+
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            free_b, total_b = torch.xpu.mem_get_info(0)
+            return {
+                "used_gib": round((total_b - free_b) / 2**30, 2),
+                "total_gib": round(total_b / 2**30, 2),
+            }
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(title="Bonsai int2 Chat Studio")
+_engine: ChatEngine | None = None
+_engine_error: str | None = None
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    global _engine, _engine_error
+    try:
+        _engine = ChatEngine(CFG)
+    except Exception as exc:  # noqa: BLE001 - surface load failures in the UI
+        _engine_error = str(exc)
+        raise
+    if CFG.warmup:
+        _engine.warmup()
+
+
+def _require_engine() -> ChatEngine:
+    if _engine is None:
+        raise HTTPException(status_code=503, detail=_engine_error or "Engine not ready")
+    return _engine
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    return {"ready": _engine is not None, "error": _engine_error}
+
+
+@app.get("/config")
+def config() -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "model": CFG.model,
+        "quantization": CFG.quant or "none",
+        "quant_method": os.environ.get("XETLA_QUANT_METHOD", "-"),
+        "prequantized": bool(os.environ.get("XETLA_PREQUANT_PATH")),
+        "dtype": CFG.dtype,
+        "max_model_len": CFG.max_model_len,
+        "device": _device_name(),
+        "ready": _engine is not None,
+        "supports_images": bool(_engine and _engine.supports_images),
+        "max_images": CFG.max_images,
+        **_memory_gib(),
+    }
+    if _engine is not None:
+        info["load_seconds"] = round(_engine.load_seconds, 1)
+        info["kv_cache_tokens"] = _kv_cache_tokens(_engine)
+    return info
+
+
+def _kv_cache_tokens(engine: ChatEngine) -> int | None:
+    try:
+        cache = engine.engine.vllm_config.cache_config
+        return int(cache.num_gpu_blocks) * int(cache.block_size)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@app.post("/chat")
+def chat(req: ChatRequest) -> StreamingResponse:
+    engine = _require_engine()
+    return StreamingResponse(
+        engine.stream(req),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/abort")
+def abort() -> dict[str, Any]:
+    _require_engine().abort()
+    return {"ok": True}
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
