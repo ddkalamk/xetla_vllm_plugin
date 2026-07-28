@@ -16,7 +16,7 @@
 # What this script does:
 #   1) Clones xetla_vllm_plugin (with the xetla submodule) into <DEST>/xetla_vllm_plugin
 #   2) Creates a fresh venv at <DEST>/xetla_vllm_plugin/.venv (Python 3.12 via uv)
-#   3) Clones ddkalamk/vllm (xetla_v0.19.0 branch) into <DEST>/xetla_vllm_plugin/vllm
+#   3) Clones ddkalamk/vllm (xetla_v0.21.0 branch) into <DEST>/xetla_vllm_plugin/vllm
 #      and (best-effort) applies the vendored vllm.patch on top
 #   4) Installs vllm (XPU target) and triton-xpu into the venv
 #   5) Builds the xetla plugin (PyTorch SYCL extension) into the venv
@@ -52,7 +52,7 @@ PLUGIN_REPO="${PLUGIN_REPO:-https://github.com/ddkalamk/xetla_vllm_plugin.git}"
 PLUGIN_BRANCH="${PLUGIN_BRANCH:-feature/int2-fp16-bonsai-chat}"
 
 VLLM_REPO="${VLLM_REPO:-https://github.com/ddkalamk/vllm.git}"
-VLLM_BRANCH="${VLLM_BRANCH:-xetla_v0.19.0}"
+VLLM_BRANCH="${VLLM_BRANCH:-xetla_v0.21.0}"
 
 # Optional: override the xetla submodule URL (useful for local file:// builds
 # when the plugin's .gitmodules points to a remote that doesn't yet have the

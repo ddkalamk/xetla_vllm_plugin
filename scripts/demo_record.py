@@ -37,7 +37,9 @@ DEFAULT_MODEL = os.environ.get(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--model", default=DEFAULT_MODEL)
-    p.add_argument("--tokenizer", default=os.environ.get("BONSAI_TOKENIZER", "Qwen/Qwen3-8B"))
+    p.add_argument("--tokenizer", default=None,
+                   help="Defaults to the model itself for HF model directories, "
+                        "otherwise $BONSAI_TOKENIZER (Qwen/Qwen3-8B).")
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--max-tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.0)
@@ -53,6 +55,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--type-cps", type=float, default=18.0,
                    help="Characters per second when 'typing' the prompt.")
     p.add_argument("--enforce-eager", action="store_true", default=False)
+    p.add_argument("--text-only", action="store_true", default=False,
+                   help="Disable image/video inputs (skips vision-tower "
+                        "profiling on multimodal models like Bonsai-27B).")
     p.add_argument("--gpu-memory-utilization", type=float,
                    default=float(os.environ.get("DEMO_GPU_MEM_UTIL", "0.9")),
                    help="vLLM gpu_memory_utilization. Lower on iGPUs.")
@@ -91,6 +96,12 @@ def main() -> None:
 
     if args.model.endswith(".gguf") and not os.path.exists(args.model):
         sys.exit(f"Model not found: {args.model}")
+
+    if args.tokenizer is None:
+        args.tokenizer = (
+            args.model if os.path.isdir(args.model)
+            else os.environ.get("BONSAI_TOKENIZER", "Qwen/Qwen3-8B")
+        )
 
     # --- Auto-detect integrated XPUs and cap gpu_memory_utilization. --------
     # Mirrors scripts/chat.sh. Only kicks in if the user did not pass
@@ -139,6 +150,9 @@ def main() -> None:
     os.dup2(devnull, 1)
     try:
         from vllm import LLM, SamplingParams  # noqa: WPS433
+        extra: dict = {}
+        if args.text_only:
+            extra["limit_mm_per_prompt"] = {"image": 0, "video": 0}
         llm = LLM(
             model=args.model,
             tokenizer=args.tokenizer,
@@ -149,6 +163,7 @@ def main() -> None:
             quantization=quant,
             dtype="float16",
             enforce_eager=args.enforce_eager,
+            **extra,
         )
         sp = SamplingParams(
             temperature=args.temperature,
@@ -177,7 +192,7 @@ def main() -> None:
     RESET = "\x1b[0m"
 
     # Banner line.
-    cast.write(f"{BOLD}{CYAN}vLLM Bonsai-8B chat demo  --  {args.label}{RESET}\r\n")
+    cast.write(f"{BOLD}{CYAN}vLLM Bonsai chat demo  --  {args.label}{RESET}\r\n")
     cast.write(f"{DIM}prompt: \"{args.prompt}\"{RESET}\r\n\r\n")
 
     # Type the prompt char-by-char.

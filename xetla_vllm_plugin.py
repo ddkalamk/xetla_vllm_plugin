@@ -27,6 +27,11 @@ except:
 #os.environ["SYCL_PROGRAM_COMPILE_OPTIONS"] = "-vc-codegen -vc-disable-indvars-opt -Xfinalizer ' -printregusage -enableBCR -DPASTokenReduction ' -doubleGRF"
 timing_enabled = int(os.environ.get("XETLA_TIMINGS", "0")) > 0
 quantize_lm_heads = int(os.environ.get("XETLA_QUANTIZE_LM_HEADS", "1")) > 0
+# The int2 x fp16 DPAS prefill kernel converts activations to int8 (XMX), which
+# costs ~1-3% relative error per GEMM. That is fine for shallow models but can
+# degrade deep ones; set XETLA_DISABLE_DPAS=1 to keep prefill on the accurate
+# upcvt kernel.
+disable_dpas = int(os.environ.get("XETLA_DISABLE_DPAS", "0")) > 0
 
 
 # ---- Pre-quantized sidecar (Option B) ---------------------------------------
@@ -67,25 +72,67 @@ def _xetla_prequant_load_index() -> None:
         _xetla_prequant_meta["keys"] = set()
 
 
+def _xetla_prequant_lookup(prefix: str, method: str = "") -> Optional[str]:
+    """Resolve `prefix` against the sidecar index and return the matching
+    sidecar key prefix, or None when the layer is not in the sidecar.
+
+    When the model is loaded as a speculative draft, vLLM prefixes all layer
+    names with 'draft_model.' (e.g. 'draft_model.model.layers.0.self_attn.qkv_proj').
+    The sidecar was generated from the standalone model and therefore uses the
+    unprefixed names.  We strip leading path components one at a time until we
+    find a match, so both loading modes use the same sidecar file.
+    """
+    if not _xetla_prequant_load_path or not prefix:
+        return None
+    _xetla_prequant_load_index()
+    if method and _xetla_prequant_meta.get("method") and \
+            _xetla_prequant_meta["method"] != method:
+        # Sidecar was produced for a different quant method.
+        return None
+    keys = _xetla_prequant_meta.get("keys", set())
+
+    # Try the prefix as-is, then strip leading components until a match.
+    candidates = [prefix]
+    parts = prefix.split(".")
+    for i in range(1, len(parts)):
+        candidates.append(".".join(parts[i:]))
+
+    for cand in candidates:
+        if f"{cand}.qweight" in keys and f"{cand}.scale" in keys:
+            return cand
+    return None
+
+
+def _xetla_target_device(layer: torch.nn.Module) -> torch.device:
+    """Device the packed weights should land on.
+
+    ``layer.weight`` may be a zero-storage *meta* placeholder (see
+    ``XetlaLinearMethod.create_weights``), in which case we fall back to the
+    current accelerator device.
+    """
+    dev = layer.weight.data.device
+    if dev.type != "meta":
+        return dev
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device(f"xpu:{torch.xpu.current_device()}")
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    return torch.device("cpu")
+
+
 def _xetla_prequant_try_load(layer: torch.nn.Module, prefix: str,
                              method: str, kind: str) -> bool:
     """If a sidecar entry exists for `prefix`, populate the layer in-place
-    and return True. `kind` is 'linear' or 'lm_head'."""
-    if not _xetla_prequant_load_path:
-        return False
-    _xetla_prequant_load_index()
-    keys = _xetla_prequant_meta.get("keys", set())
-    qkey = f"{prefix}.qweight"
-    skey = f"{prefix}.scale"
-    if qkey not in keys or skey not in keys:
-        return False
-    if _xetla_prequant_meta.get("method") and \
-            _xetla_prequant_meta["method"] != method:
-        # Sidecar was produced for a different quant method.
+    and return True. `kind` is 'linear' or 'lm_head'.
+    """
+    lookup_prefix = _xetla_prequant_lookup(prefix, method)
+    if lookup_prefix is None:
         return False
     try:
         from safetensors import safe_open  # noqa: WPS433
-        dev = layer.weight.data.device
+        dev = _xetla_target_device(layer)
+        qkey = f"{lookup_prefix}.qweight"
+        skey = f"{lookup_prefix}.scale"
         with safe_open(_xetla_prequant_load_path, framework="pt") as f:
             qw = f.get_tensor(qkey)
             sc = f.get_tensor(skey)
@@ -96,13 +143,13 @@ def _xetla_prequant_try_load(layer: torch.nn.Module, prefix: str,
         layer.xetla_quantized = True
         # Re-derive dispatch capability locally (no need to store).
         if method == "int2_f16":
-            layer._xetla_dpas_capable = (qw.shape[1] & 255) == 0
+            layer._xetla_dpas_capable = (not disable_dpas) and (qw.shape[1] & 255) == 0
         else:
             layer._xetla_dpas_capable = False
         _xetla_pre_convert_bias(layer)
         return True
     except Exception as e:
-        print(f"[xetla] WARN: sidecar load failed for {prefix}: {e}",
+        print(f"[xetla] WARN: sidecar load failed for {prefix} (lookup={lookup_prefix}): {e}",
               flush=True)
         return False
 
@@ -454,11 +501,14 @@ class XetlaConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(
-            cls, hf_quant_cfg, user_quant) -> Optional[QuantizationMethods]:
+            cls, hf_quant_cfg, user_quant, **kwargs) -> Optional[QuantizationMethods]:
         # Allow the user to opt into the xetla path even when the source
         # checkpoint advertises a different quantization method (e.g. gguf).
         # When the user explicitly asks for `xetla`, claim ownership so
         # `_verify_quantization` does not raise a mismatch error.
+        # `**kwargs` absorbs extra arguments added by newer vLLM versions
+        # (e.g. `hf_config=` since 0.21.0) -- without it the override is
+        # silently skipped and the model loads dense.
         if user_quant == "xetla":
             return "xetla"
         return None
@@ -635,6 +685,32 @@ class XetlaLinearMethod(LinearMethodBase):
                        output_partition_sizes: list[int], input_size: int,
                        output_size: int, params_dtype: torch.dtype,
                        **extra_weight_attrs):
+        # When a prequant sidecar already holds the packed weights for this
+        # layer we must NOT allocate the dense fp16 tensor: for a 27B model
+        # that alone is ~54 GB and never fits on the device. Allocate the
+        # parameter on the `meta` device instead -- it keeps the exact shape
+        # (so every vLLM weight_loader, including the fused qkv / mamba
+        # sharded ones, still validates and "copies" happily) while using
+        # zero memory. process_weights_after_loading() then swaps in the real
+        # packed tensor from the sidecar.
+        method = self.quant_config.method
+        if method in ("int2_f16", "int1_f16") and \
+                _xetla_prequant_lookup(self.prefix, method) is not None:
+            from vllm.model_executor.parameter import ModelWeightParameter
+            from vllm.model_executor.utils import set_weight_attrs
+            weight_loader = extra_weight_attrs.pop("weight_loader")
+            weight = ModelWeightParameter(
+                data=torch.empty(sum(output_partition_sizes),
+                                 input_size_per_partition,
+                                 dtype=params_dtype, device="meta"),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight", weight)
+            set_weight_attrs(weight, extra_weight_attrs)
+            layer._xetla_meta_placeholder = True
+            return
         # We just reuse UnquantizedLinearMethod to create weights
         UnquantizedLinearMethod.create_weights(self, layer, input_size_per_partition,
                                                output_partition_sizes, input_size,
@@ -652,7 +728,25 @@ class XetlaLinearMethod(LinearMethodBase):
             print(f"[xetla] sidecar hit: {self.prefix} ({method})")
             return
 
-        print(f"Processing weights for layer {layer} with method {method}")
+        if getattr(layer, "_xetla_meta_placeholder", False):
+            # Should never happen: the placeholder is only created when the
+            # sidecar has an entry for this prefix.
+            raise RuntimeError(
+                f"[xetla] sidecar entry for {self.prefix} vanished between "
+                "create_weights() and process_weights_after_loading()")
+
+        if _xetla_prequant_load_path and method in ("int2_f16", "int1_f16"):
+            # A sidecar is in use but this layer is not in it. That means the
+            # offline packer decided the layer is not ternary/binary (e.g. the
+            # vision tower, or a gate projection kept in fp16). Re-quantizing
+            # it here would silently destroy accuracy, so keep it dense.
+            if int(os.environ.get("XETLA_DEBUG", "0")) > 0:
+                print(f"[xetla] keeping {self.prefix} dense (not in sidecar)",
+                      flush=True)
+            return
+
+        print(f"[xetla] quantizing {self.prefix} "
+              f"[{tuple(layer.weight.shape)}] with method {method}")
         if method == "int2":
             weight = layer.weight.data
             weight_int2, layer.scale = quantize_to_int2(weight.t())
@@ -705,6 +799,10 @@ class XetlaLinearMethod(LinearMethodBase):
         method = self.quant_config.method
         if method == "int2":
             return xetla_int2_bf16_fused_gemm(x, layer.weight, layer.scale, bias)
+        if method in ("int2_f16", "int1_f16") and \
+                not getattr(layer, "xetla_quantized", False):
+            # Layer was deliberately left dense (mixed-precision checkpoint).
+            return UnquantizedLinearMethod.apply(self, layer, x, bias)
         if method == "int2_f16":
             x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
             # B8: prefer the pre-converted layer.bias (always fp16 already).
@@ -868,8 +966,88 @@ def _install_xetla_profile():
         print("[xetla profile] no ops found to wrap", flush=True)
 
 
+def _maybe_disable_triton_stride_versioning() -> None:
+    """Opt-in workaround for a triton-xpu compiler crash on hybrid models.
+
+    triton-xpu 3.7.0 segfaults inside its Intel-specific
+    ``TritonIntelStrideVersioning`` TTIR pass while compiling the FLA chunked
+    gated-delta-rule kernel (``fla/ops/chunk_delta_h.py``) that Qwen3.5-style
+    models -- e.g. Bonsai-27B -- use for linear-attention prefill.  Every
+    autotune config fails, so prefill dies with ``PassManager::run failed``.
+
+    vLLM >= 0.20.2 routes GDN through its XPU path and no longer hits that
+    kernel, so this is off by default.  Set
+    ``XETLA_TRITON_DISABLE_STRIDE_VERSIONING=1`` to no-op the pass (it is a
+    pure optimization) when running on an older vLLM.
+    """
+    if os.environ.get("XETLA_TRITON_DISABLE_STRIDE_VERSIONING", "0") != "1":
+        return
+    try:
+        from triton._C.libtriton import intel  # noqa: WPS433
+    except Exception:
+        return
+    try:
+        if hasattr(intel.passes.ttir, "add_stride_versioning"):
+            intel.passes.ttir.add_stride_versioning = lambda pm: None
+            print("[xetla] disabled triton TritonIntelStrideVersioning pass "
+                  "(crashes on FLA gated-delta-rule kernels)", flush=True)
+    except Exception as e:
+        print(f"[xetla] WARN: could not disable stride versioning: {e}",
+              flush=True)
+
+
+def _xetla_quantize_lm_head(model: torch.nn.Module) -> None:
+    """Quantize ``ParallelLMHead`` modules that vLLM built without a quant_config.
+
+    Several models -- Qwen3.5 / Qwen3-Next (Bonsai-27B) among them -- construct
+    ``ParallelLMHead`` without passing ``quant_config``, so
+    ``XetlaConfig.get_quant_method()`` is never consulted for it and the head
+    stays dense fp16.  For Bonsai that head is ternary in the checkpoint and it
+    is by far the largest single tensor read per decoded token
+    (248320 x 5120 x 2 B = 2.5 GB, ~27% of the decode traffic), so wire it to
+    the xetla path here, after the weights have been loaded.
+
+    Set ``XETLA_QUANTIZE_LM_HEADS=0`` to keep the head dense.
+    """
+    if not quantize_lm_heads or not current_platform.is_xpu():
+        return
+    method = xetla_quant_method()
+    if method not in ("int2_f16", "int1_f16"):
+        return
+    try:
+        config = XetlaConfig()
+    except Exception:
+        return
+
+    for name, module in model.named_modules():
+        if not isinstance(module, ParallelLMHead):
+            continue
+        if isinstance(getattr(module, "quant_method", None), XetlaEmbeddingMethod):
+            continue  # already handled through get_quant_method()
+        if getattr(module, "xetla_quantized", False):
+            continue
+        if _xetla_prequant_load_path and \
+                _xetla_prequant_lookup(name, method) is None:
+            # Sidecar in use but it has no packed head: leave it dense rather
+            # than silently re-quantizing something that may not be ternary.
+            print(f"[xetla] lm_head {name}: not in sidecar, kept dense",
+                  flush=True)
+            continue
+        try:
+            qm = XetlaEmbeddingMethod(config, inplace=True, prefix=name)
+            qm.process_weights_after_loading(module)
+            if getattr(module, "xetla_quantized", False):
+                module.quant_method = qm
+                print(f"[xetla] lm_head {name} quantized ({method}), "
+                      f"packed {tuple(module.weight.shape)}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[xetla] WARN: could not quantize lm_head {name}: {e}",
+                  flush=True)
+
+
 def register():
     print("Hello xetla plugin!")
+    _maybe_disable_triton_stride_versioning()
     # Force-load the SYCL extension so its TORCH_LIBRARY / TORCH_LIBRARY_FRAGMENT
     # blocks register `torch.ops.xetla_int2.*` in *every* process that loads
     # the plugin (main + each engine worker). Without this the ops are missing
@@ -890,34 +1068,37 @@ def register():
     # safetensors file once the whole model has been quantized. Several
     # loaders do `from ...utils import process_weights_after_loading`, so
     # we patch every module that re-exports the binding.
-    if _xetla_prequant_dump_path:
-        try:
-            import vllm.model_executor.model_loader.utils as _mu  # noqa: WPS433
-            _orig_pwal = _mu.process_weights_after_loading
+    try:
+        import vllm.model_executor.model_loader.utils as _mu  # noqa: WPS433
+        _orig_pwal = _mu.process_weights_after_loading
 
-            def _wrapped_pwal(*args, **kwargs):
-                _orig_pwal(*args, **kwargs)
-                _xetla_prequant_flush_dump()
+        def _wrapped_pwal(*args, **kwargs):
+            _orig_pwal(*args, **kwargs)
+            model = args[0] if args else kwargs.get("model")
+            if isinstance(model, torch.nn.Module):
+                _xetla_quantize_lm_head(model)
+            _xetla_prequant_flush_dump()
 
-            _mu.process_weights_after_loading = _wrapped_pwal
-            # Patch every loader that imported the symbol by name.
-            for _modname in (
-                "vllm.model_executor.model_loader.base_loader",
-                "vllm.model_executor.model_loader.gguf_loader",
-                "vllm.model_executor.model_loader.tensorizer_loader",
-                "vllm.model_executor.model_loader",
-                "vllm.model_executor.models.utils",
-                "vllm.model_executor.models.mllama4",
-            ):
-                try:
-                    _m = __import__(_modname, fromlist=["*"])
-                except Exception:
-                    continue
-                if hasattr(_m, "process_weights_after_loading"):
-                    _m.process_weights_after_loading = _wrapped_pwal
+        _mu.process_weights_after_loading = _wrapped_pwal
+        # Patch every loader that imported the symbol by name.
+        for _modname in (
+            "vllm.model_executor.model_loader.base_loader",
+            "vllm.model_executor.model_loader.gguf_loader",
+            "vllm.model_executor.model_loader.tensorizer_loader",
+            "vllm.model_executor.model_loader",
+            "vllm.model_executor.models.utils",
+            "vllm.model_executor.models.mllama4",
+        ):
+            try:
+                _m = __import__(_modname, fromlist=["*"])
+            except Exception:
+                continue
+            if hasattr(_m, "process_weights_after_loading"):
+                _m.process_weights_after_loading = _wrapped_pwal
+        if _xetla_prequant_dump_path:
             print(f"[xetla] sidecar dump enabled -> {_xetla_prequant_dump_path}")
-        except Exception as e:
-            print(f"[xetla] WARN: could not install sidecar dump hook: {e}")
+    except Exception as e:
+        print(f"[xetla] WARN: could not install post-load hook: {e}")
 
     register_quantization_config("xetla")(XetlaConfig)
     

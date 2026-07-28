@@ -14,7 +14,7 @@ Tested combo:
 - Intel oneAPI 2025.3 + Intel GPU driver 26.05.37020.3
 - Python 3.12 (managed by `uv`)
 - PyTorch 2.11.0+xpu, triton-xpu 3.7.0
-- vLLM fork [`ddkalamk/vllm@xetla_v0.19.0`](https://github.com/ddkalamk/vllm/tree/xetla_v0.19.0)
+- vLLM fork [`ddkalamk/vllm@xetla_v0.21.0`](https://github.com/ddkalamk/vllm/tree/xetla_v0.21.0)
 - Plugin branch `feature/int2-fp16-bonsai-chat`
 - GPUs verified: BMG dGPU (pcl-zen4) at full speed (~110 tok/s), BMG-XG3 / Xe2 (pcl-kini04) with workarounds
 
@@ -69,7 +69,7 @@ After completion:
 ~/fresh_int2_fp16_setup/
 └── xetla_vllm_plugin/
     ├── .venv/                # uv-managed Python 3.12 environment
-    ├── vllm/                 # cloned + patched ddkalamk/vllm@xetla_v0.19.0
+    ├── vllm/                 # cloned + patched ddkalamk/vllm@xetla_v0.21.0
     ├── xetla/                # int2 kernels (submodule)
     ├── csrc/, scripts/, ...  # plugin source
     └── ...
@@ -97,7 +97,7 @@ are unreachable, point the script at file:// URLs:
 export PLUGIN_REPO="file:///data/nfs_home/egeorgan/xetla_vllm_plugin"
 export PLUGIN_BRANCH="feature/int2-fp16-bonsai-chat"
 export VLLM_REPO="file:///data/nfs_home/egeorgan/xetla_vllm_plugin/vllm"
-export VLLM_BRANCH="xetla_v0.19.0"
+export VLLM_BRANCH="xetla_v0.21.0"
 export XETLA_SUBMODULE_REPO="file:///data/nfs_home/egeorgan/xetla_vllm_plugin/xetla"
 export GIT_ALLOW_PROTOCOL=file:https
 bash /data/nfs_home/egeorgan/xetla_vllm_plugin/utils/setup_fresh.sh ~/fresh_int2_fp16_setup
@@ -282,7 +282,7 @@ INFO ... [core.py:283] init engine (profile, create kv cache, warmup model) took
 | `csrc/` | xetla SYCL kernel wrappers exposed as Torch ops |
 | `xetla_vllm_plugin.py` | vLLM plugin (`XetlaConfig`, `XetlaLinearMethod`, sidecar prequant loader) |
 | `xetla/` | xetla kernel headers (submodule) |
-| `vllm/` | vendored ddkalamk/vllm@xetla_v0.19.0 + `vllm.patch` |
+| `vllm/` | vendored ddkalamk/vllm@xetla_v0.21.0 + `vllm.patch` |
 | `scripts/chat.sh` | turnkey chat wrapper (auto sidecar detection, integrated-XPU mem util) |
 | `scripts/chat.py` | Python REPL underneath |
 | `scripts/demo_record.py` | asciinema cast generator used for the GIFs in `DEMO.md` |
