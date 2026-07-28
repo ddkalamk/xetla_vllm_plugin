@@ -17,6 +17,58 @@ browser  ──►  demo/static/index.html   (single page, SSE)
 
 ---
 
+## Quick start (one command)
+
+If the venv and the int2 sidecar are already in place (steps 0 and 2 below),
+`launch_demo.sh` does everything: allocate a node, start the backend, wait for
+the engine, bridge the port, and print the URL. **Its only required argument is
+the Slurm partition** — the value you would pass to `salloc --partition=…`:
+
+```bash
+cd demo
+./launch_demo.sh zen5
+```
+
+```
+[demo] reusing RUNNING allocation 346533 on partition zen5
+[demo] node     : pcl-zen4
+[demo] backend already serving on pcl-zen4:8000, reusing it
+[demo] model        : Ternary-Bonsai-27B-unpacked
+[demo] quantization : xetla / int2_f16 (sidecar)
+[demo] device       : Intel(R) Graphics [0xe223]
+[demo] context      : 8192
+[demo] KV cache     : 257,088 tokens
+[demo] images       : up to 4
+
+[demo] open  ->  http://localhost:8766
+```
+
+| Command | Purpose |
+|---|---|
+| `./launch_demo.sh <partition>` | allocate (or reuse) a node and serve |
+| `./launch_demo.sh <partition> --time 02:00:00` | allocation wall time (default `03:59:00`) |
+| `./launch_demo.sh <partition> --jobid N` | reuse a specific allocation |
+| `./launch_demo.sh <partition> --port 9000` | pin the local port (default: first free from 8765) |
+| `./launch_demo.sh --status` | job, node, backend health, URL |
+| `./launch_demo.sh --logs` | follow the backend log |
+| `./launch_demo.sh --stop` | stop backend + relay (and the allocation, if the script created it) |
+
+Behaviour worth knowing:
+
+* It **reuses** a RUNNING allocation on that partition instead of grabbing a
+  second node, and reuses an already-serving backend instead of restarting it.
+* It only runs `salloc --no-shell` when there is nothing to reuse, and only
+  `scancel`s allocations it created itself.
+* State (job id, node, ports, relay pid) lives in `demo/.run/`, so `--status`
+  and `--stop` work from any shell.
+* Anything after `--` is passed straight to `salloc`, e.g.
+  `./launch_demo.sh b70 -- --nodelist=pcl-arl01`.
+
+The rest of this document covers the same steps manually, plus configuration
+and troubleshooting.
+
+---
+
 ## 0. Prerequisites (one time)
 
 | Requirement | Notes |
@@ -49,11 +101,11 @@ an interactive job and note the **job id** and **node name**:
 ```bash
 squeue -u "$USER"                       # reuse an existing allocation
 # or allocate one:
-salloc -p b70 -t 4:00:00
+salloc --partition=zen5 --time=03:59:00
 ```
 
 Everything below assumes `JOBID=<your job id>` and that the node is reachable
-by name (e.g. `pcl-zen4`).
+by name (e.g. `pcl-zen4`). `launch_demo.sh <partition>` automates this step.
 
 ---
 
