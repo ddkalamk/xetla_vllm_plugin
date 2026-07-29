@@ -62,4 +62,27 @@ echo "[serve.sh] quant   : ${XETLA_QUANT_METHOD} (${DEMO_QUANT:-xetla})"
 echo "[serve.sh] serving : http://$(hostname):${PORT}"
 
 cd "${SCRIPT_DIR}"
-exec python -m uvicorn server:app --host "${HOST}" --port "${PORT}" --timeout-keep-alive 600
+
+# The engine asks for a restart (exit 42) when the KV cache does not fit at the
+# current context length; it leaves the next value to try in DEMO_RETRY_FILE.
+# A failed vLLM build cannot free its device memory, so a fresh process is the
+# only way to retry.
+RUN_DIR="${SCRIPT_DIR}/.run"
+mkdir -p "${RUN_DIR}"
+export DEMO_RETRY_FILE="${RUN_DIR}/retry_max_model_len"
+rm -f "${DEMO_RETRY_FILE}"
+
+while true; do
+    set +e
+    python -m uvicorn server:app --host "${HOST}" --port "${PORT}" --timeout-keep-alive 600
+    rc=$?
+    set -e
+    if [[ "${rc}" -eq 42 && -s "${DEMO_RETRY_FILE}" ]]; then
+        DEMO_MAX_MODEL_LEN="$(cat "${DEMO_RETRY_FILE}")"
+        export DEMO_MAX_MODEL_LEN
+        rm -f "${DEMO_RETRY_FILE}"
+        echo "[serve.sh] restarting with DEMO_MAX_MODEL_LEN=${DEMO_MAX_MODEL_LEN}"
+        continue
+    fi
+    exit "${rc}"
+done

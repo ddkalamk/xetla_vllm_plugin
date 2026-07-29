@@ -106,6 +106,30 @@ server_alive() {
     curl -s -m 5 --noproxy '*' -o /dev/null "http://${NODE}:${REMOTE_PORT}/health" 2>/dev/null
 }
 
+# A backend that is still loading the model does not answer /health yet, so
+# also look for the process itself: starting a second engine on the same GPU
+# makes both fight for memory and one of them dies.
+backend_starting() {
+    [[ -n "${JOB_ID:-}" ]] || return 1
+    srun --jobid="${JOB_ID}" --overlap bash -lc \
+        "pgrep -f 'uvicorn server:app' >/dev/null" >/dev/null 2>&1
+}
+
+wait_for_ready() {
+    local deadline=$(( SECONDS + READY_TIMEOUT ))
+    until server_alive; do
+        # Only trust the log's failure marker once the process is really gone;
+        # the log can hold a traceback from an earlier, unrelated attempt.
+        if grep -aq "Application startup failed" "${SERVER_LOG}" 2>/dev/null \
+           && ! backend_starting; then
+            tail -25 "${SERVER_LOG}" >&2
+            die "backend failed to start (see ${SERVER_LOG})"
+        fi
+        (( SECONDS < deadline )) || die "backend not ready after ${READY_TIMEOUT}s (see ${SERVER_LOG})"
+        sleep 5
+    done
+}
+
 # --------------------------------------------------------------- stop/status
 stop_all() {
     if [[ -n "${RELAY_PID:-}" ]] && kill -0 "${RELAY_PID}" 2>/dev/null; then
@@ -193,6 +217,11 @@ msg "node     : ${NODE}"
 # --------------------------------------------------------------- 2. backend
 if server_alive; then
     msg "backend already serving on ${NODE}:${REMOTE_PORT}, reusing it"
+elif backend_starting; then
+    msg "a backend is already starting on ${NODE}, waiting for it "
+    msg "(use --stop first if you want a fresh one)"
+    wait_for_ready
+    msg "backend ready"
 else
     : > "${SERVER_LOG}"
     msg "starting backend on ${NODE}:${REMOTE_PORT} (log: ${SERVER_LOG})"
@@ -202,15 +231,7 @@ else
     disown
 
     msg "waiting for the engine (first start compiles the model, ~2 min) ..."
-    deadline=$(( SECONDS + READY_TIMEOUT ))
-    until server_alive; do
-        if grep -qE "Traceback|error:|Exited with exit code" "${SERVER_LOG}" 2>/dev/null; then
-            tail -25 "${SERVER_LOG}" >&2
-            die "backend failed to start (see ${SERVER_LOG})"
-        fi
-        (( SECONDS < deadline )) || die "backend not ready after ${READY_TIMEOUT}s (see ${SERVER_LOG})"
-        sleep 5
-    done
+    wait_for_ready
     msg "backend ready"
 fi
 

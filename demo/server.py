@@ -49,6 +49,9 @@ from pydantic import BaseModel, Field
 
 STATIC_DIR = Path(__file__).parent / "static"
 
+# Exit code asking serve.sh to relaunch us with a smaller context.
+RETRY_EXIT_CODE = 42
+
 # A single decoded image is capped at this many bytes before resizing, so a
 # malicious/oversized upload cannot exhaust host memory.
 MAX_IMAGE_BYTES = 24 * 1024 * 1024
@@ -83,6 +86,129 @@ CFG = Config()
 
 
 # ---------------------------------------------------------------------------
+# Integrated-GPU memory tuning
+# ---------------------------------------------------------------------------
+# On integrated GPUs (Lunar Lake, Arrow Lake, Meteor Lake, ...) the "VRAM" is
+# system RAM. vLLM budgets the KV cache as
+#     requested = total_memory * gpu_memory_utilization
+# and refuses to start if mem_get_info() reports less *free* than that. On an
+# iGPU that free figure is essentially MemFree, so page cache left over from
+# reading a multi-GB checkpoint counts as "used" and can starve the engine
+# even though the memory is trivially reclaimable ("No available memory for
+# the cache blocks"). So: reclaim the cache first, then size the budget from
+# what is really free.
+def _meminfo() -> dict[str, float]:
+    """/proc/meminfo in GiB."""
+    info: dict[str, float] = {}
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                info[key] = int(rest.split()[0]) / 1024**2
+    except OSError:
+        pass
+    return info
+
+
+def _is_integrated_gpu(name: str, total_bytes: int) -> bool:
+    keywords = ("lunar", "lnl", "meteor", "mtl", "arrow", "arl",
+                "iris", "arc(tm) graphics")
+    if any(k in name.lower() for k in keywords):
+        return True
+    sys_total = _meminfo().get("MemTotal", 0.0) * 2**30
+    return bool(sys_total) and abs(total_bytes - sys_total) / sys_total < 0.15
+
+
+def _reclaim_page_cache(target_gib: float) -> None:
+    """Fault in a large anonymous mapping to make the kernel drop page cache,
+    then release it. Raises MemFree without needing root."""
+    import mmap
+
+    size = int(target_gib * 2**30)
+    if size <= 0:
+        return
+    try:
+        buf = mmap.mmap(-1, size)
+    except (OSError, ValueError) as exc:
+        print(f"[demo] page-cache reclaim skipped: {exc}", flush=True)
+        return
+    try:
+        chunk = b"\0" * (64 * 1024 * 1024)
+        written = 0
+        while written < size:
+            written += buf.write(chunk[: min(len(chunk), size - written)])
+    except (OSError, ValueError):
+        pass
+    finally:
+        buf.close()
+
+
+def _tune_integrated_gpu(cfg: Config) -> None:
+    """Adjust cfg.gpu_mem_util in place when running on an integrated GPU."""
+    if os.environ.get("DEMO_GPU_MEM_UTIL"):
+        return  # explicit user choice wins
+    try:
+        import torch
+
+        if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+            return
+        props = torch.xpu.get_device_properties(0)
+        if not _is_integrated_gpu(props.name, props.total_memory):
+            return
+    except Exception:  # noqa: BLE001 - detection must never block startup
+        return
+
+    info = _meminfo()
+    free_gib = info.get("MemFree", 0.0)
+    avail_gib = info.get("MemAvailable", 0.0)
+    headroom = float(os.environ.get("DEMO_RECLAIM_HEADROOM_GIB", "1.0"))
+    if avail_gib and free_gib < avail_gib - headroom:
+        target = avail_gib - headroom
+        print(f"[demo] integrated GPU: reclaiming page cache "
+              f"(MemFree {free_gib:.1f} -> target {target:.1f} GiB) ...", flush=True)
+        _reclaim_page_cache(target)
+
+    try:
+        import torch
+
+        free_b, total_b = torch.xpu.mem_get_info(0)
+    except Exception:  # noqa: BLE001
+        return
+
+    # Between this measurement and vLLM's own snapshot, torch/vLLM init costs
+    # ~1.5-2 GiB on an iGPU; budget below that or vLLM refuses to start with
+    # "Free memory on device ... is less than desired GPU memory utilization".
+    reserve_b = float(os.environ.get("DEMO_INIT_RESERVE_GIB", "2.0")) * 2**30
+    util = max(0.20, min(0.92, (free_b - reserve_b) / total_b))
+    cfg.gpu_mem_util = round(util, 2)
+    budget_gib = cfg.gpu_mem_util * total_b / 2**30
+    print(f"[demo] integrated GPU detected: free {free_b / 2**30:.1f} / "
+          f"{total_b / 2**30:.1f} GiB, reserving {reserve_b / 2**30:.1f} GiB "
+          f"-> gpu_memory_utilization={cfg.gpu_mem_util} "
+          f"({budget_gib:.1f} GiB budget)", flush=True)
+
+    # Shrink the things that eat that budget before the KV cache gets any:
+    # the profiling run scales with max_model_len, torch.compile keeps a
+    # multi-GiB workspace, and the vision tower is ~0.9 GiB of weights. On a
+    # shared-memory GPU there is rarely room for all three plus a usable KV
+    # cache, so trade them away by default. Explicit settings always win.
+    notes = []
+    if not os.environ.get("DEMO_MAX_MODEL_LEN"):
+        cfg.max_model_len = min(cfg.max_model_len, 2048)
+        notes.append(f"max_model_len={cfg.max_model_len}")
+    if not os.environ.get("DEMO_ENFORCE_EAGER"):
+        cfg.enforce_eager = True
+        notes.append("enforce_eager")
+    if not os.environ.get("DEMO_TEXT_ONLY"):
+        cfg.text_only = True
+        cfg.max_images = 0
+        notes.append("text_only (vision tower costs ~0.9 GiB; "
+                     "set DEMO_TEXT_ONLY=0 to keep image input)")
+    if notes:
+        print("[demo] integrated GPU defaults: " + ", ".join(notes), flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Request/response models
 # ---------------------------------------------------------------------------
 class Message(BaseModel):
@@ -109,6 +235,7 @@ class ChatEngine:
     def __init__(self, cfg: Config) -> None:
         if not cfg.model:
             raise RuntimeError("DEMO_MODEL is not set")
+        _tune_integrated_gpu(cfg)
         from vllm import LLM
 
         self.cfg = cfg
@@ -122,22 +249,47 @@ class ChatEngine:
             extra["limit_mm_per_prompt"] = {"image": cfg.max_images, "video": 0}
 
         t0 = time.perf_counter()
-        self.llm = LLM(
-            model=cfg.model,
-            tokenizer=cfg.tokenizer,
-            max_model_len=cfg.max_model_len,
-            gpu_memory_utilization=cfg.gpu_mem_util,
-            trust_remote_code=True,
-            enable_prefix_caching=False,
-            quantization=cfg.quant,
-            dtype=cfg.dtype,
-            enforce_eager=cfg.enforce_eager,
-            **extra,
-        )
+        self.llm = self._build_llm(cfg, extra)
         self.load_seconds = time.perf_counter() - t0
         self.engine = self.llm.llm_engine
         self.tokenizer = self.llm.get_tokenizer()
         self.supports_images = (not cfg.text_only) and _model_has_vision(self.llm)
+
+    @staticmethod
+    def _build_llm(cfg: Config, extra: dict[str, Any]):
+        """Construct the engine. If the KV cache does not fit, ask the wrapper
+        (serve.sh) to restart us with half the context: on memory-constrained
+        integrated GPUs that is often the difference between "no cache blocks"
+        and a working demo, and a failed vLLM build cannot release its device
+        memory in-process, so retrying here would only make things worse."""
+        from vllm import LLM
+
+        try:
+            return LLM(
+                model=cfg.model,
+                tokenizer=cfg.tokenizer,
+                max_model_len=cfg.max_model_len,
+                gpu_memory_utilization=cfg.gpu_mem_util,
+                trust_remote_code=True,
+                enable_prefix_caching=False,
+                quantization=cfg.quant,
+                dtype=cfg.dtype,
+                enforce_eager=cfg.enforce_eager,
+                **extra,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            out_of_kv = "KV cache" in message or "cache blocks" in message
+            retry_file = os.environ.get("DEMO_RETRY_FILE")
+            if not (out_of_kv and retry_file) or cfg.max_model_len <= 512:
+                raise
+            retry_len = cfg.max_model_len // 2
+            print(f"[demo] KV cache does not fit at "
+                  f"max_model_len={cfg.max_model_len}; "
+                  f"restarting with {retry_len}", flush=True)
+            with open(retry_file, "w") as fh:
+                fh.write(str(retry_len))
+            raise SystemExit(RETRY_EXIT_CODE) from exc
 
     # -- prompt building ---------------------------------------------------
     def build_prompt(self, req: ChatRequest) -> tuple[Any, int]:
