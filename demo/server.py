@@ -45,6 +45,7 @@ import binascii
 import io
 import json
 import os
+import queue
 import threading
 import time
 from pathlib import Path
@@ -249,6 +250,9 @@ class ChatEngine:
         self.cfg = cfg
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        # How long a turn waits for the engine before giving up, so a stuck
+        # generation surfaces as an error rather than an endless spinner.
+        self.busy_timeout = float(os.environ.get("DEMO_BUSY_TIMEOUT", "900"))
 
         extra: dict[str, Any] = {}
         if cfg.text_only:
@@ -336,17 +340,53 @@ class ChatEngine:
 
     # -- generation --------------------------------------------------------
     def stream(self, req: ChatRequest) -> Iterator[str]:
+        """Stream one turn as SSE.
+
+        The engine loop runs in a worker thread that owns the lock, and the
+        HTTP response only drains a queue. That decoupling matters: if the
+        client disconnects, Starlette may never resume this generator, so
+        holding the lock across the engine loop here would leak it and wedge
+        every later request behind a generation nobody is reading (the UI then
+        sits on "thinking..." forever).
+        """
+        prompt, n_images = self.build_prompt(req)
+        events: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue()
+
+        worker = threading.Thread(
+            target=self._generate_into,
+            args=(req, prompt, n_images, events),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            while True:
+                item = events.get()
+                if item is None:
+                    break
+                yield _sse(item[0], item[1])
+        except GeneratorExit:
+            # Reader went away: ask the worker to stop; it owns the cleanup.
+            self._stop.set()
+            raise
+
+    def _generate_into(self, req: ChatRequest, prompt: Any, n_images: int,
+                       events: "queue.Queue") -> None:
         from vllm import SamplingParams
 
-        prompt, n_images = self.build_prompt(req)
         params = SamplingParams(
             max_tokens=req.max_tokens,
             temperature=req.temperature,
             top_p=req.top_p,
         )
+        acquired = False
+        try:
+            # One GPU, one engine: one turn at a time. Bounded so a wedged
+            # generation surfaces as an error instead of an infinite spinner.
+            acquired = self._lock.acquire(timeout=self.busy_timeout)
+            if not acquired:
+                events.put(("error", {"detail": "engine busy, try again"}))
+                return
 
-        # One GPU, one engine: one turn at a time.
-        with self._lock:
             self._stop.clear()
             req_id = f"chat-{time.time_ns()}"
             self.engine.add_request(req_id, prompt, params)
@@ -358,37 +398,38 @@ class ChatEngine:
             n_prompt = 0
             finish_reason = None
             aborted = False
-            try:
-                while self.engine.has_unfinished_requests():
-                    if self._stop.is_set() and not aborted:
-                        self.engine.abort_request(req_id)
-                        aborted = True
-                    for out in self.engine.step():
-                        if out.request_id != req_id:
-                            continue
-                        completion = out.outputs[0]
-                        text = completion.text
-                        if len(text) > sent:
-                            if t_first is None:
-                                t_first = time.perf_counter()
-                            yield _sse("delta", {"text": text[sent:]})
-                            sent = len(text)
-                        n_out = len(completion.token_ids)
-                        n_prompt = len(getattr(out, "prompt_token_ids", None) or ()) or n_prompt
-                        if out.finished:
-                            finish_reason = completion.finish_reason
-            except GeneratorExit:
-                # Browser navigated away / stopped reading: drop the request.
-                self.engine.abort_request(req_id)
-                raise
+            while self.engine.has_unfinished_requests():
+                if self._stop.is_set() and not aborted:
+                    self.engine.abort_request(req_id)
+                    aborted = True
+                for out in self.engine.step():
+                    if out.request_id != req_id:
+                        continue
+                    completion = out.outputs[0]
+                    text = completion.text
+                    if len(text) > sent:
+                        if t_first is None:
+                            t_first = time.perf_counter()
+                        events.put(("delta", {"text": text[sent:]}))
+                        sent = len(text)
+                    n_out = len(completion.token_ids)
+                    n_prompt = len(getattr(out, "prompt_token_ids", None) or ()) or n_prompt
+                    if out.finished:
+                        finish_reason = completion.finish_reason
             t_end = time.perf_counter()
 
-        yield _sse("stats", _metrics(
-            t_start=t_start, t_first=t_first, t_end=t_end,
-            n_prompt=n_prompt, n_out=n_out, n_images=n_images,
-            finish_reason="aborted" if aborted else finish_reason,
-        ))
-        yield _sse("done", {})
+            events.put(("stats", _metrics(
+                t_start=t_start, t_first=t_first, t_end=t_end,
+                n_prompt=n_prompt, n_out=n_out, n_images=n_images,
+                finish_reason="aborted" if aborted else finish_reason,
+            )))
+            events.put(("done", {}))
+        except Exception as exc:  # noqa: BLE001 - report, never wedge the lock
+            events.put(("error", {"detail": str(exc)}))
+        finally:
+            if acquired:
+                self._lock.release()
+            events.put(None)
 
     def abort(self) -> None:
         self._stop.set()

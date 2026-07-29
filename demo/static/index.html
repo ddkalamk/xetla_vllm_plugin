@@ -137,7 +137,10 @@
       <input id="temp" type="number" min="0" max="2" step="0.05" value="0.7" />
       <label for="topp">Top-p</label>
       <input id="topp" type="number" min="0" max="1" step="0.05" value="0.9" />
-      <div class="check"><input id="thinking" type="checkbox" /><label for="thinking" style="margin:0">Thinking mode</label></div>
+      <div class="check"><input id="thinking" type="checkbox" checked /><label for="thinking" style="margin:0">Thinking mode</label></div>
+      <div class="hint" style="margin-top:6px">This is a reasoning model. Turning thinking off
+        pre-closes the <code>&lt;think&gt;</code> block, which pushes it off-distribution —
+        long answers can degrade into repetition.</div>
     </div>
 
     <div class="section">
@@ -378,6 +381,9 @@ async function send() {
           updateSession(payload);
           $("b-last").innerHTML = payload.decode_tps != null
             ? `last turn <b>${payload.decode_tps} tok/s</b>` : "last turn —";
+        } else if (ev[1] === "error") {
+          if (live.parentElement) live.textContent = "";
+          throw new Error(payload.detail || "generation failed");
         }
       }
     }
