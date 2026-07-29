@@ -1,7 +1,35 @@
-# One time Setup
+# Fresh setup (from scratch)
+
+`utils/setup_fresh.sh` does the whole thing: clones this repo with the `xetla`
+submodule, creates a Python 3.12 venv, clones the vendored vLLM, installs it
+for XPU, and builds the plugin extension.
+
 ```bash
-# Setup vLLM Python uv ENV
-bash utils/setup_vllm_xpu.sh
+# Prerequisites, loaded BEFORE running the script:
+source /swtools/intel-gpu/<ver>/intel_gpu_vars.sh
+source /swtools/intel/<oneapi-ver>/oneapi-vars.sh --force
+# plus: python >= 3.10, git, and uv (preferred) in PATH
+
+./utils/setup_fresh.sh /path/to/empty/build/dir
+```
+
+> **Known blocker.** The script clones `ddkalamk/vllm` branch `xetla_v0.21.0`,
+> which is **not published yet** — `git ls-remote --heads` finds no such
+> branch, so a fresh run fails at that step. Until it is pushed, override the
+> source:
+>
+> ```bash
+> VLLM_REPO=/path/to/local/vllm VLLM_BRANCH=xetla_v0.21.0 \
+>     ./utils/setup_fresh.sh /path/to/dest
+> ```
+>
+> Everything else resolves: the `xetla` submodule commit is published on
+> `egeor/xetla` branch `feature_int2_woq_f16_act_gs128`.
+
+If you only need the Python environment (no from-scratch clone):
+
+```bash
+bash utils/setup_vllm_xpu.sh          # vLLM Python uv env
 ```
 
 # Install oneAPI Deep Learning Essentials
@@ -9,6 +37,55 @@ bash utils/setup_vllm_xpu.sh
 wget https://registrationcenter-download.intel.com/akdlm/IRC_NAS/56f7923a-adb8-43f3-8b02-2b60fcac8cab/intel-deep-learning-essentials-2025.3.3.16_offline.sh
 bash ./intel-deep-learning-essentials-2025.3.3.16_offline.sh -a --silent --eula accept
 ```
+
+> After any `pip install .` of the plugin, re-create the symlink so edits to
+> `xetla_vllm_plugin.py` take effect without reinstalling:
+> ```bash
+> ln -sf "$PWD/xetla_vllm_plugin.py" .venv/lib/python3.12/site-packages/xetla_vllm_plugin.py
+> ```
+
+# Models
+
+| Model | Format | Notes |
+| --- | --- | --- |
+| `Ternary-Bonsai-8B` | GGUF or `prism-ml/Bonsai-8B-unpacked` | text-only |
+| `prism-ml/Ternary-Bonsai-27B-unpacked` | HF safetensors | vision-language, **needs a pre-packed sidecar** (below) |
+
+## Bonsai-27B: pack the int2 sidecar first
+
+The 27B never fits in its dense fp16 form (~54 GB). `scripts/pack_bonsai_hf.py`
+recovers the already-ternary weights losslessly into the packed layout the
+xetla kernels consume; the plugin then allocates the dense tensors on the
+`meta` device so they are never materialised.
+
+```bash
+python scripts/pack_bonsai_hf.py \
+    --model prism-ml/Ternary-Bonsai-27B-unpacked \
+    --out   Ternary-Bonsai-27B.xetla-int2_f16.safetensors
+```
+
+~7.1 GB out of a 51 GB checkpoint (306 modules incl. `lm_head` and
+`embed_tokens`), round-trip error 0. Point the plugin at it:
+
+```bash
+export XETLA_QUANT_METHOD=int2_f16
+export XETLA_PREQUANT_PATH=/path/to/Ternary-Bonsai-27B.xetla-int2_f16.safetensors
+```
+
+On a single B70 this gives 6.85 GiB of weights and ~48 tok/s decode.
+
+# Interactive demo (chat GUI, text + images)
+
+A FastAPI backend plus single-page UI that streams tokens and reports the
+observed decode throughput after every prompt. One command, whose only
+argument is the Slurm partition:
+
+```bash
+cd demo && ./launch_demo.sh zen5
+```
+
+Full instructions — prerequisites, sidecar, remote access, configuration,
+HTTP API and troubleshooting — are in [demo/README.md](demo/README.md).
 
 
 # Running latency benchmark
@@ -136,8 +213,11 @@ tok/s.
 
 ## vLLM patches required for the GGUF + xetla path
 
-To allow `--quantization xetla` against a `.gguf` file we made two minimal
-edits to the vendored `vllm/` copy (branch `xetla_v0.19.0`):
+The vendored `vllm/` copy is on branch **`xetla_v0.21.0`** (vLLM v0.21.0 plus
+`vllm.patch`). The bump to 0.21.0 was required for the 27B: earlier branches
+produced fluent-but-context-blind output on the hybrid GDN + attention path.
+
+Two minimal edits allow `--quantization xetla` against a `.gguf` file:
 
 1. `vllm/engine/arg_utils.py` — when the model path ends in `.gguf`, force
    `load_format=gguf` but **don't** clobber a user-supplied `quantization`.
@@ -147,7 +227,18 @@ edits to the vendored `vllm/` copy (branch `xetla_v0.19.0`):
 
 Both patches are no-ops for non-GGUF / non-xetla models. They're not needed
 if you switch to an HF safetensors checkout (e.g.
-`prism-ml/Ternary-Bonsai-8B-unpacked`).
+`prism-ml/Ternary-Bonsai-8B-unpacked` or the 27B).
+
+## torch.compile cache
+
+All entry points set `VLLM_DISABLE_COMPILE_CACHE=1`. vLLM's AOT compile
+artifacts are not keyed on every engine setting these scripts vary (context
+length, multimodal on/off, eager), and loading a mismatched one either raises
+`'NoneType' object has no attribute 'size'` inside the compiled graph or
+silently produces degenerate output. Recompiling costs ~60 s per start; set
+`VLLM_DISABLE_COMPILE_CACHE=0` (or `DEMO_COMPILE_CACHE=1` for the demo) to opt
+back in.
+
 
 ## Numerical-correctness smoke test
 
