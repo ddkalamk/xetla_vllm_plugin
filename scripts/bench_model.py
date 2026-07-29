@@ -9,6 +9,13 @@ import argparse
 import os
 import time
 
+# vLLM's AOT torch.compile artifacts are not keyed on every engine setting we
+# vary here (context length, multimodal on/off, eager). Reusing a mismatched
+# one either crashes inside the compiled graph ("'NoneType' object has no
+# attribute 'size'") or silently produces degenerate output -- which would
+# quietly corrupt a benchmark. Export VLLM_DISABLE_COMPILE_CACHE=0 to opt in.
+os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+
 
 def parse_args():
     p = argparse.ArgumentParser()

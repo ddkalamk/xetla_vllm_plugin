@@ -18,6 +18,12 @@ import os
 import sys
 import time
 
+# vLLM's AOT torch.compile artifacts are not keyed on every engine setting we
+# vary, and reusing a mismatched one either crashes inside the compiled graph
+# or silently generates degenerate, repeating text -- which would be recorded
+# straight into the demo cast. Export VLLM_DISABLE_COMPILE_CACHE=0 to opt in.
+os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+
 # Quiet vLLM/transformers BEFORE importing them.
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")

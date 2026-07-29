@@ -15,6 +15,12 @@ import os
 import sys
 import time
 
+# Must be set before vllm is imported. vLLM's AOT torch.compile artifacts are
+# not keyed on every engine setting we vary, and reusing a mismatched one
+# either crashes inside the compiled graph or silently generates degenerate,
+# repeating text. Export VLLM_DISABLE_COMPILE_CACHE=0 to opt in.
+os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+
 from vllm import LLM, SamplingParams
 
 DEFAULT_MODEL = os.environ.get(
