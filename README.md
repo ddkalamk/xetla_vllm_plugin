@@ -13,18 +13,11 @@ source /swtools/intel/<oneapi-ver>/oneapi-vars.sh --force
 ./utils/setup_fresh.sh /path/to/empty/build/dir
 ```
 
-> **Known blocker.** The script clones `ddkalamk/vllm` branch `xetla_v0.21.0`,
-> which is **not published yet** — `git ls-remote --heads` finds no such
-> branch, so a fresh run fails at that step. Until it is pushed, override the
-> source:
->
-> ```bash
-> VLLM_REPO=/path/to/local/vllm VLLM_BRANCH=xetla_v0.21.0 \
->     ./utils/setup_fresh.sh /path/to/dest
-> ```
->
-> Everything else resolves: the `xetla` submodule commit is published on
-> `egeor/xetla` branch `feature_int2_woq_f16_act_gs128`.
+> **The vendored vLLM.** The script clones upstream `vllm-project/vllm` at tag
+> `v0.21.0` and applies `vllm.patch` on top. That is exactly the
+> `xetla_v0.21.0` branch (v0.21.0 plus 15 changed lines across two files), so
+> no access to a private fork is needed. Override the source with `VLLM_REPO` /
+> `VLLM_BRANCH` if you have a prepared checkout.
 
 If you only need the Python environment (no from-scratch clone):
 
