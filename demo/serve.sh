@@ -39,6 +39,17 @@ export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 export VLLM_ENABLE_V1_MULTIPROCESSING="${VLLM_ENABLE_V1_MULTIPROCESSING:-0}"
 export XETLA_QUANT_METHOD="${XETLA_QUANT_METHOD:-int2_f16}"
 
+# vLLM's AOT torch.compile cache is not keyed on every engine setting this demo
+# varies (context length, multimodal on/off, eager). Loading a mismatched
+# artifact either raises "'NoneType' object has no attribute 'size'" inside the
+# compiled graph or silently produces degenerate, repeating output - so pay the
+# ~60 s recompile instead. Set DEMO_COMPILE_CACHE=1 to opt back in.
+if [[ "${DEMO_COMPILE_CACHE:-0}" == "1" ]]; then
+    echo "[serve.sh] torch.compile cache ENABLED (DEMO_COMPILE_CACHE=1)"
+else
+    export VLLM_DISABLE_COMPILE_CACHE=1
+fi
+
 BONSAI_27B_DEFAULT=/data/nfs_home/egeorgan/.cache/huggingface/hub/models--prism-ml--Ternary-Bonsai-27B-unpacked/snapshots/427bc01949f6122fda741199506b0d00f1fc9122
 export DEMO_MODEL="${DEMO_MODEL:-${BONSAI_27B:-${BONSAI_27B_DEFAULT}}}"
 

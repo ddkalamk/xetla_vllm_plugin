@@ -28,6 +28,14 @@ model the plugin supports:
 
 The xetla plugin itself is configured as usual via XETLA_QUANT_METHOD /
 XETLA_PREQUANT_PATH; see demo/serve.sh.
+
+NOTE: serve.sh sets VLLM_DISABLE_COMPILE_CACHE=1 by default. vLLM's AOT
+torch.compile artifacts are keyed in a way that does not capture every engine
+setting this demo varies (context length, multimodal on/off, eager), and
+reusing a mismatched artifact does not fail loudly: it either raises
+"'NoneType' object has no attribute 'size'" inside the compiled graph or,
+worse, silently generates degenerate repeating text. Recompiling costs ~60 s
+per start; set DEMO_COMPILE_CACHE=1 to opt back in.
 """
 
 from __future__ import annotations

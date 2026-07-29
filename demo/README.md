@@ -263,8 +263,8 @@ Examples:
 DEMO_MODEL=prism-ml/Bonsai-8B-unpacked \
 XETLA_PREQUANT_PATH=~/FRESH/Bonsai-8B.xetla-int2_f16.safetensors ./serve.sh
 
-# text-only, longer context
-DEMO_TEXT_ONLY=1 DEMO_MAX_MODEL_LEN=32768 ./serve.sh
+# text-only (frees the ~0.9 GiB vision tower)
+DEMO_TEXT_ONLY=1 ./serve.sh
 
 # dense fp16 baseline for comparison
 DEMO_QUANT=none ./serve.sh

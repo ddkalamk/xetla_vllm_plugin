@@ -109,21 +109,31 @@ server_alive() {
 # A backend that is still loading the model does not answer /health yet, so
 # also look for the process itself: starting a second engine on the same GPU
 # makes both fight for memory and one of them dies.
+# The bracket in '[u]vicorn' keeps the pattern from matching the command line
+# of the wrapper shell that runs the pgrep (which would always report a hit).
 backend_starting() {
     [[ -n "${JOB_ID:-}" ]] || return 1
     srun --jobid="${JOB_ID}" --overlap bash -lc \
-        "pgrep -f 'uvicorn server:app' >/dev/null" >/dev/null 2>&1
+        "pgrep -f '[u]vicorn server:app' >/dev/null" >/dev/null 2>&1
 }
 
 wait_for_ready() {
+    # $1: 1 if we launched this backend (so SERVER_LOG describes it and its
+    # failure marker is meaningful), 0 if we are attaching to someone else's.
+    local own_log="${1:-0}"
     local deadline=$(( SECONDS + READY_TIMEOUT ))
     until server_alive; do
-        # Only trust the log's failure marker once the process is really gone;
-        # the log can hold a traceback from an earlier, unrelated attempt.
-        if grep -aq "Application startup failed" "${SERVER_LOG}" 2>/dev/null \
+        # Only trust the log's failure marker for a backend we started, and
+        # only once the process is really gone: the log can otherwise hold a
+        # traceback from an earlier, unrelated attempt.
+        if [[ "${own_log}" == "1" ]] \
+           && grep -aq "Application startup failed" "${SERVER_LOG}" 2>/dev/null \
            && ! backend_starting; then
             tail -25 "${SERVER_LOG}" >&2
             die "backend failed to start (see ${SERVER_LOG})"
+        fi
+        if [[ "${own_log}" != "1" ]] && ! backend_starting; then
+            die "the backend we were waiting for is gone; rerun to start a new one"
         fi
         (( SECONDS < deadline )) || die "backend not ready after ${READY_TIMEOUT}s (see ${SERVER_LOG})"
         sleep 5
@@ -138,8 +148,9 @@ stop_all() {
     fi
     if [[ -n "${JOB_ID:-}" && -n "$(job_state "${JOB_ID}")" ]]; then
         # Kill the server step but keep the allocation unless we created it.
+        # '[u]vicorn' so pkill does not match (and kill) this wrapper shell.
         srun --jobid="${JOB_ID}" --overlap bash -lc \
-            "pkill -f 'uvicorn server:app' || true" >/dev/null 2>&1 || true
+            "pkill -f '[u]vicorn server:app' || true" >/dev/null 2>&1 || true
         msg "backend stopped on ${NODE:-?} (job ${JOB_ID})"
         if [[ "${OWNED_ALLOCATION:-0}" == "1" ]]; then
             scancel "${JOB_ID}" 2>/dev/null || true
@@ -220,7 +231,7 @@ if server_alive; then
 elif backend_starting; then
     msg "a backend is already starting on ${NODE}, waiting for it "
     msg "(use --stop first if you want a fresh one)"
-    wait_for_ready
+    wait_for_ready 0
     msg "backend ready"
 else
     : > "${SERVER_LOG}"
@@ -231,7 +242,7 @@ else
     disown
 
     msg "waiting for the engine (first start compiles the model, ~2 min) ..."
-    wait_for_ready
+    wait_for_ready 1
     msg "backend ready"
 fi
 
