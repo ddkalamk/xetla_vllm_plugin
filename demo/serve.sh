@@ -50,22 +50,63 @@ else
     export VLLM_DISABLE_COMPILE_CACHE=1
 fi
 
-BONSAI_27B_DEFAULT=/data/nfs_home/egeorgan/.cache/huggingface/hub/models--prism-ml--Ternary-Bonsai-27B-unpacked/snapshots/427bc01949f6122fda741199506b0d00f1fc9122
-export DEMO_MODEL="${DEMO_MODEL:-${BONSAI_27B:-${BONSAI_27B_DEFAULT}}}"
+# Model resolution, in order of preference:
+#   1. DEMO_MODEL / BONSAI_27B, if set
+#   2. a bundle produced by scripts/make_bundle.py next to the repo
+#   3. a plain HF checkout next to the repo
+#   4. the HF repo id (resolved through the local cache or downloaded)
+# Never hardcode a machine-specific absolute path: on another host it silently
+# becomes a bogus "repo id" and transformers fails with a confusing
+# HFValidationError instead of "model not found".
+if [[ -z "${DEMO_MODEL:-}" && -z "${BONSAI_27B:-}" ]]; then
+    for candidate in \
+        "${ROOT_DIR}/../bonsai27b-int2-bundle/model" \
+        "${ROOT_DIR}/bonsai27b-int2-bundle/model" \
+        "${ROOT_DIR}/../Ternary-Bonsai-27B-unpacked"
+    do
+        if [[ -d "${candidate}" ]]; then
+            DEMO_MODEL="${candidate}"
+            break
+        fi
+    done
+fi
+export DEMO_MODEL="${DEMO_MODEL:-${BONSAI_27B:-prism-ml/Ternary-Bonsai-27B-unpacked}}"
+
+# If it looks like a path, it must exist: fail here with a clear message rather
+# than letting transformers treat a missing directory as a Hugging Face repo id.
+case "${DEMO_MODEL}" in
+    /*|./*|../*)
+        if [[ ! -d "${DEMO_MODEL}" ]]; then
+            echo "[serve.sh] ERROR: DEMO_MODEL is not a directory on this host:" >&2
+            echo "[serve.sh]   ${DEMO_MODEL}" >&2
+            echo "[serve.sh] Set DEMO_MODEL to a local checkout or bundle, e.g." >&2
+            echo "[serve.sh]   DEMO_MODEL=/path/to/bonsai27b-int2-bundle/model ./serve.sh" >&2
+            echo "[serve.sh] or use the repo id: DEMO_MODEL=prism-ml/Ternary-Bonsai-27B-unpacked" >&2
+            exit 2
+        fi
+        ;;
+esac
 
 # Pre-quantized sidecar: <model>.xetla-<method>.safetensors next to the model
 # directory, or the well-known 27B one.
 if [[ -z "${XETLA_PREQUANT_PATH:-}" ]]; then
     for candidate in \
         "${DEMO_MODEL}.xetla-${XETLA_QUANT_METHOD}.safetensors" \
-        "${ROOT_DIR}/../Ternary-Bonsai-27B.xetla-${XETLA_QUANT_METHOD}.safetensors"
+        "${DEMO_MODEL}/../model.xetla-${XETLA_QUANT_METHOD}.safetensors" \
+        "${ROOT_DIR}/../Ternary-Bonsai-27B.xetla-${XETLA_QUANT_METHOD}.safetensors" \
+        "${ROOT_DIR}/Ternary-Bonsai-27B.xetla-${XETLA_QUANT_METHOD}.safetensors"
     do
         if [[ -f "${candidate}" ]]; then
-            export XETLA_PREQUANT_PATH="${candidate}"
+            export XETLA_PREQUANT_PATH="$(cd "$(dirname "${candidate}")" && pwd)/$(basename "${candidate}")"
             echo "[serve.sh] xetla sidecar: ${XETLA_PREQUANT_PATH}"
             break
         fi
     done
+fi
+if [[ -z "${XETLA_PREQUANT_PATH:-}" ]]; then
+    echo "[serve.sh] WARNING: no int2 sidecar found; the 27B will try to load" >&2
+    echo "[serve.sh]          dense (~54 GB) and will not fit. See" >&2
+    echo "[serve.sh]          scripts/pack_bonsai_hf.py / scripts/make_bundle.py" >&2
 fi
 
 echo "[serve.sh] model   : ${DEMO_MODEL}"
