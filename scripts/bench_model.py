@@ -28,6 +28,8 @@ def parse_args():
     p.add_argument("--max-tokens", type=int, default=200)
     p.add_argument("--enforce-eager", action="store_true")
     p.add_argument("--text-only", action="store_true")
+    p.add_argument("--cudagraph-sizes", default=None,
+                   help="comma-separated batch sizes to capture graphs for")
     p.add_argument("--prompt", default="Tell me what is photosynthesis")
     return p.parse_args()
 
@@ -41,6 +43,9 @@ def main():
     extra = {}
     if a.text_only:
         extra["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+    if a.cudagraph_sizes:
+        sizes = [int(s) for s in a.cudagraph_sizes.split(",")]
+        extra["compilation_config"] = {"cudagraph_capture_sizes": sizes}
 
     t0 = time.perf_counter()
     llm = LLM(model=a.model, tokenizer=a.tokenizer or a.model,

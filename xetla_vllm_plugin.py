@@ -32,6 +32,18 @@ quantize_lm_heads = int(os.environ.get("XETLA_QUANTIZE_LM_HEADS", "1")) > 0
 # degrade deep ones; set XETLA_DISABLE_DPAS=1 to keep prefill on the accurate
 # upcvt kernel.
 disable_dpas = int(os.environ.get("XETLA_DISABLE_DPAS", "0")) > 0
+# MoE: largest tokens*top_k the batched expert GEMV handles before falling back
+# to gathering rows per expert. The batched path re-reads an expert's weights
+# once per assignment, so it wins only while that stays under the expert count.
+moe_expand_max = int(os.environ.get("XETLA_MOE_EXPAND_MAX", "128"))
+
+
+def _stream_capturing() -> bool:
+    """True while an XPU graph is being captured, when the runtime reports it."""
+    try:
+        return torch.xpu.is_current_stream_capturing()
+    except Exception:
+        return False
 
 
 # ---- Pre-quantized sidecar (Option B) ---------------------------------------
@@ -876,27 +888,44 @@ class XetlaFusedMoEMethod(_fused_moe_method_base()):
 
         orig_shape = x.shape
         x = x.reshape(-1, orig_shape[-1])
-        out = torch.zeros_like(x)
         gemm = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
         w13_q, w13_s = packed["w13_q"], packed["w13_s"]
         w2_q, w2_s = packed["w2_q"], packed["w2_s"]
+        tokens, top_k = x.shape[0], topk_ids.shape[1]
 
-        # Decode: one token, top_k experts. The batched kernel takes the expert
-        # ids on device, so the whole layer is two GEMV launches and no host
-        # sync at all - the per-expert loop was launch-bound at ~145 GiB/s.
-        if x.shape[0] == 1 and x.dtype == torch.float16:
+        # The batched kernel takes the expert ids on device, so this whole path
+        # is two GEMV launches with no host sync - which is both why decode is
+        # fast (the per-expert loop was launch-bound at ~145 GiB/s) and why it
+        # can be captured into an XPU graph.
+        if x.dtype == torch.float16 and tokens * top_k <= moe_expand_max:
             moe_gemv = torch.ops.xetla_int2.int2_fp16_moe_gemv_run
-            sel = topk_ids[0].to(torch.int32).contiguous()
-            h = moe_gemv(x.contiguous(), w13_q, w13_s, sel)
+            sel = topk_ids.reshape(-1).to(torch.int32).contiguous()
+            # One row per (token, expert) pair, except for decode where the
+            # kernel broadcasts the single row across experts instead.
+            a = x.contiguous() if tokens == 1 \
+                else x.repeat_interleave(top_k, dim=0).contiguous()
+            h = moe_gemv(a, w13_q, w13_s, sel)
             inter = h.shape[1] // 2
             act = torch.nn.functional.silu(h[:, :inter]) * h[:, inter:]
             y = moe_gemv(act.contiguous(), w2_q, w2_s, sel)
-            w_row = topk_weights[0].to(y.dtype).unsqueeze(-1)
-            return (y * w_row).sum(0, keepdim=True).reshape(orig_shape)
+            y = y * topk_weights.reshape(-1, 1).to(y.dtype)
+            return y.view(tokens, top_k, -1).sum(1).reshape(orig_shape)
 
-        # Prefill: experts see several rows each, so fall back to the gathered
-        # per-expert GEMMs. One host transfer per layer covers all of them;
-        # doing the bookkeeping on device costs a sync per expert.
+        if _stream_capturing():
+            raise RuntimeError(
+                f"XPU graph capture at batch size {tokens} exceeds the batched "
+                f"MoE path (tokens*top_k {tokens * top_k} > "
+                f"XETLA_MOE_EXPAND_MAX {moe_expand_max}); the gathered path "
+                f"below syncs to host and cannot be captured. Cap capture to "
+                f"{max(1, moe_expand_max // top_k)} tokens, e.g. "
+                f"compilation_config={{'cudagraph_capture_sizes': [1, 2, 4, 8, "
+                f"{max(1, moe_expand_max // top_k)}]}}.")
+
+        # Prefill: too many rows to re-read weights per assignment, so gather
+        # per expert instead. One host transfer per layer covers all of them;
+        # doing the bookkeeping on device costs a sync per expert. This path
+        # cannot be captured into a graph.
+        out = torch.zeros_like(x)
         ids = topk_ids.cpu()
         weights = topk_weights.to(x.dtype)
         buckets: dict[int, list[tuple[int, int]]] = {}
