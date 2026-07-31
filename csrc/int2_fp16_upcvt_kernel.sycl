@@ -267,7 +267,7 @@ sycl::event int2_fp16_upcvt_gemm_run(
   // Dispatch table. We instantiate one compiled kernel per (KS, LS, kUnaligned)
   // triple that we want to use; tile shape is fixed at WGM=1/SGM=1/SGN=16/SGK=128
   // and WGN tracked separately.
-#define DISPATCH(WGN_, KS_, LS_)                                              \
+#define DISPATCH_RAW(WGN_, KS_, LS_)                                          \
   do {                                                                        \
     if (aligned_n)                                                            \
       return upcvt_dispatch<                                                  \
@@ -277,6 +277,18 @@ sycl::event int2_fp16_upcvt_gemm_run(
       return upcvt_dispatch<                                                  \
           /*WGM*/ 1, WGN_, /*SGM*/ 1, /*SGN*/ 16, /*SGK*/ 128, KS_, LS_,      \
           /*kUnaligned*/ true>(q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt);  \
+  } while (0)
+
+// K is split KS ways globally and LS ways locally, each slice consuming whole
+// SGK=128 chunks, so K must divide evenly by KS*LS*128. It silently produced
+// NaNs otherwise (e.g. MoE down_proj with K=768 under the KS=2,LS=4 tier), so
+// step down to a slicing that divides before falling back to no slicing.
+#define K_DIVIDES(KS_, LS_) ((K % ((KS_) * (LS_) * 128)) == 0)
+#define DISPATCH(WGN_, KS_, LS_)                                              \
+  do {                                                                        \
+    if (K_DIVIDES(KS_, LS_))     { DISPATCH_RAW(WGN_, KS_, LS_); }            \
+    else if (K_DIVIDES(1, 2))    { DISPATCH_RAW(WGN_, 1, 2); }                \
+    else                         { DISPATCH_RAW(WGN_, 1, 1); }                \
   } while (0)
 
   if (M == 1) {
@@ -331,6 +343,8 @@ sycl::event int2_fp16_upcvt_gemm_run(
   // M>1 fallback (works correctly; not perf-tuned for prefill).
   DISPATCH(128, 1, 1);
 #undef DISPATCH
+#undef DISPATCH_RAW
+#undef K_DIVIDES
 }
 
 // ---------------------------------------------------------------------------

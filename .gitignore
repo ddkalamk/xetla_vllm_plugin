@@ -26,3 +26,6 @@ scripts/test_xetla_ops.py
 
 # demo/launch_demo.sh runtime state (job id, node, logs)
 demo/.run/
+BitTern/projects/cat-q/configs/*/export/
+BitTern/projects/cat-q/configs/*/parameters.pth
+BitTern/projects/cat-q/configs/*/config_fp16.yaml
