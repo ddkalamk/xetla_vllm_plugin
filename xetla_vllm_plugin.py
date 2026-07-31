@@ -552,6 +552,12 @@ class XetlaConfig(QuantizationConfig):
             return XetlaEmbeddingMethod(self, True, prefix=prefix)
         elif isinstance(layer, VocabParallelEmbedding) and quantize_lm_heads:
             return XetlaEmbeddingMethod(self, False, prefix=prefix)
+        try:
+            from vllm.model_executor.layers.fused_moe import FusedMoE
+            if isinstance(layer, FusedMoE):
+                return XetlaFusedMoEMethod(self, layer.moe_config, prefix=prefix)
+        except ImportError:
+            pass
         # Other layer types (notably `Attention`) are not handled by xetla;
         # vLLM falls back to the default impl when we return None. Only print
         # once per type when XETLA_DEBUG=1 to avoid spamming one line per
@@ -763,6 +769,130 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
                 out = xetla_int1_fp16_upcvt_gemm(x16, layer.weight, layer.scale, b16)
             return out if out.dtype == x.dtype else out.to(x.dtype)
         return super().apply(layer, x, bias)
+
+
+def _fused_moe_method_base():
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+    return FusedMoEMethodBase
+
+
+class XetlaFusedMoEMethod(_fused_moe_method_base()):
+    """int2 x fp16 experts for vLLM's FusedMoE layer.
+
+    vLLM stacks the experts into w13_weight [E, 2I, H] and w2_weight [E, H, I];
+    the sidecar mirrors that with <prefix>.w13 / <prefix>.w2 packed the same way
+    a Linear is, one slice per expert. Only sidecar-backed layers are handled --
+    without packed weights we fall back to the dense implementation, because
+    ternarizing a checkpoint that is not already ternary destroys it.
+    """
+
+    def __init__(self, quant_config, moe, prefix: str = ""):
+        super().__init__(moe)
+        self.quant_config = quant_config
+        self.prefix = prefix
+        self.packed = None
+        self._fallback = None
+
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module):
+        return None
+
+    # -- vLLM plumbing ----------------------------------------------------
+    def _dense(self):
+        if self._fallback is None:
+            from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (  # noqa: E501
+                UnquantizedFusedMoEMethod,
+            )
+            self._fallback = UnquantizedFusedMoEMethod(self.moe)
+        return self._fallback
+
+    def create_weights(self, layer: torch.nn.Module, num_experts: int,
+                       hidden_size: int, intermediate_size_per_partition: int,
+                       params_dtype: torch.dtype, **extra_weight_attrs):
+        method = self.quant_config.method
+        w13 = _xetla_prequant_lookup(f"{self.prefix}.w13", method)
+        w2 = _xetla_prequant_lookup(f"{self.prefix}.w2", method)
+        if method != "int2_f16" or w13 is None or w2 is None:
+            return self._dense().create_weights(
+                layer, num_experts, hidden_size,
+                intermediate_size_per_partition, params_dtype,
+                **extra_weight_attrs)
+
+        from vllm.model_executor.utils import set_weight_attrs
+        weight_loader = extra_weight_attrs.pop("weight_loader")
+        # Meta placeholders keep the dense experts (54 GiB for a 30B MoE) from
+        # ever being allocated; the loader's copies become no-ops.
+        for name, shape in (
+            ("w13_weight", (num_experts, 2 * intermediate_size_per_partition,
+                            hidden_size)),
+            ("w2_weight", (num_experts, hidden_size,
+                           intermediate_size_per_partition)),
+        ):
+            param = torch.nn.Parameter(
+                torch.empty(*shape, dtype=params_dtype, device="meta"),
+                requires_grad=False)
+            layer.register_parameter(name, param)
+            set_weight_attrs(param, {"weight_loader": weight_loader,
+                                     **extra_weight_attrs})
+        layer._xetla_moe_keys = (w13, w2)
+        layer._xetla_meta_placeholder = True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        keys = getattr(layer, "_xetla_moe_keys", None)
+        if keys is None:
+            dense = self._dense()
+            if hasattr(dense, "process_weights_after_loading"):
+                dense.process_weights_after_loading(layer)
+            return
+        from safetensors import safe_open
+
+        dev = torch.device(f"xpu:{torch.xpu.current_device()}") \
+            if hasattr(torch, "xpu") and torch.xpu.is_available() \
+            else torch.device("cpu")
+        packed = {}
+        with safe_open(_xetla_prequant_load_path, framework="pt") as f:
+            for slot, key in zip(("w13", "w2"), keys):
+                packed[f"{slot}_q"] = f.get_tensor(f"{key}.qweight").to(dev)
+                packed[f"{slot}_s"] = f.get_tensor(f"{key}.scale").to(dev)
+        layer.w13_weight = None
+        layer.w2_weight = None
+        self.packed = packed
+        layer._xetla_moe_packed = packed
+        layer.xetla_quantized = True
+        if int(os.environ.get("XETLA_DEBUG", "0")) > 0:
+            print(f"[xetla] moe {self.prefix}: w13{tuple(packed['w13_q'].shape)} "
+                  f"w2{tuple(packed['w2_q'].shape)}", flush=True)
+
+    # -- execution --------------------------------------------------------
+    def apply(self, layer: torch.nn.Module, x: torch.Tensor,
+              topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+              shared_experts_input: Optional[torch.Tensor] = None,
+              **kwargs) -> torch.Tensor:
+        packed = getattr(layer, "_xetla_moe_packed", None)
+        if packed is None:
+            return self._dense().apply(layer, x, topk_weights, topk_ids,
+                                       shared_experts_input, **kwargs)
+
+        orig_shape = x.shape
+        x = x.reshape(-1, orig_shape[-1])
+        out = torch.zeros_like(x)
+        gemm = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
+        w13_q, w13_s = packed["w13_q"], packed["w13_s"]
+        w2_q, w2_s = packed["w2_q"], packed["w2_s"]
+
+        for expert in torch.unique(topk_ids).tolist():
+            rows, slot = (topk_ids == expert).nonzero(as_tuple=True)
+            if rows.numel() == 0:
+                continue
+            xe = x.index_select(0, rows).contiguous()
+            h = gemm(xe, w13_q[expert], w13_s[expert], None)
+            gate, up = h.chunk(2, dim=-1)
+            act = torch.nn.functional.silu(gate) * up
+            y = gemm(act.contiguous(), w2_q[expert], w2_s[expert], None)
+            out.index_add_(0, rows,
+                           (y * topk_weights[rows, slot].unsqueeze(-1)).to(out.dtype))
+        return out.reshape(orig_shape)
 
 
 class XetlaLinearMethod(LinearMethodBase):
