@@ -39,6 +39,14 @@ export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 export VLLM_ENABLE_V1_MULTIPROCESSING="${VLLM_ENABLE_V1_MULTIPROCESSING:-0}"
 export XETLA_QUANT_METHOD="${XETLA_QUANT_METHOD:-int2_f16}"
 
+# XPU graphs are worth ~2.6x decode (62 -> 159 tok/s on the CAT-Q MoE model),
+# but so far that is the only model they have been measured on, and capture is
+# fragile: it aborts on any host sync or large allocation in the captured
+# region. Opt in with VLLM_XPU_ENABLE_XPU_GRAPH=1 once you have checked the
+# model you care about. Capture sizes are capped in server.py
+# (DEMO_CUDAGRAPH_SIZES) to stay inside the plugin's batched MoE path.
+export VLLM_XPU_ENABLE_XPU_GRAPH="${VLLM_XPU_ENABLE_XPU_GRAPH:-0}"
+
 # vLLM's AOT torch.compile cache is not keyed on every engine setting this demo
 # varies (context length, multimodal on/off, eager). Loading a mismatched
 # artifact either raises "'NoneType' object has no attribute 'size'" inside the

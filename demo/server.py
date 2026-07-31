@@ -24,6 +24,7 @@ model the plugin supports:
   DEMO_MAX_IMAGE_SIDE   downscale longest side to        (1024)
   DEMO_TEXT_ONLY        1 disables image inputs          (0)
   DEMO_ENFORCE_EAGER    1 disables torch.compile         (0)
+  DEMO_CUDAGRAPH_SIZES  batch sizes to capture graphs    (1,2,4,8,16)
   DEMO_WARMUP           1 pays the first-token JIT cost  (1)
 
 The xetla plugin itself is configured as usual via XETLA_QUANT_METHOD /
@@ -89,6 +90,11 @@ class Config:
         self.max_image_side = int(os.environ.get("DEMO_MAX_IMAGE_SIDE", "1024"))
         self.enforce_eager = _env_bool("DEMO_ENFORCE_EAGER", False)
         self.warmup = _env_bool("DEMO_WARMUP", True)
+        # Capture sizes must stay under the plugin's batched MoE path
+        # (XETLA_MOE_EXPAND_MAX / top_k); above it the gathered path syncs to
+        # host and aborts the capture.
+        self.cudagraph_sizes = os.environ.get("DEMO_CUDAGRAPH_SIZES",
+                                              "1,2,4,8,16")
 
 
 CFG = Config()
@@ -259,6 +265,14 @@ class ChatEngine:
             extra["limit_mm_per_prompt"] = {"image": 0, "video": 0}
         else:
             extra["limit_mm_per_prompt"] = {"image": cfg.max_images, "video": 0}
+
+        # XPU graphs were worth 2.6x decode on the CAT-Q MoE model (62 -> 159
+        # tok/s): almost everything here is small enough to be launch-bound.
+        if (os.environ.get("VLLM_XPU_ENABLE_XPU_GRAPH") == "1"
+                and not cfg.enforce_eager and cfg.cudagraph_sizes):
+            sizes = [int(s) for s in cfg.cudagraph_sizes.split(",") if s.strip()]
+            extra["compilation_config"] = {"cudagraph_capture_sizes": sizes}
+            print(f"[demo] xpu graphs on, capture sizes {sizes}", flush=True)
 
         t0 = time.perf_counter()
         self.llm = self._build_llm(cfg, extra)

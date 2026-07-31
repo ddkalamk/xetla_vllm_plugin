@@ -145,7 +145,10 @@
 
     <div class="section">
       <h2>System prompt</h2>
-      <textarea id="system">You are a helpful assistant.</textarea>
+      <!-- Empty by default: a system turn makes the ternary models echo the
+           user's question back instead of answering. Folding the same
+           instruction into the user turn is fine. -->
+      <textarea id="system" placeholder="(none) — a system turn can destabilise these models"></textarea>
       <button class="secondary" id="reset" style="width:100%;margin-top:10px">Clear conversation</button>
     </div>
 
