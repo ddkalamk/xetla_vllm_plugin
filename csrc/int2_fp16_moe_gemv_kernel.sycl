@@ -1,0 +1,192 @@
+/*******************************************************************************
+ * Batched int2 GEMV over selected MoE experts.
+ *
+ *   C[g, n] = sum_k A[g, k] * codeval(B[ids[g], k, n]) * S[ids[g], k/128, n]
+ *
+ *   A    : fp16 [G, K], or [1, K] broadcast to every g (broadcast_a)
+ *   B    : int2x16 [E, K/16, N] int32, 16 K-rows of one N column per word
+ *   S    : fp16 [E, K/128, N]
+ *   ids  : int32 [G], indices into E
+ *   C    : fp16 [G, N]
+ *
+ * int2 codes are {0, 1, 3}: 0 -> 0, 1 -> +1, 3 -> -1 (code 2 unused).
+ *
+ * Decode routes one token to top_k experts, so the per-expert GEMVs are far too
+ * small to fill the machine - a single (K=2048, N=1536) expert GEMV runs at
+ * 145 GiB/s against the ~400 GiB/s the same kernel reaches on large shapes, and
+ * eight of them back to back cost 8x a launch. Folding the expert index into
+ * the grid turns those eight launches into one and recovers the bandwidth.
+ *
+ * Lanes are laid out along N so that the int32 weight loads of a subgroup are
+ * contiguous; K is split LS ways within the work-group and reduced through SLM.
+ *******************************************************************************/
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include "timing_utils.h"
+
+namespace {
+
+static constexpr int kMoEScaleGS = 128;
+static constexpr int kBlocksPerGroup = kMoEScaleGS / 16;
+
+template <int COLS, int LS>
+class int2_fp16_moe_gemv_tag;
+
+template <int COLS, int LS>
+sycl::event moe_gemv_impl(
+    sycl::queue& q, int G, int N, int K, const sycl::half* A, long a_stride,
+    const int32_t* B, const sycl::half* S, const int32_t* ids, sycl::half* C) {
+  const int ntiles = N / COLS;
+  const int kblocks = K / 16;
+  const int ngroups = K / kMoEScaleGS;
+  const int groups_per_slice = ngroups / LS;
+  const size_t b_stride = static_cast<size_t>(kblocks) * N;
+  const size_t s_stride = static_cast<size_t>(ngroups) * N;
+
+  sycl::range<2> global(static_cast<size_t>(G) * ntiles * LS, COLS);
+  sycl::range<2> local(LS, COLS);
+
+  return q.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> slm(sycl::range<1>(LS * COLS), cgh);
+    cgh.parallel_for<int2_fp16_moe_gemv_tag<COLS, LS>>(
+        sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> it) {
+          const int wg = static_cast<int>(it.get_group(0));
+          const int tile = wg % ntiles;
+          const int g = wg / ntiles;
+          const int s = static_cast<int>(it.get_local_id(0));
+          const int c = static_cast<int>(it.get_local_id(1));
+          const int n = tile * COLS + c;
+          const int eid = ids[g];
+
+          const int32_t* Bp = B + static_cast<size_t>(eid) * b_stride + n;
+          const sycl::half* Sp = S + static_cast<size_t>(eid) * s_stride + n;
+          const sycl::half* Ap = A + static_cast<size_t>(g) * a_stride;
+
+          float acc = 0.f;
+          const int gi_end = (s + 1) * groups_per_slice;
+          for (int gi = s * groups_per_slice; gi < gi_end; ++gi) {
+            float gsum = 0.f;
+#pragma unroll
+            for (int b = 0; b < kBlocksPerGroup; ++b) {
+              const int kb = gi * kBlocksPerGroup + b;
+              const uint32_t w =
+                  static_cast<uint32_t>(Bp[static_cast<size_t>(kb) * N]);
+              const sycl::half* a = Ap + kb * 16;
+#pragma unroll
+              for (int j = 0; j < 16; ++j) {
+                const uint32_t code = (w >> (2 * j)) & 3u;
+                const float av = static_cast<float>(a[j]);
+                gsum += (code & 1u) ? ((code & 2u) ? -av : av) : 0.f;
+              }
+            }
+            acc += gsum * static_cast<float>(Sp[static_cast<size_t>(gi) * N]);
+          }
+
+          if (LS == 1) {
+            C[static_cast<size_t>(g) * N + n] = static_cast<sycl::half>(acc);
+            return;
+          }
+          slm[s * COLS + c] = acc;
+          it.barrier(sycl::access::fence_space::local_space);
+          if (s == 0) {
+            float t = 0.f;
+#pragma unroll
+            for (int i = 0; i < LS; ++i)
+              t += slm[i * COLS + c];
+            C[static_cast<size_t>(g) * N + n] = static_cast<sycl::half>(t);
+          }
+        });
+  });
+}
+
+template <int COLS>
+sycl::event moe_gemv_pick_ls(
+    sycl::queue& q, int ls, int G, int N, int K, const sycl::half* A,
+    long a_stride, const int32_t* B, const sycl::half* S, const int32_t* ids,
+    sycl::half* C) {
+#define MOE_LS(LS_)                                                      \
+  case LS_:                                                              \
+    return moe_gemv_impl<COLS, LS_>(q, G, N, K, A, a_stride, B, S, ids, C)
+  switch (ls) {
+    MOE_LS(8);
+    MOE_LS(4);
+    MOE_LS(2);
+    default:
+      MOE_LS(1);
+  }
+#undef MOE_LS
+}
+
+}  // namespace
+
+torch::Tensor int2_fp16_moe_gemv_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor S, torch::Tensor ids) {
+  RECORD_FUNCTION("int2_fp16_moe_gemv", {});
+  Timer t_("int2_fp16_moe_gemv");
+  TORCH_CHECK(A.dtype() == torch::kHalf, "A must be fp16");
+  TORCH_CHECK(B.dtype() == torch::kInt32, "B must be int32 (int2x16)");
+  TORCH_CHECK(S.dtype() == torch::kHalf, "S must be fp16");
+  TORCH_CHECK(ids.dtype() == torch::kInt, "ids must be int32");
+  TORCH_CHECK(
+      A.is_contiguous() && B.is_contiguous() && S.is_contiguous() &&
+          ids.is_contiguous(),
+      "all inputs must be contiguous");
+  TORCH_CHECK(A.device().is_xpu(), "A must be on XPU");
+  TORCH_CHECK(A.dim() == 2 && B.dim() == 3 && S.dim() == 3 && ids.dim() == 1,
+              "expected A[G,K], B[E,K/16,N], S[E,K/128,N], ids[G]");
+
+  const long G = ids.size(0);
+  const long K = A.size(1);
+  const long N = B.size(2);
+  TORCH_CHECK(A.size(0) == G || A.size(0) == 1, "A rows must be G or 1");
+  TORCH_CHECK(K % kMoEScaleGS == 0, "K must be a multiple of 128");
+  TORCH_CHECK(B.size(1) == K / 16, "B.size(1) must be K/16");
+  TORCH_CHECK(S.size(1) == K / kMoEScaleGS, "S.size(1) must be K/128");
+  TORCH_CHECK(S.size(2) == N, "S.size(2) must be N");
+  TORCH_CHECK(B.size(0) == S.size(0), "B and S must stack the same experts");
+
+  auto C = A.new_empty({G, N}, torch::kHalf);
+
+  int cols = 16;
+  for (int cand : {64, 32}) {
+    if (N % cand == 0) {
+      cols = cand;
+      break;
+    }
+  }
+  TORCH_CHECK(N % cols == 0, "N must be a multiple of 16");
+
+  const int ngroups = static_cast<int>(K / kMoEScaleGS);
+  int ls = 1;
+  for (int cand : {8, 4, 2}) {
+    if (ngroups % cand == 0) {
+      ls = cand;
+      break;
+    }
+  }
+
+  auto q = c10::xpu::getCurrentXPUStream(A.device().index()).queue();
+  const auto* a_ptr = reinterpret_cast<const sycl::half*>(A.data_ptr<at::Half>());
+  const auto* s_ptr = reinterpret_cast<const sycl::half*>(S.data_ptr<at::Half>());
+  auto* c_ptr = reinterpret_cast<sycl::half*>(C.data_ptr<at::Half>());
+  const long a_stride = (A.size(0) == 1) ? 0 : K;
+
+  if (cols == 64)
+    moe_gemv_pick_ls<64>(q, ls, G, N, K, a_ptr, a_stride, B.data_ptr<int32_t>(),
+                         s_ptr, ids.data_ptr<int32_t>(), c_ptr);
+  else if (cols == 32)
+    moe_gemv_pick_ls<32>(q, ls, G, N, K, a_ptr, a_stride, B.data_ptr<int32_t>(),
+                         s_ptr, ids.data_ptr<int32_t>(), c_ptr);
+  else
+    moe_gemv_pick_ls<16>(q, ls, G, N, K, a_ptr, a_stride, B.data_ptr<int32_t>(),
+                         s_ptr, ids.data_ptr<int32_t>(), c_ptr);
+  return C;
+}
+
+// The TORCH_LIBRARY_FRAGMENT registration lives in int2_kernel_wrapper.cpp for
+// the same reason as the other .sycl kernels here: global ctors emitted from a
+// .sycl translation unit are not reliably run at .so load time under oneAPI
+// 2025.3, which would leave the op silently unregistered.

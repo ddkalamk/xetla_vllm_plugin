@@ -881,24 +881,24 @@ class XetlaFusedMoEMethod(_fused_moe_method_base()):
         w13_q, w13_s = packed["w13_q"], packed["w13_s"]
         w2_q, w2_s = packed["w2_q"], packed["w2_s"]
 
-        # One host transfer per layer: doing the routing bookkeeping on device
-        # costs a sync per expert (~9 per layer, 48 layers per token).
+        # Decode: one token, top_k experts. The batched kernel takes the expert
+        # ids on device, so the whole layer is two GEMV launches and no host
+        # sync at all - the per-expert loop was launch-bound at ~145 GiB/s.
+        if x.shape[0] == 1 and x.dtype == torch.float16:
+            moe_gemv = torch.ops.xetla_int2.int2_fp16_moe_gemv_run
+            sel = topk_ids[0].to(torch.int32).contiguous()
+            h = moe_gemv(x.contiguous(), w13_q, w13_s, sel)
+            inter = h.shape[1] // 2
+            act = torch.nn.functional.silu(h[:, :inter]) * h[:, inter:]
+            y = moe_gemv(act.contiguous(), w2_q, w2_s, sel)
+            w_row = topk_weights[0].to(y.dtype).unsqueeze(-1)
+            return (y * w_row).sum(0, keepdim=True).reshape(orig_shape)
+
+        # Prefill: experts see several rows each, so fall back to the gathered
+        # per-expert GEMMs. One host transfer per layer covers all of them;
+        # doing the bookkeeping on device costs a sync per expert.
         ids = topk_ids.cpu()
         weights = topk_weights.to(x.dtype)
-
-        # Decode: a single token picks top_k experts, so skip the gather and
-        # scatter entirely and accumulate in place.
-        if x.shape[0] == 1:
-            acc = torch.zeros_like(x)
-            w_row = weights[0]
-            for slot, expert in enumerate(ids[0].tolist()):
-                h = gemm(x, w13_q[expert], w13_s[expert], None)
-                gate, up = h.chunk(2, dim=-1)
-                act = torch.nn.functional.silu(gate) * up
-                y = gemm(act.contiguous(), w2_q[expert], w2_s[expert], None)
-                acc += y * w_row[slot]
-            return acc.reshape(orig_shape)
-
         buckets: dict[int, list[tuple[int, int]]] = {}
         for row, experts in enumerate(ids.tolist()):
             for slot, expert in enumerate(experts):
