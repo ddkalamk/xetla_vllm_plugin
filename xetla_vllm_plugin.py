@@ -881,17 +881,38 @@ class XetlaFusedMoEMethod(_fused_moe_method_base()):
         w13_q, w13_s = packed["w13_q"], packed["w13_s"]
         w2_q, w2_s = packed["w2_q"], packed["w2_s"]
 
-        for expert in torch.unique(topk_ids).tolist():
-            rows, slot = (topk_ids == expert).nonzero(as_tuple=True)
-            if rows.numel() == 0:
-                continue
+        # One host transfer per layer: doing the routing bookkeeping on device
+        # costs a sync per expert (~9 per layer, 48 layers per token).
+        ids = topk_ids.cpu()
+        weights = topk_weights.to(x.dtype)
+
+        # Decode: a single token picks top_k experts, so skip the gather and
+        # scatter entirely and accumulate in place.
+        if x.shape[0] == 1:
+            acc = torch.zeros_like(x)
+            w_row = weights[0]
+            for slot, expert in enumerate(ids[0].tolist()):
+                h = gemm(x, w13_q[expert], w13_s[expert], None)
+                gate, up = h.chunk(2, dim=-1)
+                act = torch.nn.functional.silu(gate) * up
+                y = gemm(act.contiguous(), w2_q[expert], w2_s[expert], None)
+                acc += y * w_row[slot]
+            return acc.reshape(orig_shape)
+
+        buckets: dict[int, list[tuple[int, int]]] = {}
+        for row, experts in enumerate(ids.tolist()):
+            for slot, expert in enumerate(experts):
+                buckets.setdefault(expert, []).append((row, slot))
+
+        for expert, entries in buckets.items():
+            rows = torch.tensor([r for r, _ in entries], device=x.device)
+            slots = torch.tensor([s for _, s in entries], device=x.device)
             xe = x.index_select(0, rows).contiguous()
             h = gemm(xe, w13_q[expert], w13_s[expert], None)
             gate, up = h.chunk(2, dim=-1)
             act = torch.nn.functional.silu(gate) * up
             y = gemm(act.contiguous(), w2_q[expert], w2_s[expert], None)
-            out.index_add_(0, rows,
-                           (y * topk_weights[rows, slot].unsqueeze(-1)).to(out.dtype))
+            out.index_add_(0, rows, y * weights[rows, slots].unsqueeze(-1))
         return out.reshape(orig_shape)
 
 
