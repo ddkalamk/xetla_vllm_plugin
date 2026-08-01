@@ -28,10 +28,12 @@ except:
 timing_enabled = int(os.environ.get("XETLA_TIMINGS", "0")) > 0
 quantize_lm_heads = int(os.environ.get("XETLA_QUANTIZE_LM_HEADS", "1")) > 0
 # The int2 x fp16 DPAS prefill kernel converts activations to int8 (XMX), which
-# costs ~1-3% relative error per GEMM. That is fine for shallow models but can
-# degrade deep ones; set XETLA_DISABLE_DPAS=1 to keep prefill on the accurate
-# upcvt kernel.
-disable_dpas = int(os.environ.get("XETLA_DISABLE_DPAS", "0")) > 0
+# costs ~1.3% relative error per GEMM. That compounds across layers and is
+# enough to destroy a model outright: the CAT-Q Qwen3 8B and 32B emit a single
+# repeated token with it on and are coherent with it off, while Bonsai happens
+# to survive it. It buys almost nothing anyway (8B TTFT 75 ms with, 80 ms
+# without), so it is off unless XETLA_DISABLE_DPAS=0 asks for it.
+disable_dpas = int(os.environ.get("XETLA_DISABLE_DPAS", "1")) > 0
 # MoE: largest tokens*top_k the batched expert GEMV handles before falling back
 # to gathering rows per expert. The batched path re-reads an expert's weights
 # once per assignment, so it wins only while that stays under the expert count.
@@ -323,7 +325,10 @@ def xetla_int2_fp16_upcvt_gemm(
     """
     m = input.shape[0]
     n = weight.shape[1]
-    use_dpas = (m > 1) and (n % 256 == 0)
+    # The eager path in XetlaLinearMethod.apply gates this on disable_dpas via
+    # _xetla_dpas_capable; this one has to check it too, or XETLA_DISABLE_DPAS
+    # silently does nothing whenever the model is compiled.
+    use_dpas = (not disable_dpas) and (m > 1) and (n % 256 == 0)
     with Timer(input, weight):
         if use_dpas:
             out = torch.ops.xetla_int2.int2_fp16_dpas_gemm_run(
@@ -718,7 +723,7 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
             )
             layer.xetla_quantized = True
             # B7: lm_head N is the (padded) vocab size; check DPAS capability.
-            layer._xetla_dpas_capable = (packed.shape[1] & 255) == 0
+            layer._xetla_dpas_capable = (not disable_dpas) and (packed.shape[1] & 255) == 0
             _xetla_pre_convert_bias(layer)
             _xetla_prequant_dump_record(self.prefix, layer, "int2_f16", "lm_head")
         elif self.quant_config.method == "int1_f16":
@@ -1042,7 +1047,7 @@ class XetlaLinearMethod(LinearMethodBase):
                 scale_f16.to(weight.device).contiguous(), requires_grad=False
             )
             # B7: cache the dispatch predicate (depends only on N).
-            layer._xetla_dpas_capable = (packed.shape[1] & 255) == 0
+            layer._xetla_dpas_capable = (not disable_dpas) and (packed.shape[1] & 255) == 0
             layer.xetla_quantized = True
             _xetla_pre_convert_bias(layer)
             _xetla_prequant_dump_record(self.prefix, layer, method, "linear")
