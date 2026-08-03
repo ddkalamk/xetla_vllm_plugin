@@ -219,9 +219,17 @@ torch::Tensor int1_fp16_upcvt_gemm_run_torch(
 torch::Tensor int2_fp16_moe_gemv_run_torch(
     torch::Tensor A, torch::Tensor B, torch::Tensor S, torch::Tensor ids);
 
+// bf16 twin of the upcvt GEMM, for checkpoints that are natively bf16. Same
+// kernel; the int2 dequant is bit work that does not care which 16-bit float
+// it is producing.
+torch::Tensor int2_bf16_upcvt_gemm_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
+    std::optional<torch::Tensor> C_out);
+
 TORCH_LIBRARY(xetla_int2, m) {
   m.def("int2_bf16_fused_gemm_run", &int2_bf16_fused_gemm_run_torch);
   m.def("int2_fp16_upcvt_gemm_run", &int2_fp16_upcvt_gemm_run_torch);
+  m.def("int2_bf16_upcvt_gemm_run", &int2_bf16_upcvt_gemm_run_torch);
   m.def("int2_fp16_dpas_gemm_run", &int2_fp16_dpas_gemm_run_torch);
   m.def("int1_fp16_upcvt_gemm_run", &int1_fp16_upcvt_gemm_run_torch);
   m.def("int2_fp16_moe_gemv_run", &int2_fp16_moe_gemv_run_torch);
