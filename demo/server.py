@@ -244,12 +244,13 @@ class ChatRequest(BaseModel):
     temperature: float = Field(0.6, ge=0.0, le=2.0)
     top_p: float = Field(0.95, ge=0.0, le=1.0)
     top_k: int = Field(20, ge=-1, le=1000)
-    # Both penalties default to neutral. They are exposed because they are the
-    # usual answer to repetition, but on these ternary checkpoints they push the
-    # model off-distribution fast: 1.05 turned a rambling answer into a run of
-    # "000000", and presence 0.5 into "!!!!!!". Raise them only for a specific
-    # prompt, and check the output.
-    repetition_penalty: float = Field(1.0, ge=0.5, le=2.0)
+    # 1.1 is not a guess: on "tell me about X in 200 words" the model produces a
+    # good answer and then repeats its last sentence forever. Measured on that
+    # prompt, 1.0 repeats a phrase 7 times, 1.03 fourteen, 1.05 four and none of
+    # them terminate; 1.1 ends cleanly at 259 tokens with no repeats. Higher is
+    # not automatically better - 1.05 collapsed a long thinking generation into
+    # "000000" - so leave this alone unless a specific prompt misbehaves.
+    repetition_penalty: float = Field(1.1, ge=0.5, le=2.0)
     presence_penalty: float = Field(0.0, ge=-2.0, le=2.0)
     thinking: bool = True
 
