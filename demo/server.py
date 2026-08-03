@@ -235,9 +235,22 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[Message] = Field(..., min_length=1)
-    max_tokens: int = Field(512, ge=1, le=32768)
-    temperature: float = Field(0.7, ge=0.0, le=2.0)
-    top_p: float = Field(0.9, ge=0.0, le=1.0)
+    # Reasoning models spend most of their budget inside <think>; 512 was not
+    # enough to reach an answer on anything non-trivial.
+    max_tokens: int = Field(2048, ge=1, le=32768)
+    # Defaults follow the checkpoint's own generation_config (temperature 0.6,
+    # top_k 20, top_p 0.95). Qwen3 leans on top_k in particular - leaving it
+    # unset lets the tail of the distribution drive it into repetition loops.
+    temperature: float = Field(0.6, ge=0.0, le=2.0)
+    top_p: float = Field(0.95, ge=0.0, le=1.0)
+    top_k: int = Field(20, ge=-1, le=1000)
+    # Both penalties default to neutral. They are exposed because they are the
+    # usual answer to repetition, but on these ternary checkpoints they push the
+    # model off-distribution fast: 1.05 turned a rambling answer into a run of
+    # "000000", and presence 0.5 into "!!!!!!". Raise them only for a specific
+    # prompt, and check the output.
+    repetition_penalty: float = Field(1.0, ge=0.5, le=2.0)
+    presence_penalty: float = Field(0.0, ge=-2.0, le=2.0)
     thinking: bool = True
 
 
@@ -391,6 +404,9 @@ class ChatEngine:
             max_tokens=req.max_tokens,
             temperature=req.temperature,
             top_p=req.top_p,
+            top_k=req.top_k,
+            repetition_penalty=req.repetition_penalty,
+            presence_penalty=req.presence_penalty,
         )
         acquired = False
         try:
