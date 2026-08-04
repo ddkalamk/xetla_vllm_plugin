@@ -134,6 +134,111 @@ def _xetla_target_device(layer: torch.nn.Module) -> torch.device:
     return torch.device("cpu")
 
 
+def _xetla_shard_moe_packed(packed: dict) -> dict:
+    """Split stacked expert weights across tensor-parallel ranks.
+
+    vLLM shards MoE experts on the intermediate dimension: every rank keeps all
+    experts but only its slice of each one. w13 is [E, K/16, 2I] with gate and
+    up concatenated, so both halves are sliced separately; w2 is [E, I/16, K]
+    with the intermediate on the input side, so it slices rows.
+    """
+    try:
+        from vllm.distributed import (get_tensor_model_parallel_rank,
+                                      get_tensor_model_parallel_world_size)
+        tp = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+    except Exception:
+        return packed
+    if tp <= 1:
+        return packed
+
+    q13, s13, q2, s2 = (packed["w13_q"], packed["w13_s"],
+                        packed["w2_q"], packed["w2_s"])
+    inter = q13.shape[2] // 2
+    if inter % tp:
+        raise ValueError(f"moe intermediate {inter} not divisible by tp={tp}")
+    per = inter // tp
+    # The scale groups are 128 wide along K, so w2's row split only lands on a
+    # group boundary if the per-rank intermediate is a multiple of 128.
+    if per % 128:
+        raise ValueError(
+            f"moe intermediate {inter} split {tp} ways gives {per} per rank, "
+            f"which breaks the 128-element scale groups; use a smaller tp")
+
+    lo, hi = rank * per, (rank + 1) * per
+    out = {
+        "w13_q": torch.cat([q13[:, :, lo:hi], q13[:, :, inter + lo:inter + hi]], dim=2),
+        "w13_s": torch.cat([s13[:, :, lo:hi], s13[:, :, inter + lo:inter + hi]], dim=2),
+        "w2_q": q2[:, lo // 16:hi // 16, :],
+        "w2_s": s2[:, lo // 128:hi // 128, :],
+    }
+    return out
+
+
+def _xetla_shard_packed(layer: torch.nn.Module, qw: torch.Tensor,
+                        sc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cut full packed tensors down to this rank's shard.
+
+    The sidecar stores whole tensors, qweight [K/16, N] and scale [K/128, N], so
+    an input-sharded layer takes a slice of rows and an output-sharded one a
+    slice of columns. Fused layers are concatenations of independently sharded
+    blocks - qkv splits q, k and v separately, gate_up splits gate and up - so
+    each block is sliced on its own and the pieces rejoined.
+    """
+    tp = getattr(layer, "tp_size", 1) or 1
+    if tp == 1:
+        return qw, sc
+    rank = getattr(layer, "tp_rank", 0)
+
+    from vllm.model_executor.layers.linear import (
+        ColumnParallelLinear, MergedColumnParallelLinear, QKVParallelLinear,
+        RowParallelLinear)
+
+    if isinstance(layer, RowParallelLinear):
+        # K is split. qweight packs 16 K-rows per int32 and scale one row per
+        # 128, so both divide cleanly only if K/tp stays a multiple of 128.
+        if qw.shape[0] % tp or sc.shape[0] % tp:
+            raise ValueError(
+                f"cannot split K={qw.shape[0] * 16} across tp={tp} "
+                f"and keep the 128-element scale groups intact")
+        kq, ks = qw.shape[0] // tp, sc.shape[0] // tp
+        return (qw[rank * kq:(rank + 1) * kq].contiguous(),
+                sc[rank * ks:(rank + 1) * ks].contiguous())
+
+    if isinstance(layer, QKVParallelLinear):
+        hs = layer.head_size
+        # When there are fewer kv heads than ranks vLLM replicates them, so the
+        # kv block index is not the rank.
+        if layer.total_num_kv_heads >= tp:
+            kv_idx, kv_take = rank, layer.num_kv_heads * hs
+        else:
+            kv_idx, kv_take = rank // (tp // layer.total_num_kv_heads), hs
+        blocks = [layer.total_num_heads * hs,
+                  layer.total_num_kv_heads * hs,
+                  layer.total_num_kv_heads * hs]
+        takes = [layer.num_heads * hs, kv_take, kv_take]
+        idxs = [rank, kv_idx, kv_idx]
+    elif isinstance(layer, MergedColumnParallelLinear):
+        blocks = list(layer.output_sizes)
+        takes = [b // tp for b in blocks]
+        idxs = [rank] * len(blocks)
+    elif isinstance(layer, ColumnParallelLinear):
+        blocks = [qw.shape[1]]
+        takes = [qw.shape[1] // tp]
+        idxs = [rank]
+    else:
+        return qw, sc
+
+    qs, ss, off = [], [], 0
+    for block, take, idx in zip(blocks, takes, idxs):
+        start = off + idx * take
+        qs.append(qw[:, start:start + take])
+        ss.append(sc[:, start:start + take])
+        off += block
+    return (torch.cat(qs, dim=1).contiguous(),
+            torch.cat(ss, dim=1).contiguous())
+
+
 def _xetla_prequant_try_load(layer: torch.nn.Module, prefix: str,
                              method: str, kind: str) -> bool:
     """If a sidecar entry exists for `prefix`, populate the layer in-place
@@ -150,6 +255,7 @@ def _xetla_prequant_try_load(layer: torch.nn.Module, prefix: str,
         with safe_open(_xetla_prequant_load_path, framework="pt") as f:
             qw = f.get_tensor(qkey)
             sc = f.get_tensor(skey)
+        qw, sc = _xetla_shard_packed(layer, qw, sc)
         layer.weight = torch.nn.Parameter(
             qw.to(dev).contiguous(), requires_grad=False)
         layer.scale = torch.nn.Parameter(
@@ -870,8 +976,10 @@ class XetlaFusedMoEMethod(_fused_moe_method_base()):
         packed = {}
         with safe_open(_xetla_prequant_load_path, framework="pt") as f:
             for slot, key in zip(("w13", "w2"), keys):
-                packed[f"{slot}_q"] = f.get_tensor(f"{key}.qweight").to(dev)
-                packed[f"{slot}_s"] = f.get_tensor(f"{key}.scale").to(dev)
+                packed[f"{slot}_q"] = f.get_tensor(f"{key}.qweight")
+                packed[f"{slot}_s"] = f.get_tensor(f"{key}.scale")
+        packed = _xetla_shard_moe_packed(packed)
+        packed = {k: v.to(dev).contiguous() for k, v in packed.items()}
         layer.w13_weight = None
         layer.w2_weight = None
         self.packed = packed

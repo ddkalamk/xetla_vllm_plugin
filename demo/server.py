@@ -24,6 +24,7 @@ model the plugin supports:
   DEMO_MAX_IMAGE_SIDE   downscale longest side to        (1024)
   DEMO_TEXT_ONLY        1 disables image inputs          (0)
   DEMO_ENFORCE_EAGER    1 disables torch.compile         (0)
+  DEMO_TENSOR_PARALLEL_SIZE  GPUs to shard across       (1)
   DEMO_CUDAGRAPH_SIZES  batch sizes to capture graphs    (1,2,4,8,16)
   DEMO_WARMUP           1 pays the first-token JIT cost  (1)
 
@@ -89,6 +90,8 @@ class Config:
         self.max_images = 0 if self.text_only else int(os.environ.get("DEMO_MAX_IMAGES", "4"))
         self.max_image_side = int(os.environ.get("DEMO_MAX_IMAGE_SIDE", "1024"))
         self.enforce_eager = _env_bool("DEMO_ENFORCE_EAGER", False)
+        self.tensor_parallel_size = int(
+            os.environ.get("DEMO_TENSOR_PARALLEL_SIZE", "1"))
         self.warmup = _env_bool("DEMO_WARMUP", True)
         # Capture sizes must stay under the plugin's batched MoE path
         # (XETLA_MOE_EXPAND_MAX / top_k); above it the gathered path syncs to
@@ -314,6 +317,7 @@ class ChatEngine:
                 enable_prefix_caching=False,
                 quantization=cfg.quant,
                 dtype=cfg.dtype,
+                tensor_parallel_size=cfg.tensor_parallel_size,
                 enforce_eager=cfg.enforce_eager,
                 **extra,
             )
