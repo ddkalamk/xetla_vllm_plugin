@@ -26,9 +26,14 @@ def parse_args():
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     p.add_argument("--max-tokens", type=int, default=200)
+    p.add_argument("--repetition-penalty", type=float, default=1.0)
+    p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--enforce-eager", action="store_true")
     p.add_argument("--text-only", action="store_true")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
+    p.add_argument("--pipeline-parallel-size", type=int, default=1)
+    p.add_argument("--full", action="store_true",
+                   help="print whole generations plus a repetition report")
     p.add_argument("--cudagraph-sizes", default=None,
                    help="comma-separated batch sizes to capture graphs for")
     p.add_argument("--prompt", action="append", default=None,
@@ -56,6 +61,7 @@ def main():
               trust_remote_code=True, enable_prefix_caching=False,
               quantization=quant, dtype=a.dtype,
               tensor_parallel_size=a.tensor_parallel_size,
+              pipeline_parallel_size=a.pipeline_parallel_size,
               enforce_eager=a.enforce_eager, **extra)
     load_s = time.perf_counter() - t0
 
@@ -71,6 +77,7 @@ def main():
     print(f"quantization         : {quant} ({os.environ.get('XETLA_QUANT_METHOD', '-')})"
           f"{'  [sidecar]' if os.environ.get('XETLA_PREQUANT_PATH') else ''}")
     print(f"tensor parallel      : {a.tensor_parallel_size}")
+    print(f"pipeline parallel    : {a.pipeline_parallel_size}")
     print(f"engine load          : {load_s:.1f} s")
     print(f"device memory in use : {(total_b - free_b) / 2**30:.2f} GiB "
           f"of {total_b / 2**30:.2f} GiB")
@@ -83,7 +90,8 @@ def main():
         except Exception:
             prompt = raw
 
-        sp = SamplingParams(max_tokens=a.max_tokens, temperature=0.0)
+        sp = SamplingParams(max_tokens=a.max_tokens, temperature=a.temperature,
+                            repetition_penalty=a.repetition_penalty)
         req = f"bench-{idx}-{time.time_ns()}"
         engine.add_request(req, prompt, sp)
         t0 = time.perf_counter()
@@ -110,8 +118,32 @@ def main():
         print(f"TTFT (prefill)       : {ttft * 1000:.0f} ms")
         print(f"decode               : {n} tokens in {decode_s:.2f} s = "
               f"{n / decode_s if decode_s else 0:.2f} tok/s   [{finish}]")
-        print(text.strip()[:700])
+        if a.full:
+            print(f"repetition           : {_repetition_report(text)}")
+            print(text.strip())
+        else:
+            print(text.strip()[:700])
     return
+
+
+def _repetition_report(text):
+    """Distinguish a decoding loop from output that is merely long."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    uniq = len(set(lines))
+    words = text.split()
+    report = [f"{len(lines)} lines, {uniq} unique"]
+    if words:
+        report.append(f"{len(words)} words, {len(set(words))} unique")
+    # longest sentence repeated back to back
+    for size in (40, 20, 10):
+        if len(words) < size * 2:
+            continue
+        for i in range(len(words) - size * 2 + 1):
+            a_ = words[i:i + size]
+            if a_ == words[i + size:i + size * 2]:
+                report.append(f"LOOP: {size}-word block repeats at word {i}")
+                return "; ".join(report)
+    return "; ".join(report)
 
 
 

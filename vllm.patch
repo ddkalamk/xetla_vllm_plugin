@@ -1,3 +1,19 @@
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index 58c49c09d..81e69f7a8 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -477,8 +477,9 @@ class GroupCoordinator:
+             CudaCommunicator,
+         )
+ 
+-        if self.device_communicator is not None:
+-            assert isinstance(self.device_communicator, CudaCommunicator)
++        # Custom all-reduce and aiter are cuda/rocm only. Other backends (xpu)
++        # have nothing collective to capture, so they fall through as no-ops.
++        if isinstance(self.device_communicator, CudaCommunicator):
+             ca_comm = self.device_communicator.ca_comm
+             if ca_comm is not None:
+                 maybe_ca_context = ca_comm.capture()  # type: ignore
 diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
 index e65ef6e42..8267e0ddb 100644
 --- a/vllm/engine/arg_utils.py
@@ -36,3 +52,19 @@ index c418c29a8..03d87d72e 100644
      # Read the quantization config from the HF model config, if available.
      hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
      # some vision model may keep quantization_config in their text_config
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+index bd9006f3f..355f92f38 100644
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -195,7 +195,10 @@ class XPUPlatform(Platform):
+                 "XPU Graph is disabled by environment variable, "
+                 "please set VLLM_XPU_ENABLE_XPU_GRAPH=1 to enable it."
+             )
+-        elif parallel_config.world_size_across_dp > 1:
++        elif (
++            parallel_config.tensor_parallel_size > 1
++            or parallel_config.data_parallel_size > 1
++        ):
+             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+             logger.warning(
+                 "XPU Graph doesn't support capture communication ops, "
