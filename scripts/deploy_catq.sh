@@ -1,17 +1,36 @@
 #!/usr/bin/env bash
-# Turn a CAT-Q ternary checkpoint into an int2 sidecar this plugin can serve.
+# Turn a CAT-Q ternary checkpoint into an int2 sidecar this plugin can serve,
+# then run it.
 #
-#   ./scripts/deploy_catq.sh https://huggingface.co/IntelLabsChina/CAT-Q/tree/main/qwen3-32B
+#   ./scripts/deploy_catq.sh https://huggingface.co/IntelLabsChina/CAT-Q/tree/main/qwen3-1.7b
 #
-# CAT-Q publishes learned modulation parameters, not weights. Three stages:
+# CAT-Q publishes learned modulation parameters, not weights. Four stages:
 #
 #   1. download   parameters.pth + config.yaml from the CAT-Q repo
 #   2. export     merge them into the base model and save a fake-quantized HF
 #                 checkpoint (ternary values stored dense in fp16)
 #   3. pack       squeeze the ternary tensors into the int2 sidecar
+#   4. run        decode a sample prompt and report tok/s
 #
 # Stages are skippable so a failed run can resume:
-#   --skip-download / --skip-export / --skip-pack
+#   --skip-download / --skip-export / --skip-pack / --skip-run
+#
+# Serving defaults, measured rather than assumed:
+#   * XPU graphs (VLLM_XPU_ENABLE_XPU_GRAPH=1) remove kernel dispatch overhead,
+#     which is most of a token at batch 1. The win scales with how many ops a
+#     layer issues, so it is largest on MoE: 2.6x on Qwen3-30B-A3B, 2.2x on
+#     235B-A22B under pp=4, but only 1.20x on the dense 1.7B (301 vs 251 tok/s)
+#     where there is less dispatch to remove. Pass --no-graphs to compare.
+#   * repetition_penalty 1.1. Without it these checkpoints answer and then
+#     repeat the last sentence forever. 1.05 collapsed a long answer into
+#     "000000", so do not tune it blind.
+#   * XETLA_QUANTIZE_LM_HEADS=0. CAT-Q embeddings and lm_head are not ternary
+#     and ternarizing them destroys the model. The packer already leaves them
+#     out; this stops the plugin quantizing them on the fly.
+#
+# Multi-card (only needed when the sidecar does not fit in 30.3 GiB) lives in
+# scripts/run_multi_gpu.sh. Prefer pipeline over tensor parallel there: it
+# keeps graphs usable and costs far less at batch 1.
 #
 # Notes
 #   * Export is CPU and RAM bound, not GPU bound. A 32B needs ~70 GB resident,
@@ -19,10 +38,6 @@
 #     that is already serving. The 30B MoE export was OOM-killed on a 94 GB node.
 #   * use_bfloat16 is forced off: the plugin's kernels are fp16, and packing a
 #     bf16 export loses the low mantissa bits of the scales.
-#   * Serving a CAT-Q model needs XETLA_QUANTIZE_LM_HEADS=0. Its embeddings and
-#     lm_head are not ternary, and ternarizing them destroys the model. The
-#     packer already leaves them out of the sidecar; this stops the plugin
-#     quantizing them on the fly.
 set -euo pipefail
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
@@ -31,14 +46,20 @@ CATQ_DIR="${CATQ_DIR:-${ROOT_DIR}/BitTern/projects/cat-q}"
 SIDECAR_DIR="${SIDECAR_DIR:-${ROOT_DIR}/..}"
 PYTHON="${PYTHON:-${ROOT_DIR}/.venv/bin/python}"
 
-do_download=1; do_export=1; do_pack=1
+do_download=1; do_export=1; do_pack=1; do_run=1; graphs=1
+MAXTOK="${MAXTOK:-256}"
+PROMPT="${PROMPT:-Tell me about CPU caches}"
 URL=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-download) do_download=0 ;;
         --skip-export)   do_export=0 ;;
         --skip-pack)     do_pack=0 ;;
-        -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --skip-run)      do_run=0 ;;
+        --no-graphs)     graphs=0 ;;
+        --max-tokens)    MAXTOK="$2"; shift ;;
+        --prompt)        PROMPT="$2"; shift ;;
+        -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) URL="$1" ;;
     esac
     shift
@@ -131,6 +152,37 @@ if [[ "${do_pack}" == "1" ]]; then
     ls -lh "${SIDECAR}"
 fi
 
+# ---- 4. run ---------------------------------------------------------------
+if [[ "${do_run}" == "1" ]]; then
+    echo "[deploy] --- decoding ${MAXTOK} tokens ---"
+    if [[ ! -f "${SIDECAR}" ]]; then
+        echo "[deploy] ERROR: no sidecar at ${SIDECAR}" >&2
+        exit 5
+    fi
+
+    # The vendor env scripts assume a permissive shell.
+    set +eu
+    GPU_VARS="${INTEL_GPU_VARS:-/swtools/intel-gpu/26.05.37020.3/intel_gpu_vars.sh}"
+    ONEAPI="${ONEAPI_VARS:-/swtools/intel/2025.3/oneapi-vars.sh}"
+    [[ -f "${GPU_VARS}" ]] && source "${GPU_VARS}" >/dev/null 2>&1
+    [[ -f "${ONEAPI}" ]] && source "${ONEAPI}" --force >/dev/null 2>&1
+    set -eu
+
+    export XETLA_QUANT_METHOD=int2_f16
+    export XETLA_QUANTIZE_LM_HEADS=0
+    export XETLA_PREQUANT_PATH="${SIDECAR}"
+    export VLLM_XPU_ENABLE_XPU_GRAPH="${graphs}"
+    export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
+    export VLLM_ENABLE_V1_MULTIPROCESSING=0
+
+    echo "[deploy] xpu graphs: ${VLLM_XPU_ENABLE_XPU_GRAPH}"
+    "${PYTHON}" "${ROOT_DIR}/scripts/bench_model.py" \
+        --model "${EXPORT_DIR}" \
+        --max-tokens "${MAXTOK}" --repetition-penalty 1.1 --full \
+        --cudagraph-sizes 1,2,4,8 \
+        --prompt "${PROMPT}"
+fi
+
 cat <<EOF
 
 [deploy] done.
@@ -138,17 +190,14 @@ cat <<EOF
   export : ${EXPORT_DIR}
   sidecar: ${SIDECAR}
 
-Serve it:
+Chat with it:
 
-  XETLA_QUANT_METHOD=int2_f16 \\
-  XETLA_QUANTIZE_LM_HEADS=0 \\
+  XETLA_QUANT_METHOD=int2_f16 XETLA_QUANTIZE_LM_HEADS=0 \\
   XETLA_PREQUANT_PATH=${SIDECAR} \\
-  DEMO_MODEL=${EXPORT_DIR} \\
-  DEMO_TEXT_ONLY=1 PORT=8000 ./demo/serve.sh
+  DEMO_MODEL=${EXPORT_DIR} DEMO_TEXT_ONLY=1 \\
+  VLLM_XPU_ENABLE_XPU_GRAPH=1 PORT=8000 ./demo/serve.sh
 
-Sanity-check it first - a CAT-Q run can converge to a model that repeats
-forever, and that is visible only in a long generation:
-
-  ${PYTHON} tests/dense_cpu_reference.py --model ${EXPORT_DIR} \\
-      --prompt "What is 2+2?" --max-new-tokens 60
+A CAT-Q run can converge to a model that repeats forever. The run stage above
+prints a repetition report (unique words vs total, and any repeated block) so
+that shows up without reading the whole generation.
 EOF

@@ -35,8 +35,19 @@ source "${ROOT_DIR}/.venv/bin/activate"
 set -eu
 
 # ---- Engine / plugin configuration ---------------------------------------
-export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
-export VLLM_ENABLE_V1_MULTIPROCESSING="${VLLM_ENABLE_V1_MULTIPROCESSING:-0}"
+# Multi-GPU needs the opposite of the single-card defaults: ONEAPI_DEVICE_SELECTOR
+# pins one device and would starve the other ranks, and the workers need the
+# multiprocessing executor.
+DEMO_WORLD=$(( ${DEMO_PIPELINE_PARALLEL_SIZE:-1} * ${DEMO_TENSOR_PARALLEL_SIZE:-1} ))
+if (( DEMO_WORLD > 1 )); then
+    export ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK:-$(seq -s, 0 $((DEMO_WORLD - 1)))}"
+    unset ONEAPI_DEVICE_SELECTOR || true
+    export VLLM_ENABLE_V1_MULTIPROCESSING="${VLLM_ENABLE_V1_MULTIPROCESSING:-1}"
+    echo "[serve.sh] ${DEMO_WORLD} cards (ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK})"
+else
+    export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
+    export VLLM_ENABLE_V1_MULTIPROCESSING="${VLLM_ENABLE_V1_MULTIPROCESSING:-0}"
+fi
 export XETLA_QUANT_METHOD="${XETLA_QUANT_METHOD:-int2_f16}"
 
 # XPU graphs are worth ~2.6x decode (62 -> 159 tok/s on the CAT-Q MoE model),
