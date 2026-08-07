@@ -52,7 +52,7 @@ if ! command -v uv >/dev/null; then
 fi
 
 PLUGIN_REPO="${PLUGIN_REPO:-https://github.com/ddkalamk/xetla_vllm_plugin.git}"
-PLUGIN_BRANCH="${PLUGIN_BRANCH:-feature/int2-fp16-bonsai-chat}"
+PLUGIN_BRANCH="${PLUGIN_BRANCH:-feature/catq-moe-int2}"
 
 VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
 VLLM_BRANCH="${VLLM_BRANCH:-v0.21.0}"

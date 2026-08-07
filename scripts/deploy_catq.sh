@@ -12,6 +12,11 @@
 #   3. pack       squeeze the ternary tensors into the int2 sidecar
 #   4. run        decode a sample prompt and report tok/s
 #
+# The export stage runs CAT-Q's own main.py from IntelChina-AI/BitTern, which
+# is cloned on first use (it is not vendored: its configs/ dir is where the
+# exports land, hundreds of GB, so it has to stay untracked). Point CATQ_DIR
+# at an existing checkout to skip the clone.
+#
 # Stages are skippable so a failed run can resume:
 #   --skip-download / --skip-export / --skip-pack / --skip-run
 #
@@ -86,6 +91,22 @@ EXPORT_DIR="${CFG_DIR}/export"
 echo "[deploy] repo      : ${REPO_ID}"
 echo "[deploy] subfolder : ${SUBFOLDER}"
 echo "[deploy] config dir: ${CFG_DIR}"
+
+# ---- 0. CAT-Q source ------------------------------------------------------
+# The export stage runs CAT-Q's own main.py, which lives in the BitTern repo.
+# It is not vendored here (its configs/ dir is where the multi-hundred-GB
+# exports land, so it must stay untracked), so fetch it on first use.
+BITTERN_REPO="${BITTERN_REPO:-https://github.com/IntelChina-AI/BitTern.git}"
+if [[ ! -f "${CATQ_DIR}/main.py" ]]; then
+    BITTERN_DIR="$(dirname "$(dirname "${CATQ_DIR}")")"
+    echo "[deploy] --- fetching CAT-Q source (${BITTERN_REPO}) ---"
+    git clone --depth 1 "${BITTERN_REPO}" "${BITTERN_DIR}"
+    [[ -f "${CATQ_DIR}/main.py" ]] || {
+        echo "[deploy] ERROR: ${CATQ_DIR}/main.py still missing after clone." >&2
+        echo "[deploy]        Set CATQ_DIR to an existing checkout instead." >&2
+        exit 6
+    }
+fi
 
 # ---- 1. download ----------------------------------------------------------
 if [[ "${do_download}" == "1" ]]; then

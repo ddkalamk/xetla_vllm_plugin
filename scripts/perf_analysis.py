@@ -28,6 +28,16 @@ SHAPES = {
         ("expert_w2", 1536, 4096),
         ("lm_head_fp16", 4096, 151936),
     ],
+    "8b": [
+        # Qwen3-8B: hidden 4096, 32 q heads, 8 kv heads, head_dim 128,
+        # intermediate 12288, 36 layers.
+        ("qkv_proj", 4096, 6144),
+        ("o_proj", 4096, 4096),
+        ("gate_up", 4096, 24576),
+        ("down_proj", 12288, 4096),
+        # CAT-Q leaves lm_head in fp16, so the fp16 column is the real cost
+        ("lm_head", 4096, 151936),
+    ],
     "30b": [
         ("qkv_proj", 2048, 4096),
         ("o_proj", 4096, 2048),
