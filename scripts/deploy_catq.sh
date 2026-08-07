@@ -108,6 +108,32 @@ if [[ ! -f "${CATQ_DIR}/main.py" ]]; then
     }
 fi
 
+# CAT-Q's pyproject pins torch==2.4.0 / transformers==4.51.0, which would tear
+# out the xpu torch and vllm this plugin is built against. So never install it
+# as a package: just add the handful of modules its export path imports, with
+# everything already present pinned to the installed version.
+MISSING=()
+for mod in accelerate lm_eval yaml sentencepiece; do
+    "${PYTHON}" -c "import ${mod}" 2>/dev/null || MISSING+=("${mod}")
+done
+if (( ${#MISSING[@]} )); then
+    echo "[deploy] --- installing CAT-Q imports: ${MISSING[*]} ---"
+    PIP_PKGS=("${MISSING[@]/#yaml/PyYAML}")
+    PIP_PKGS=("${PIP_PKGS[@]/#lm_eval/lm_eval}")
+    CONSTRAINTS="$(mktemp)"
+    "${PYTHON}" - <<'PY' > "${CONSTRAINTS}"
+import importlib.metadata as md
+for p in ("torch", "transformers", "vllm", "numpy", "datasets", "tokenizers",
+          "huggingface-hub", "safetensors"):
+    try:
+        print(f"{p}=={md.version(p)}")
+    except md.PackageNotFoundError:
+        pass
+PY
+    "${PYTHON}" -m pip install -q "${PIP_PKGS[@]}" -c "${CONSTRAINTS}"
+    rm -f "${CONSTRAINTS}"
+fi
+
 # ---- 1. download ----------------------------------------------------------
 if [[ "${do_download}" == "1" ]]; then
     echo "[deploy] --- downloading CAT-Q parameters ---"
