@@ -93,11 +93,10 @@ echo "[deploy] subfolder : ${SUBFOLDER}"
 echo "[deploy] config dir: ${CFG_DIR}"
 
 # ---- 0. CAT-Q source ------------------------------------------------------
-# The export stage runs CAT-Q's own main.py, which lives in the BitTern repo.
-# It is not vendored here (its configs/ dir is where the multi-hundred-GB
-# exports land, so it must stay untracked), so fetch it on first use.
+# Only the export stage needs CAT-Q's own main.py, so skip all of this when
+# the caller already has an export.
 BITTERN_REPO="${BITTERN_REPO:-https://github.com/IntelChina-AI/BitTern.git}"
-if [[ ! -f "${CATQ_DIR}/main.py" ]]; then
+if [[ "${do_export}" == "1" && ! -f "${CATQ_DIR}/main.py" ]]; then
     BITTERN_DIR="$(dirname "$(dirname "${CATQ_DIR}")")"
     echo "[deploy] --- fetching CAT-Q source (${BITTERN_REPO}) ---"
     git clone --depth 1 "${BITTERN_REPO}" "${BITTERN_DIR}"
@@ -112,16 +111,16 @@ fi
 # out the xpu torch and vllm this plugin is built against. So never install it
 # as a package: just add the handful of modules its export path imports, with
 # everything already present pinned to the installed version.
-MISSING=()
-for mod in accelerate lm_eval yaml sentencepiece; do
-    "${PYTHON}" -c "import ${mod}" 2>/dev/null || MISSING+=("${mod}")
-done
-if (( ${#MISSING[@]} )); then
-    echo "[deploy] --- installing CAT-Q imports: ${MISSING[*]} ---"
-    PIP_PKGS=("${MISSING[@]/#yaml/PyYAML}")
-    PIP_PKGS=("${PIP_PKGS[@]/#lm_eval/lm_eval}")
-    CONSTRAINTS="$(mktemp)"
-    "${PYTHON}" - <<'PY' > "${CONSTRAINTS}"
+if [[ "${do_export}" == "1" ]]; then
+    MISSING=()
+    for mod in accelerate lm_eval yaml sentencepiece; do
+        "${PYTHON}" -c "import ${mod}" 2>/dev/null || MISSING+=("${mod}")
+    done
+    if (( ${#MISSING[@]} )); then
+        echo "[deploy] --- installing CAT-Q imports: ${MISSING[*]} ---"
+        PIP_PKGS=("${MISSING[@]/#yaml/PyYAML}")
+        CONSTRAINTS="$(mktemp)"
+        "${PYTHON}" - <<'PY' > "${CONSTRAINTS}"
 import importlib.metadata as md
 for p in ("torch", "transformers", "vllm", "numpy", "datasets", "tokenizers",
           "huggingface-hub", "safetensors"):
@@ -130,8 +129,9 @@ for p in ("torch", "transformers", "vllm", "numpy", "datasets", "tokenizers",
     except md.PackageNotFoundError:
         pass
 PY
-    "${PYTHON}" -m pip install -q "${PIP_PKGS[@]}" -c "${CONSTRAINTS}"
-    rm -f "${CONSTRAINTS}"
+        "${PYTHON}" -m pip install -q "${PIP_PKGS[@]}" -c "${CONSTRAINTS}"
+        rm -f "${CONSTRAINTS}"
+    fi
 fi
 
 # ---- 1. download ----------------------------------------------------------
