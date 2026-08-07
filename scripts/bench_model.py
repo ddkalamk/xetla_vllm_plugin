@@ -28,6 +28,8 @@ def parse_args():
     p.add_argument("--max-tokens", type=int, default=200)
     p.add_argument("--repetition-penalty", type=float, default=1.0)
     p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--no-warmup", action="store_true",
+                   help="report cold TTFT, including jit and first-touch cost")
     p.add_argument("--enforce-eager", action="store_true")
     p.add_argument("--text-only", action="store_true")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
@@ -69,7 +71,26 @@ def main():
     tok = llm.get_tokenizer()
     prompts = a.prompt or ["Tell me what is photosynthesis"]
 
-    llm.generate(["hi"], SamplingParams(max_tokens=4, temperature=0.0))
+    def _template(raw):
+        try:
+            return tok.apply_chat_template(
+                [{"role": "user", "content": raw}],
+                tokenize=False, add_generation_prompt=True)
+        except Exception:
+            return raw
+
+    templated = [_template(p) for p in prompts]
+
+    # Warm on the real prompts, not a one-token stand-in: the first prefill at
+    # a realistic length is what triggers triton jit and first-touch of the
+    # attention/graph buckets, and that lands entirely in the first TTFT
+    # (2.2 s against 66 ms warmed).
+    if not a.no_warmup:
+        w0 = time.perf_counter()
+        llm.generate(templated, SamplingParams(max_tokens=8, temperature=0.0))
+        warm_s = time.perf_counter() - w0
+    else:
+        warm_s = float("nan")
     engine = llm.llm_engine
 
     print("\n" + "=" * 70)
@@ -79,17 +100,12 @@ def main():
     print(f"tensor parallel      : {a.tensor_parallel_size}")
     print(f"pipeline parallel    : {a.pipeline_parallel_size}")
     print(f"engine load          : {load_s:.1f} s")
+    print(f"warmup               : {warm_s:.1f} s"
+          f"{' (skipped)' if a.no_warmup else ''}")
     print(f"device memory in use : {(total_b - free_b) / 2**30:.2f} GiB "
           f"of {total_b / 2**30:.2f} GiB")
 
-    for idx, raw in enumerate(prompts):
-        try:
-            prompt = tok.apply_chat_template(
-                [{"role": "user", "content": raw}],
-                tokenize=False, add_generation_prompt=True)
-        except Exception:
-            prompt = raw
-
+    for idx, (raw, prompt) in enumerate(zip(prompts, templated)):
         sp = SamplingParams(max_tokens=a.max_tokens, temperature=a.temperature,
                             repetition_penalty=a.repetition_penalty)
         req = f"bench-{idx}-{time.time_ns()}"
