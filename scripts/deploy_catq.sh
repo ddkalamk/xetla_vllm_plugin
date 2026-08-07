@@ -51,7 +51,7 @@ CATQ_DIR="${CATQ_DIR:-${ROOT_DIR}/BitTern/projects/cat-q}"
 SIDECAR_DIR="${SIDECAR_DIR:-${ROOT_DIR}/..}"
 PYTHON="${PYTHON:-${ROOT_DIR}/.venv/bin/python}"
 
-do_download=1; do_export=1; do_pack=1; do_run=1; graphs=1
+do_download=1; do_export=1; do_pack=1; do_run=1; graphs=1; force=0
 MAXTOK="${MAXTOK:-256}"
 PROMPT="${PROMPT:-Tell me about CPU caches}"
 URL=""
@@ -61,17 +61,18 @@ while [[ $# -gt 0 ]]; do
         --skip-export)   do_export=0 ;;
         --skip-pack)     do_pack=0 ;;
         --skip-run)      do_run=0 ;;
+        --force)         force=1 ;;
         --no-graphs)     graphs=0 ;;
         --max-tokens)    MAXTOK="$2"; shift ;;
         --prompt)        PROMPT="$2"; shift ;;
-        -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '2,45p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) URL="$1" ;;
     esac
     shift
 done
 
 if [[ -z "${URL}" ]]; then
-    echo "usage: $0 <huggingface tree URL> [--skip-download|--skip-export|--skip-pack]" >&2
+    echo "usage: $0 <huggingface tree URL> [--skip-*] [--force]" >&2
     echo "  e.g. $0 https://huggingface.co/IntelLabsChina/CAT-Q/tree/main/qwen3-32B" >&2
     exit 2
 fi
@@ -91,6 +92,20 @@ EXPORT_DIR="${CFG_DIR}/export"
 echo "[deploy] repo      : ${REPO_ID}"
 echo "[deploy] subfolder : ${SUBFOLDER}"
 echo "[deploy] config dir: ${CFG_DIR}"
+
+# Reuse what is already on disk. Re-running should not repeat a multi-GB
+# download or an export that takes tens of minutes and a lot of RAM.
+if [[ "${force}" == "0" && "${do_export}" == "1" && -f "${EXPORT_DIR}/config.json" ]]; then
+    echo "[deploy] export already present, skipping export (--force to redo)"
+    do_export=0
+fi
+# parameters.pth is only an input to the export, so nothing to fetch once the
+# export exists.
+if [[ "${force}" == "0" && "${do_export}" == "0" && "${do_download}" == "1" \
+      && -f "${CFG_DIR}/config.yaml" ]]; then
+    echo "[deploy] no export to run, skipping download"
+    do_download=0
+fi
 
 # ---- 0. CAT-Q source ------------------------------------------------------
 # Only the export stage needs CAT-Q's own main.py, so skip all of this when
@@ -167,6 +182,12 @@ MODEL_NAME="${BASE_MODEL##*/}"
 SIDECAR="${SIDECAR_DIR}/CAT-Q-${MODEL_NAME}.xetla-int2_f16.safetensors"
 echo "[deploy] base model: ${BASE_MODEL}"
 echo "[deploy] sidecar   : ${SIDECAR}"
+
+if [[ "${force}" == "0" && "${do_pack}" == "1" && -s "${SIDECAR}" ]]; then
+    echo "[deploy] sidecar already present ($(du -h "${SIDECAR}" | cut -f1)),"\
+         "skipping pack (--force to redo)"
+    do_pack=0
+fi
 
 # ---- 2. export ------------------------------------------------------------
 # CAT-Q's own export_model.sh reads config.yaml and grabs a GPU. We use a fp16
