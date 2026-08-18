@@ -28,6 +28,8 @@ def parse_args():
     p.add_argument("--max-tokens", type=int, default=200)
     p.add_argument("--repetition-penalty", type=float, default=1.0)
     p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--top-k", type=int, default=-1)
     p.add_argument("--no-warmup", action="store_true",
                    help="report cold TTFT, including jit and first-touch cost")
     p.add_argument("--enforce-eager", action="store_true")
@@ -40,6 +42,9 @@ def parse_args():
                    help="comma-separated batch sizes to capture graphs for")
     p.add_argument("--prompt", action="append", default=None,
                    help="repeat to benchmark several prompts off one load")
+    p.add_argument("--prompt-file", action="append", default=None,
+                   help="read a prompt verbatim from a file, for text that "
+                        "shell quoting would mangle")
     return p.parse_args()
 
 
@@ -69,7 +74,12 @@ def main():
 
     free_b, total_b = torch.xpu.mem_get_info(0)
     tok = llm.get_tokenizer()
-    prompts = a.prompt or ["Tell me what is photosynthesis"]
+    prompts = list(a.prompt or [])
+    for path in (a.prompt_file or []):
+        with open(path, encoding="utf-8") as fh:
+            prompts.append(fh.read().strip())
+    if not prompts:
+        prompts = ["Tell me what is photosynthesis"]
 
     def _template(raw):
         try:
@@ -107,6 +117,7 @@ def main():
 
     for idx, (raw, prompt) in enumerate(zip(prompts, templated)):
         sp = SamplingParams(max_tokens=a.max_tokens, temperature=a.temperature,
+                            top_p=a.top_p, top_k=a.top_k,
                             repetition_penalty=a.repetition_penalty)
         req = f"bench-{idx}-{time.time_ns()}"
         engine.add_request(req, prompt, sp)

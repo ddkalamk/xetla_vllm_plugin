@@ -27,6 +27,12 @@ except:
 #os.environ["SYCL_PROGRAM_COMPILE_OPTIONS"] = "-vc-codegen -vc-disable-indvars-opt -Xfinalizer ' -printregusage -enableBCR -DPASTokenReduction ' -doubleGRF"
 timing_enabled = int(os.environ.get("XETLA_TIMINGS", "0")) > 0
 quantize_lm_heads = int(os.environ.get("XETLA_QUANTIZE_LM_HEADS", "1")) > 0
+# CAT-Q needs its lm_head left dense (ternarising it destroys the model), but
+# fp16 lm_head is the largest single gemm at decode: 2.1 ms of an 8 ms token on
+# a B70, 11.7 ms of 49 ms on an integrated GPU. int8 via torch._int_mm runs it
+# 1.84x faster. It also flips ~3% of argmax decisions against an fp32 reference
+# where fp16 flips 0.6%, so it stays opt-in until measured on a real task.
+lm_head_int8 = int(os.environ.get("XETLA_LM_HEAD_INT8", "0")) > 0
 # The int2 x fp16 DPAS prefill kernel converts activations to int8 (XMX), which
 # costs ~1.3% relative error per GEMM. That compounds across layers and is
 # enough to destroy a model outright: the CAT-Q Qwen3 8B and 32B emit a single
@@ -1386,6 +1392,62 @@ def _maybe_disable_triton_stride_versioning() -> None:
               flush=True)
 
 
+def _xetla_int8_lm_head(model: torch.nn.Module) -> None:
+    """Swap ParallelLMHead to int8 weights driven by torch._int_mm.
+
+    Independent of XETLA_QUANTIZE_LM_HEADS: CAT-Q sets that to 0 because
+    ternarising the output layer destroys the model, but int8 is a much
+    milder step and this is the largest gemm left in fp16.
+    """
+    if not lm_head_int8 or not current_platform.is_xpu():
+        return
+
+    for name, module in model.named_modules():
+        if not isinstance(module, ParallelLMHead):
+            continue
+        if getattr(module, "xetla_quantized", False):
+            continue
+        w = module.weight.data                      # [vocab, hidden]
+        if w.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            continue
+        # Per output row: each vocab entry gets its own scale, so a few
+        # large-magnitude rows cannot squash the rest of the table.
+        wf = w.to("cpu", dtype=torch.float32)
+        ws = (wf.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-12)
+        w8 = torch.round(wf / ws).clamp(-127, 127).to(torch.int8)
+        dev = w.device
+        # _int_mm wants [K, N], and the row scales become a column vector.
+        module.weight_int8 = torch.nn.Parameter(
+            w8.t().contiguous().to(dev), requires_grad=False)
+        module.weight_int8_scale = torch.nn.Parameter(
+            ws.reshape(1, -1).to(dev, dtype=torch.float16), requires_grad=False)
+        module.weight = torch.nn.Parameter(
+            torch.empty(0, dtype=w.dtype, device=dev), requires_grad=False)
+        module.xetla_quantized = True
+        module.quant_method = XetlaInt8LMHeadMethod()
+        print(f"[xetla] lm_head {name} int8: {tuple(w.shape)} "
+              f"({w.numel() * w.element_size() / 2**30:.2f} GiB fp16 -> "
+              f"{w8.numel() / 2**30:.2f} GiB int8)", flush=True)
+
+
+class XetlaInt8LMHeadMethod:
+    """W8A8 logits: quantize activations per token, then torch._int_mm."""
+
+    def apply(self, layer, x, bias=None):
+        orig_dtype = x.dtype
+        xf = x.reshape(-1, x.shape[-1]).to(torch.float32)
+        xs = (xf.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-12)
+        x8 = torch.round(xf / xs).clamp(-127, 127).to(torch.int8)
+        acc = torch._int_mm(x8.contiguous(), layer.weight_int8)
+        out = acc.to(torch.float32) * xs * layer.weight_int8_scale.float()
+        if bias is not None:
+            out = out + bias.float()
+        return out.to(orig_dtype).reshape(*x.shape[:-1], -1)
+
+    def process_weights_after_loading(self, layer):  # already done in-place
+        return
+
+
 def _xetla_quantize_lm_head(model: torch.nn.Module) -> None:
     """Quantize embedding tables that vLLM built without a quant_config.
 
@@ -1475,6 +1537,7 @@ def register():
             model = args[0] if args else kwargs.get("model")
             if isinstance(model, torch.nn.Module):
                 _xetla_quantize_lm_head(model)
+                _xetla_int8_lm_head(model)
             _xetla_prequant_flush_dump()
 
         _mu.process_weights_after_loading = _wrapped_pwal
