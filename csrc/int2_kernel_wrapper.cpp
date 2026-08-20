@@ -214,6 +214,15 @@ torch::Tensor int1_fp16_upcvt_gemm_run_torch(
     torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
     std::optional<torch::Tensor> C_out);
 
+// Forward declaration of the BITCOS ternary upcvt GEMM torch wrapper. The
+// kernel implementation lives in csrc/bitcos_fp16_upcvt_kernel.sycl. B is a
+// flat buffer holding the bitmap, per-column sign offsets and the compacted
+// sign bitstream, so it carries no zero weights at all.
+torch::Tensor bitcos_fp16_upcvt_gemm_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
+    std::optional<torch::Tensor> slice_ranks,
+    std::optional<torch::Tensor> C_out);
+
 // Forward declaration of the batched MoE expert GEMV. The kernel
 // implementation lives in csrc/int2_fp16_moe_gemv_kernel.sycl.
 torch::Tensor int2_fp16_moe_gemv_run_torch(
@@ -232,5 +241,6 @@ TORCH_LIBRARY(xetla_int2, m) {
   m.def("int2_bf16_upcvt_gemm_run", &int2_bf16_upcvt_gemm_run_torch);
   m.def("int2_fp16_dpas_gemm_run", &int2_fp16_dpas_gemm_run_torch);
   m.def("int1_fp16_upcvt_gemm_run", &int1_fp16_upcvt_gemm_run_torch);
+  m.def("bitcos_fp16_upcvt_gemm_run", &bitcos_fp16_upcvt_gemm_run_torch);
   m.def("int2_fp16_moe_gemv_run", &int2_fp16_moe_gemv_run_torch);
 }

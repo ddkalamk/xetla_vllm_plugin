@@ -252,14 +252,29 @@ def _xetla_prequant_try_load(layer: torch.nn.Module, prefix: str,
         dev = _xetla_target_device(layer)
         qkey = f"{lookup_prefix}.qweight"
         skey = f"{lookup_prefix}.scale"
+        rkey = f"{lookup_prefix}.slice_ranks"
+        ranks = None
         with safe_open(_xetla_prequant_load_path, framework="pt") as f:
             qw = f.get_tensor(qkey)
             sc = f.get_tensor(skey)
-        qw, sc = _xetla_shard_packed(layer, qw, sc)
+            if rkey in f.keys():
+                ranks = f.get_tensor(rkey)
+        if method == "bitcos_f16":
+            # The BITCOS buffer is a flat three-plane bitstream whose sign
+            # plane is data dependent, so it cannot be sliced like a regular
+            # packed matrix.
+            if (getattr(layer, "tp_size", 1) or 1) > 1:
+                raise ValueError(
+                    "bitcos_f16 sidecar cannot be sharded; repack per rank")
+        else:
+            qw, sc = _xetla_shard_packed(layer, qw, sc)
         layer.weight = torch.nn.Parameter(
             qw.to(dev).contiguous(), requires_grad=False)
         layer.scale = torch.nn.Parameter(
             sc.to(dev).contiguous(), requires_grad=False)
+        layer.xetla_slice_ranks = (
+            ranks.to(dev).contiguous() if ranks is not None and ranks.numel()
+            else None)
         layer.xetla_quantized = True
         # Re-derive dispatch capability locally (no need to store).
         if method == "int2_f16":
@@ -282,12 +297,16 @@ def _xetla_prequant_dump_record(prefix: str, layer: torch.nn.Module,
     try:
         qw = layer.weight.data.detach().to("cpu").contiguous()
         sc = layer.scale.data.detach().to("cpu").contiguous()
-        _xetla_prequant_dump_buf[prefix] = {
+        rec = {
             "qweight": qw,
             "scale": sc,
             "method": method,
             "kind": kind,
         }
+        ranks = getattr(layer, "xetla_slice_ranks", None)
+        if ranks is not None and ranks.numel():
+            rec["slice_ranks"] = ranks.detach().to("cpu").contiguous()
+        _xetla_prequant_dump_buf[prefix] = rec
     except Exception as e:
         print(f"[xetla] WARN: dump capture failed for {prefix}: {e}",
               flush=True)
@@ -306,6 +325,8 @@ def _xetla_prequant_flush_dump() -> None:
         for prefix, rec in _xetla_prequant_dump_buf.items():
             tensors[f"{prefix}.qweight"] = rec["qweight"]
             tensors[f"{prefix}.scale"] = rec["scale"]
+            if "slice_ranks" in rec:
+                tensors[f"{prefix}.slice_ranks"] = rec["slice_ranks"]
             layers_meta[prefix] = {
                 "kind": rec["kind"],
                 "qweight_shape": list(rec["qweight"].shape),
@@ -516,6 +537,145 @@ def pack_int1x32(codes):
     return packed
 
 
+# ---- BITCOS ternary weights: presence bitmap + compacted sign stream -------
+#
+# int2 spends 2 bits on every weight and int1 spends 1 bit but cannot express a
+# zero. BITCOS stores a presence bit per weight plus a sign bit per *non-zero*,
+# so a ternary matrix that is a fraction z zeros costs 2 - z bits per weight.
+BITCOS_F16_GROUP_SIZE = 128
+# Local-K slices the decode kernel is allowed to use. The prefix ranks cost
+# (slices-1) words per output column, which is negligible, and they let a slice
+# that does not start at k=0 find where its columns enter the sign stream.
+# The kernel infers the slice count from the rank table it is handed, so the
+# packer has to commit to it: a long reduction is worth splitting further.
+BITCOS_LOCAL_SLICES = 4
+BITCOS_LOCAL_SLICES_LONG_K = 8
+BITCOS_LONG_K = 8192
+
+
+def bitcos_slices_for(K: int, N: int) -> int:
+    """Slice count the decode kernel wants for this shape.
+
+    Measured on B70 with a >=2 GB rotating footprint at the checkpoint's own
+    density; a single cache-resident buffer ranks these the other way round.
+    """
+    if K >= BITCOS_LONG_K:          # long reduction: more slices to fill it
+        return BITCOS_LOCAL_SLICES_LONG_K
+    if N <= 4096 or (16384 <= N < 65536):
+        return BITCOS_LOCAL_SLICES_LONG_K
+    return BITCOS_LOCAL_SLICES
+
+
+def _to_int32_wrap(t: torch.Tensor) -> torch.Tensor:
+    """Reinterpret uint32-valued int64 data as signed int32 (torch has no
+    uint32), so the bit patterns survive the trip to the kernel."""
+    return torch.where(t >= 2 ** 31, t - 2 ** 32, t).to(torch.int32)
+
+
+def pack_bitcos(codes, slices: Optional[int] = None,
+                col_chunk: int = 2048):
+    """Pack int8 ternary codes [K, N] in {-1, 0, +1} into the BITCOS buffer.
+
+    One flat uint32 buffer holds three planes back to back:
+
+        [0,          K*N/32     )  bitmap  : bit c of word kp*N+n marks
+                                             k = kp*32 + c present in column n
+        [K*N/32,     K*N/32 + N )  offsets : first sign word of each column
+        [K*N/32 + N, ...        )  signs   : one bit per non-zero, column
+                                             major in increasing k, 1 -> -1
+
+    plus one pad word, because the kernel's sign window always gathers a high
+    word past the end of the last run.
+
+    Returns (buf int32 [total + 1], slice_ranks int32 [slices-1, N]).
+    """
+    K, N = codes.shape
+    assert K % 32 == 0, f"K ({K}) must be multiple of 32"
+    dev = codes.device
+    if slices is None:
+        slices = bitcos_slices_for(K, N)
+
+    present = codes != 0
+    nnz = present.sum(dim=0, dtype=torch.int64)              # [N]
+    words_per_col = (nnz + 31) // 32
+    offsets = torch.zeros(N, dtype=torch.int64, device=dev)
+    if N > 1:
+        offsets[1:] = torch.cumsum(words_per_col, 0)[:-1]
+    sign_words = int(words_per_col.sum().item())
+
+    bitmap_words = (K // 32) * N
+    buf = torch.zeros(bitmap_words + N + sign_words + 1,
+                      dtype=torch.int64, device=dev)
+    buf[bitmap_words:bitmap_words + N] = offsets
+
+    bitmap_view = buf[:bitmap_words].view(K // 32, N)
+    sign_base = bitmap_words + N
+    shifts = torch.arange(32, dtype=torch.int64, device=dev).view(1, 32, 1)
+
+    # Chunk over columns: the intermediate rank/bitmap tensors are [K, chunk],
+    # which for a fused gate_up would otherwise be several hundred MB.
+    for c0 in range(0, N, col_chunk):
+        c1 = min(c0 + col_chunk, N)
+        p = present[:, c0:c1]
+        bitmap_view[:, c0:c1] = (
+            (p.view(K // 32, 32, c1 - c0).to(torch.int64) << shifts).sum(dim=1))
+
+        neg = codes[:, c0:c1] < 0
+        if not bool(neg.any()):
+            continue
+        # Rank of each non-zero within its column, counted from k = 0.
+        pi = p.to(torch.int32)
+        rank = torch.cumsum(pi, dim=0) - pi
+        # Each column's run starts word aligned, so the global bit index is
+        # just the column's word offset in bits plus the within-column rank.
+        gbit = offsets[c0:c1].view(1, -1) * 32 + rank.to(torch.int64)
+        sel = gbit[neg]
+        # Every non-zero owns a distinct bit, so add == or here.
+        buf.scatter_add_(0, sign_base + (sel >> 5),
+                         torch.ones_like(sel) << (sel & 31))
+
+    if slices > 1:
+        slice_k = (K + slices - 1) // slices
+        rows = [present[:min(s * slice_k, K)].sum(dim=0, dtype=torch.int64)
+                for s in range(1, slices)]
+        slice_ranks = _to_int32_wrap(torch.stack(rows, 0))
+    else:
+        slice_ranks = torch.zeros((0, N), dtype=torch.int32, device=dev)
+
+    return _to_int32_wrap(buf), slice_ranks
+
+
+@torch.library.custom_op("xetla::bitcos_fp16_upcvt_gemm", mutates_args=())
+def xetla_bitcos_fp16_upcvt_gemm(
+    input: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
+    slice_ranks: Optional[torch.Tensor], bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """BITCOS ternary weight x fp16 act GEMM, per-K-group fp16 scales (gs=128).
+
+    input       : fp16  [M, K]
+    weight      : int32 [bitmap | offsets | signs | pad]  (flat)
+    scale       : fp16  [K/128, N]
+    slice_ranks : int32 [slices-1, N] or None
+    bias        : optional fp16 [N]
+    """
+    with Timer(input, weight):
+        out = torch.ops.xetla_int2.bitcos_fp16_upcvt_gemm_run(
+            input, weight, scale, slice_ranks, None
+        )
+    if bias is not None:
+        out = out + bias.to(out.dtype)
+    return out
+
+
+@xetla_bitcos_fp16_upcvt_gemm.register_fake
+def _xetla_bitcos_fp16_upcvt_gemm_fake(
+    input: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
+    slice_ranks: Optional[torch.Tensor], bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    # weight is a flat multi-plane buffer, so N comes from the scale plane.
+    return input.new_empty([input.shape[0], scale.shape[1]])
+
+
 def pack_int2_rowwise(codes):
     """Pack int8 codes in {-1,0,+1} of shape [rows, cols] into int32 words of
     shape [rows, cols/16], 16 consecutive column entries per word.
@@ -564,7 +724,7 @@ def xetla_quant_method():
             pass
     if not quant_method:
         quant_method = "int2"
-    if quant_method not in ["bf16", "int2", "int2_f16", "int1_f16"]:
+    if quant_method not in ["bf16", "int2", "int2_f16", "int1_f16", "bitcos_f16"]:
         raise ValueError(f"Unsupported xetla quantization method: {quant_method}")
     return quant_method
 
@@ -757,7 +917,7 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
 
         method = self.quant_config.method
         # Sidecar load short-circuit (Option B).
-        if (self.inplace and method in ("int2_f16", "int1_f16") and
+        if (self.inplace and method in ("int2_f16", "int1_f16", "bitcos_f16") and
                 _xetla_prequant_try_load(layer, self.prefix, method, "lm_head")):
             print(f"[xetla] sidecar hit: {self.prefix} lm_head ({method})")
             return
@@ -851,6 +1011,26 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
             layer._xetla_dpas_capable = False
             _xetla_pre_convert_bias(layer)
             _xetla_prequant_dump_record(self.prefix, layer, "int1_f16", "lm_head")
+        elif self.quant_config.method == "bitcos_f16":
+            if not self.inplace:
+                return
+            weight = layer.weight.data  # [vocab_size, hidden_size]
+            dev = weight.device
+            wkn = weight.detach().to("cpu", dtype=torch.float16).t().contiguous()
+            codes, scale_f16 = quantize_to_ternary_f16(wkn, BITCOS_F16_GROUP_SIZE)
+            packed, slice_ranks = pack_bitcos(codes)
+            print(f"Processing lm_head with method bitcos_f16: weight {tuple(weight.shape)} -> packed {tuple(packed.shape)}, scale {tuple(scale_f16.shape)}")
+            layer.weight = torch.nn.Parameter(
+                packed.to(dev).contiguous(), requires_grad=False
+            )
+            layer.scale = torch.nn.Parameter(
+                scale_f16.to(dev).contiguous(), requires_grad=False
+            )
+            layer.xetla_slice_ranks = slice_ranks.to(dev).contiguous()
+            layer.xetla_quantized = True
+            layer._xetla_dpas_capable = False
+            _xetla_pre_convert_bias(layer)
+            _xetla_prequant_dump_record(self.prefix, layer, "bitcos_f16", "lm_head")
         else:
             pass
 
@@ -890,6 +1070,19 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
                     out = out + b16
             else:
                 out = xetla_int1_fp16_upcvt_gemm(x16, layer.weight, layer.scale, b16)
+            return out if out.dtype == x.dtype else out.to(x.dtype)
+        if self.quant_config.method == "bitcos_f16" and getattr(layer, "xetla_quantized", False):
+            x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+            b16 = bias if bias is None or bias.dtype == torch.float16 else bias.to(torch.float16)
+            ranks = getattr(layer, "xetla_slice_ranks", None)
+            if not _xetla_is_compiling():
+                out = torch.ops.xetla_int2.bitcos_fp16_upcvt_gemm_run(
+                    x16, layer.weight, layer.scale, ranks, None)
+                if b16 is not None:
+                    out = out + b16
+            else:
+                out = xetla_bitcos_fp16_upcvt_gemm(
+                    x16, layer.weight, layer.scale, ranks, b16)
             return out if out.dtype == x.dtype else out.to(x.dtype)
         return super().apply(layer, x, bias)
 
@@ -1084,7 +1277,7 @@ class XetlaLinearMethod(LinearMethodBase):
         # zero memory. process_weights_after_loading() then swaps in the real
         # packed tensor from the sidecar.
         method = self.quant_config.method
-        if method in ("int2_f16", "int1_f16") and \
+        if method in ("int2_f16", "int1_f16", "bitcos_f16") and \
                 _xetla_prequant_lookup(self.prefix, method) is not None:
             from vllm.model_executor.parameter import ModelWeightParameter
             from vllm.model_executor.utils import set_weight_attrs
@@ -1113,7 +1306,7 @@ class XetlaLinearMethod(LinearMethodBase):
 
         method = self.quant_config.method
         # Sidecar load short-circuit (Option B).
-        if method in ("int2_f16", "int1_f16") and \
+        if method in ("int2_f16", "int1_f16", "bitcos_f16") and \
                 _xetla_prequant_try_load(layer, self.prefix, method, "linear"):
             print(f"[xetla] sidecar hit: {self.prefix} ({method})")
             return
@@ -1125,7 +1318,8 @@ class XetlaLinearMethod(LinearMethodBase):
                 f"[xetla] sidecar entry for {self.prefix} vanished between "
                 "create_weights() and process_weights_after_loading()")
 
-        if _xetla_prequant_load_path and method in ("int2_f16", "int1_f16"):
+        if _xetla_prequant_load_path and method in ("int2_f16", "int1_f16",
+                                                    "bitcos_f16"):
             # A sidecar is in use but this layer is not in it. That means the
             # offline packer decided the layer is not ternary/binary (e.g. the
             # vision tower, or a gate projection kept in fp16). Re-quantizing
@@ -1173,7 +1367,25 @@ class XetlaLinearMethod(LinearMethodBase):
             layer.scale = torch.nn.Parameter(
                 scale_f16.to(dev).contiguous(), requires_grad=False
             )
-            # int1 path has no DPAS variant.
+            layer._xetla_dpas_capable = False
+            layer.xetla_quantized = True
+            _xetla_pre_convert_bias(layer)
+            _xetla_prequant_dump_record(self.prefix, layer, method, "linear")
+        elif method == "bitcos_f16":
+            # Ternary fp16 weight stored as presence bitmap + compacted signs,
+            # so zeros cost one bit and carry no sign at all.
+            weight = layer.weight.data  # [N_out, K_in], any float dtype
+            dev = weight.device
+            # Pack on CPU: the intermediate rank tensors are K*N int32.
+            wkn = weight.detach().to("cpu", dtype=torch.float16).t().contiguous()
+            codes, scale_f16 = quantize_to_ternary_f16(wkn, BITCOS_F16_GROUP_SIZE)
+            packed, slice_ranks = pack_bitcos(codes)
+            layer.weight.data = packed.to(dev).contiguous()
+            layer.scale = torch.nn.Parameter(
+                scale_f16.to(dev).contiguous(), requires_grad=False
+            )
+            layer.xetla_slice_ranks = slice_ranks.to(dev).contiguous()
+            # BITCOS has no DPAS variant; the unpack is the whole kernel.
             layer._xetla_dpas_capable = False
             layer.xetla_quantized = True
             _xetla_pre_convert_bias(layer)
@@ -1189,7 +1401,7 @@ class XetlaLinearMethod(LinearMethodBase):
         method = self.quant_config.method
         if method == "int2":
             return xetla_int2_bf16_fused_gemm(x, layer.weight, layer.scale, bias)
-        if method in ("int2_f16", "int1_f16") and \
+        if method in ("int2_f16", "int1_f16", "bitcos_f16") and \
                 not getattr(layer, "xetla_quantized", False):
             # Layer was deliberately left dense (mixed-precision checkpoint).
             return UnquantizedLinearMethod.apply(self, layer, x, bias)
@@ -1223,6 +1435,19 @@ class XetlaLinearMethod(LinearMethodBase):
             else:
                 c = xetla_int1_fp16_upcvt_gemm(x16, layer.weight, layer.scale, b16)
             return c if c.dtype == x.dtype else c.to(x.dtype)
+        if method == "bitcos_f16":
+            x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+            b16 = bias if bias is None or bias.dtype == torch.float16 else bias.to(torch.float16)
+            ranks = getattr(layer, "xetla_slice_ranks", None)
+            if not _xetla_is_compiling():
+                c = torch.ops.xetla_int2.bitcos_fp16_upcvt_gemm_run(
+                    x16, layer.weight, layer.scale, ranks, None)
+                if b16 is not None:
+                    c = c + b16
+            else:
+                c = xetla_bitcos_fp16_upcvt_gemm(
+                    x16, layer.weight, layer.scale, ranks, b16)
+            return c if c.dtype == x.dtype else c.to(x.dtype)
         return UnquantizedLinearMethod.apply(self, layer, x, bias)
 
 
@@ -1242,6 +1467,11 @@ def _xprof_bytes(op_name: str, m: int, n: int, k: int) -> int:
     a = m * k * fp16_b
     c = m * n * fp16_b
     if "int2_fp16" in op_name:
+        b = k * n // 4
+        sb = (k // 128) * n * fp16_b
+    elif "bitcos" in op_name:
+        # Data dependent; the caller passes the real buffer size as `n` bytes
+        # only for the dense planes, so bound it by the 2-bit worst case.
         b = k * n // 4
         sb = (k // 128) * n * fp16_b
     elif "int1_fp16" in op_name:
@@ -1267,7 +1497,9 @@ def _xprof_capturing() -> bool:
 
 def _xprof_wrap(op, op_name: str):
     def wrapped(A, B, scale_B, *rest, **kw):
-        m = int(A.shape[0]); k = int(A.shape[1]); n = int(B.shape[1])
+        m = int(A.shape[0]); k = int(A.shape[1])
+        # BITCOS packs every plane into one flat buffer, so N lives on scale.
+        n = int(B.shape[1]) if B.dim() > 1 else int(scale_B.shape[1])
         capturing = _xprof_capturing()
         if not capturing:
             torch.xpu.synchronize()
@@ -1335,6 +1567,7 @@ def _install_xetla_profile():
         "int2_fp16_upcvt_gemm_run",
         "int2_fp16_dpas_gemm_run",
         "int1_fp16_upcvt_gemm_run",
+        "bitcos_fp16_upcvt_gemm_run",
         "int2_bf16_fused_gemm_run",
     ]
     installed = []
@@ -1406,7 +1639,7 @@ def _xetla_quantize_lm_head(model: torch.nn.Module) -> None:
     if not quantize_lm_heads or not current_platform.is_xpu():
         return
     method = xetla_quant_method()
-    if method not in ("int2_f16", "int1_f16"):
+    if method not in ("int2_f16", "int1_f16", "bitcos_f16"):
         return
     try:
         config = XetlaConfig()

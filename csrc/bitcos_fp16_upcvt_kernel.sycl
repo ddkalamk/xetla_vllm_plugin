@@ -1,0 +1,479 @@
+/*******************************************************************************
+ * BITCOS ternary weight-only GEMM with fp16 activations and per-K-group fp16
+ * scales. Mirrors the kernel exercised by
+ *   xetla/bitcos_fp16_dpas_fp16scales_fast_test.
+ *
+ *   C[m,n] = sum_k  A[m,k] * (code(k,n) * ScaleB[k/gs, n]),  code in {-1,0,+1}
+ *
+ *   A      : fp16, row-major, [M, K]
+ *   B      : uint32 buffer holding three planes back to back
+ *              [0            , K*N/32      )  bitmap  : bit c of word kp*N+n
+ *                                                       marks k = kp*32 + c
+ *                                                       present in column n
+ *              [K*N/32       , K*N/32 + N  )  offsets : word index where each
+ *                                                       column's sign run starts
+ *              [K*N/32 + N   , ...         )  signs   : one bit per non-zero,
+ *                                                       column-major, 1 -> -1
+ *            plus one readable pad word, because the sign window always
+ *            gathers a high word past the last run.
+ *   ScaleB : fp16, row-major, [K/gs, N]      (gs = 128, fixed at compile time)
+ *   C      : fp16, row-major, [M, N]
+ *
+ * Unlike int2 (fixed 2 bits) and int1 (sign only, no zeros), BITCOS spends no
+ * sign bit on a zero weight, so the format costs 2-z bits per weight.
+ *
+ * slice_ranks is the per-column prefix population count at each local-K-slice
+ * boundary. It is required when LS > 1, because a slice that does not start at
+ * k = 0 cannot know where its columns enter the compacted sign stream.
+ *******************************************************************************/
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+#include <utility>
+
+#include "timing_utils.h"
+#include "xetla.hpp"
+
+using namespace gpu::xetla;
+using namespace sycl;
+
+namespace {
+
+// Fixed K-group for the fp16-scales upcvt kernel (matches the xetla test).
+static constexpr int kScaleGS = 128;
+
+// Unique kernel-name tag to avoid mangled-name collisions between
+// (WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned) instantiations.
+template <
+    int WGM, int WGN, int SGM, int SGN, int SGK, int KS, int LS,
+    bool kUnaligned>
+class bitcos_fp16_upcvt_kernel_tag;
+
+template <
+    int WGM, int WGN, int SGM, int SGN, int SGK, int KS, int LS,
+    bool kUnaligned>
+sycl::event bitcos_fp16_upcvt_gemm_impl(
+    sycl::queue& queue, const size_t M, const size_t N, const size_t K,
+    sycl::half* A_d, int32_t* B_d, sycl::half* C_d, sycl::half* ScaleB_d,
+    uint32_t* SliceRanks_d, float* Acc_d, uint32_t* Cnt_d) {
+  using fp16_t = gpu::xetla::fp16;
+  using data_type_a = fp16_t;
+  using data_type_b = int1x32;
+  using data_type_c = fp16_t;
+  using data_type_acc = float;
+  using data_type_scale = fp16_t;
+
+  constexpr int wg_tile_m = WGM;
+  constexpr int wg_tile_n = WGN;
+  constexpr int sg_tile_m = SGM;
+  constexpr int sg_tile_n = SGN;
+  constexpr int sg_tile_k = SGK;
+  constexpr uint32_t prefetch_distance = 0;
+  constexpr uint32_t periodic_sync_interval = 0;
+  constexpr uint32_t global_kslicing = KS;
+  constexpr uint32_t local_kslicing = LS;
+
+  static constexpr gpu_arch arch_tag = gpu_arch::Xe;
+
+  using tile_shape = gpu::xetla::group::tile_shape_t<
+      wg_tile_n, wg_tile_m, sg_tile_n, sg_tile_m>;
+  using mem_desc_a_t = gpu::xetla::mem_desc_t<
+      data_type_a, mem_layout::row_major, mem_space::global>;
+  using mem_desc_b_t = gpu::xetla::mem_desc_t<
+      data_type_b, mem_layout::row_major, mem_space::global>;
+  using mem_desc_c_t = gpu::xetla::mem_desc_t<
+      data_type_c, mem_layout::row_major, mem_space::global>;
+
+  using compute_attr = gpu::xetla::group::compute_attr_t<
+      data_type_a, data_type_a, data_type_acc>;
+  using perf_tuning_knob = gpu::xetla::group::perf_tuning_knob_t<
+      sg_tile_k, prefetch_distance, periodic_sync_interval>;
+  using compute_policy =
+      gpu::xetla::group::compute_policy_bitcos_fp16_upcvt_xmx<
+          compute_attr, perf_tuning_knob, data_type_scale, kScaleGS,
+          /*mma_xmx_m=*/SGM, arch_tag, /*use_unaligned_n=*/kUnaligned>;
+  using gemm_t = gpu::xetla::group::gemm_t<
+      compute_policy, tile_shape, mem_desc_a_t, mem_desc_b_t>;
+
+  using epilogue_policy_t = std::conditional_t<
+      kUnaligned, gpu::xetla::group::epilogue_policy_unaligned<arch_tag>,
+      gpu::xetla::group::epilogue_policy_default<arch_tag>>;
+  using mem_desc_c_epilogue_t = std::conditional_t<
+      kUnaligned,
+      gpu::xetla::mem_desc_t<
+          data_type_c, mem_layout::row_major, mem_space::global,
+          /*alignment=*/1>,
+      mem_desc_c_t>;
+  using epilogue_t = gpu::xetla::group::epilogue_t<
+      epilogue_policy_t, tile_shape, mem_desc_c_epilogue_t>;
+
+  using group_swizzle = gpu::xetla::kernel::group_swizzle_default<arch_tag>;
+  using gemm_op_t = gpu::xetla::kernel::gemm_universal_t<
+      gpu::xetla::kernel::dispatch_policy_bitcos_fp16_upcvt_kslicing<
+          group_swizzle, global_kslicing, local_kslicing>,
+      gemm_t, epilogue_t>;
+
+  uint32_t lda = static_cast<uint32_t>(K);
+  uint32_t ldb = static_cast<uint32_t>(N);
+  uint32_t ldc = static_cast<uint32_t>(N);
+  uint32_t lds = static_cast<uint32_t>(N);
+
+  // The offsets and signs planes sit at fixed word offsets behind the bitmap.
+  uint32_t* b_words = reinterpret_cast<uint32_t*>(B_d);
+  const size_t offsets_word_base = (K / 32) * N;
+  const size_t signs_word_base = offsets_word_base + N;
+
+  typename gemm_op_t::arguments_t gemm_arg(
+      static_cast<uint32_t>(M), static_cast<uint32_t>(K),
+      static_cast<uint32_t>(N), A_d, lda, reinterpret_cast<int1x32*>(B_d), ldb,
+      C_d, ldc, ScaleB_d, lds, b_words + signs_word_base,
+      b_words + offsets_word_base, SliceRanks_d, Acc_d, Cnt_d);
+
+  if (!gemm_op_t::can_implement(gemm_arg)) {
+    std::cout << "bitcos_fp16_upcvt: arguments not supported (M=" << M
+              << " N=" << N << " K=" << K << ")\n";
+    exit(1);
+  }
+  sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
+
+  using kernel_name_t = bitcos_fp16_upcvt_kernel_tag<
+      WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned>;
+
+  Timer t("bitcos_fp16_upcvt_submit");
+  return queue.submit([&](handler& cgh) {
+    cgh.parallel_for<kernel_name_t>(
+        nd_range, [=](nd_item<3> item) KERNEL_MAIN {
+          slm_barrier_init<gemm_op_t>();
+          gemm_op_t gemm_op;
+          gemm_op(item, gemm_arg);
+        });
+  });
+}
+
+// Per-process scratch (Acc, Cnt) reused across calls.
+struct BitcosUpcvtScratch {
+  float* acc = nullptr;
+  uint32_t* cnt = nullptr;
+  size_t acc_bytes = 0;
+  size_t cnt_bytes = 0;
+};
+
+BitcosUpcvtScratch& get_bitcos_scratch(
+    sycl::queue& q, size_t need_acc_bytes, size_t need_cnt_bytes) {
+  static BitcosUpcvtScratch s;
+  if (s.acc_bytes < need_acc_bytes) {
+    if (s.acc)
+      sycl::free(s.acc, q.get_context());
+    s.acc = static_cast<float*>(sycl::aligned_alloc_device(
+        256, need_acc_bytes, q.get_device(), q.get_context()));
+    s.acc_bytes = need_acc_bytes;
+    q.memset(s.acc, 0, need_acc_bytes);
+  }
+  if (s.cnt_bytes < need_cnt_bytes) {
+    if (s.cnt)
+      sycl::free(s.cnt, q.get_context());
+    s.cnt = static_cast<uint32_t*>(sycl::aligned_alloc_device(
+        256, need_cnt_bytes, q.get_device(), q.get_context()));
+    s.cnt_bytes = need_cnt_bytes;
+    q.memset(s.cnt, 0, need_cnt_bytes);
+  }
+  return s;
+}
+
+template <
+    int WGM, int WGN, int SGM, int SGN, int SGK, int KS, int LS,
+    bool kUnaligned>
+std::pair<size_t, size_t> bitcos_upcvt_scratch_bytes(size_t M, size_t N) {
+  using fp16_t = gpu::xetla::fp16;
+  using data_type_a = fp16_t;
+  using data_type_b = int1x32;
+  using data_type_c = fp16_t;
+  using data_type_acc = float;
+  using data_type_scale = fp16_t;
+  static constexpr gpu_arch arch_tag = gpu_arch::Xe;
+  using tile_shape = gpu::xetla::group::tile_shape_t<WGN, WGM, SGN, SGM>;
+  using mem_desc_a_t = gpu::xetla::mem_desc_t<
+      data_type_a, mem_layout::row_major, mem_space::global>;
+  using mem_desc_b_t = gpu::xetla::mem_desc_t<
+      data_type_b, mem_layout::row_major, mem_space::global>;
+  using mem_desc_c_t = gpu::xetla::mem_desc_t<
+      data_type_c, mem_layout::row_major, mem_space::global>;
+  using compute_attr = gpu::xetla::group::compute_attr_t<
+      data_type_a, data_type_a, data_type_acc>;
+  using perf_tuning_knob = gpu::xetla::group::perf_tuning_knob_t<SGK, 0, 0>;
+  using compute_policy =
+      gpu::xetla::group::compute_policy_bitcos_fp16_upcvt_xmx<
+          compute_attr, perf_tuning_knob, data_type_scale, kScaleGS, SGM,
+          arch_tag, kUnaligned>;
+  using gemm_t = gpu::xetla::group::gemm_t<
+      compute_policy, tile_shape, mem_desc_a_t, mem_desc_b_t>;
+  using epilogue_policy_t = std::conditional_t<
+      kUnaligned, gpu::xetla::group::epilogue_policy_unaligned<arch_tag>,
+      gpu::xetla::group::epilogue_policy_default<arch_tag>>;
+  using mem_desc_c_epilogue_t = std::conditional_t<
+      kUnaligned,
+      gpu::xetla::mem_desc_t<
+          data_type_c, mem_layout::row_major, mem_space::global, 1>,
+      mem_desc_c_t>;
+  using epilogue_t = gpu::xetla::group::epilogue_t<
+      epilogue_policy_t, tile_shape, mem_desc_c_epilogue_t>;
+  using group_swizzle = gpu::xetla::kernel::group_swizzle_default<arch_tag>;
+  using gemm_op_t = gpu::xetla::kernel::gemm_universal_t<
+      gpu::xetla::kernel::dispatch_policy_bitcos_fp16_upcvt_kslicing<
+          group_swizzle, KS, LS>,
+      gemm_t, epilogue_t>;
+  size_t acc_elems = gemm_op_t::get_acc_buf_size(M, N);
+  size_t cnt_elems = gemm_op_t::get_cnt_buf_size(M, N);
+  return {acc_elems * sizeof(data_type_acc), cnt_elems * sizeof(uint32_t)};
+}
+
+} // namespace
+
+// Prefill tile selector, so the M>1 tile can be swept without a rebuild.
+static int bitcos_prefill_cfg() {
+  static const int cfg = [] {
+    const char* e = std::getenv("XETLA_BITCOS_PREFILL_CFG");
+    return e ? std::atoi(e) : 0;
+  }();
+  return cfg;
+}
+
+// Decode tile selector; -1 keeps the tuned per-shape tiers below.
+static int bitcos_decode_cfg() {
+  static const int cfg = [] {
+    const char* e = std::getenv("XETLA_BITCOS_DECODE_CFG");
+    return e ? std::atoi(e) : -1;
+  }();
+  return cfg;
+}
+
+// -- Public entry point: pick a precompiled variant based on (M, N) ----------
+//
+// sg_n = 16 and sg_k = 64 are the tuned inner tile from the standalone shmoo on
+// both B70 and Lunar Lake; wg_n and LS are what actually move with the shape.
+// LS > 1 needs slice_ranks, so it is only reachable when the caller supplied
+// them.
+sycl::event bitcos_fp16_upcvt_gemm_run(
+    sycl::queue& q, const size_t M, const size_t N, const size_t K,
+    sycl::half* A, int32_t* B, sycl::half* C, sycl::half* ScaleB,
+    uint32_t* SliceRanks, int slice_count) {
+  const bool aligned_n = (N % 4 == 0);
+  const int slices = (SliceRanks != nullptr) ? slice_count : 1;
+
+  // The kslicing scratch depends on the tile, so it has to bound *every*
+  // variant this function can reach. Sizing it from a single tile silently
+  // corrupts memory as soon as a wider wg_n is dispatched.
+  size_t need_acc = 0, need_cnt = 0;
+  auto widen = [&](std::pair<size_t, size_t> p) {
+    need_acc = std::max(need_acc, p.first);
+    need_cnt = std::max(need_cnt, p.second);
+  };
+#define BITCOS_SCRATCH(WGM_, WGN_, SGM_, SGN_, SGK_, LS_)                     \
+  widen(bitcos_upcvt_scratch_bytes<WGM_, WGN_, SGM_, SGN_, SGK_, 1, LS_,      \
+                                   false>(M, N));                             \
+  widen(bitcos_upcvt_scratch_bytes<WGM_, WGN_, SGM_, SGN_, SGK_, 1, LS_,      \
+                                   true>(M, N))
+  BITCOS_SCRATCH(1, 32, 1, 16, 64, 1);
+  BITCOS_SCRATCH(1, 64, 1, 16, 64, 1);
+  BITCOS_SCRATCH(1, 128, 1, 16, 64, 1);
+  BITCOS_SCRATCH(1, 256, 1, 16, 64, 1);
+  BITCOS_SCRATCH(1, 32, 1, 16, 64, 4);
+  BITCOS_SCRATCH(1, 64, 1, 16, 64, 4);
+  BITCOS_SCRATCH(1, 128, 1, 16, 64, 4);
+  BITCOS_SCRATCH(1, 256, 1, 16, 64, 4);
+  BITCOS_SCRATCH(1, 32, 1, 16, 64, 8);
+  BITCOS_SCRATCH(1, 64, 1, 16, 64, 8);
+  BITCOS_SCRATCH(1, 128, 1, 16, 64, 8);
+  BITCOS_SCRATCH(1, 256, 1, 16, 64, 8);
+  BITCOS_SCRATCH(1, 128, 1, 16, 128, 1);
+  BITCOS_SCRATCH(1, 128, 1, 16, 128, 4);
+  BITCOS_SCRATCH(1, 256, 1, 16, 128, 4);
+  BITCOS_SCRATCH(16, 64, 8, 16, 64, 1);
+  BITCOS_SCRATCH(32, 64, 8, 16, 64, 1);
+  BITCOS_SCRATCH(32, 128, 8, 32, 64, 1);
+  BITCOS_SCRATCH(64, 64, 8, 32, 64, 1);
+  BITCOS_SCRATCH(8, 128, 8, 16, 64, 1);
+  BITCOS_SCRATCH(32, 64, 8, 16, 32, 1);
+#undef BITCOS_SCRATCH
+  auto& sc = get_bitcos_scratch(q, need_acc, need_cnt);
+
+#define BITCOS_DISPATCH_MN(WGM_, WGN_, SGM_, SGN_, SGK_, LS_, RANKS_)         \
+  do {                                                                        \
+    if (aligned_n)                                                            \
+      return bitcos_fp16_upcvt_gemm_impl<                                     \
+          WGM_, WGN_, SGM_, SGN_, SGK_, /*KS*/ 1, LS_,                        \
+          /*kUnaligned*/ false>(                                              \
+          q, M, N, K, A, B, C, ScaleB, RANKS_, sc.acc, sc.cnt);               \
+    else                                                                      \
+      return bitcos_fp16_upcvt_gemm_impl<                                     \
+          WGM_, WGN_, SGM_, SGN_, SGK_, /*KS*/ 1, LS_,                        \
+          /*kUnaligned*/ true>(                                               \
+          q, M, N, K, A, B, C, ScaleB, RANKS_, sc.acc, sc.cnt);               \
+  } while (0)
+
+#define BITCOS_DISPATCH(WGN_, LS_, RANKS_)                                    \
+  BITCOS_DISPATCH_MN(1, WGN_, 1, 16, 64, LS_, RANKS_)
+
+#define BITCOS_DISPATCH_K(WGN_, SGK_, LS_, RANKS_)                            \
+  BITCOS_DISPATCH_MN(1, WGN_, 1, 16, SGK_, LS_, RANKS_)
+
+// wg_n is a compile-time tile, so the runtime choice is a small switch.
+#define BITCOS_PICK(WGN_RT, LS_, RANKS_)                                      \
+  do {                                                                        \
+    switch (WGN_RT) {                                                         \
+      case 256: BITCOS_DISPATCH(256, LS_, RANKS_);                            \
+      case 128: BITCOS_DISPATCH(128, LS_, RANKS_);                            \
+      case 64: BITCOS_DISPATCH(64, LS_, RANKS_);                              \
+      default: BITCOS_DISPATCH(32, LS_, RANKS_);                              \
+    }                                                                         \
+  } while (0)
+
+  // A partial n tile walks off the end of the weight planes, so only consider
+  // a workgroup width that divides N.
+  auto widest_upto = [&](size_t cap) -> int {
+    for (int w : {256, 128, 64, 32})
+      if (static_cast<size_t>(w) <= cap && N % static_cast<size_t>(w) == 0)
+        return w;
+    return 32;
+  };
+
+  if (M == 1) {
+    const int dcfg = bitcos_decode_cfg();
+    if (dcfg >= 0) {
+      switch (dcfg) {
+        case 0: BITCOS_DISPATCH(32, 1, nullptr);
+        case 1: if (N % 64 == 0) BITCOS_DISPATCH(64, 1, nullptr); break;
+        case 2: if (N % 128 == 0) BITCOS_DISPATCH(128, 1, nullptr); break;
+        case 3: if (N % 256 == 0) BITCOS_DISPATCH(256, 1, nullptr); break;
+        case 4: BITCOS_DISPATCH(32, 4, SliceRanks);
+        case 5: if (N % 64 == 0) BITCOS_DISPATCH(64, 4, SliceRanks); break;
+        case 6: if (N % 128 == 0) BITCOS_DISPATCH(128, 4, SliceRanks); break;
+        case 7: if (N % 256 == 0) BITCOS_DISPATCH(256, 4, SliceRanks); break;
+        case 8: if (N % 128 == 0) BITCOS_DISPATCH_K(128, 128, 1, nullptr); break;
+        case 9: if (N % 128 == 0) BITCOS_DISPATCH_K(128, 128, 4, SliceRanks); break;
+        case 10: if (N % 256 == 0) BITCOS_DISPATCH_K(256, 128, 4, SliceRanks); break;
+        case 11: BITCOS_DISPATCH(32, 8, SliceRanks);
+        case 12: if (N % 64 == 0) BITCOS_DISPATCH(64, 8, SliceRanks); break;
+        case 13: if (N % 128 == 0) BITCOS_DISPATCH(128, 8, SliceRanks); break;
+        case 14: break;  // wg_n=256 with LS=8 exceeds the work-group limit
+        default: break;
+      }
+    }
+    // Measured on B70 with a >=2 GB rotating footprint at the checkpoint's own
+    // density. A work-group holds at most 64 subgroups, i.e.
+    // (wg_n / sg_n) * LS <= 64, which is why LS=8 stops at wg_n=128.
+    if (slices == 8) {
+      BITCOS_PICK(widest_upto(128), 8, SliceRanks);
+    }
+    if (slices == 4) {
+      BITCOS_PICK(widest_upto(64), 4, SliceRanks);
+    }
+    BITCOS_PICK(widest_upto(N <= 8192 ? 128 : 256), 1, nullptr);
+  }
+
+  // Prefill. A GEMV tile (wg_tile_m == 1) would walk the whole weight matrix
+  // once per row, so M > 1 needs a tile that actually reuses the unpacked
+  // weights across rows.
+  const int cfg = bitcos_prefill_cfg();
+  switch (cfg) {
+    case 1:
+      BITCOS_DISPATCH_MN(16, 64, 8, 16, 64, 1, nullptr);
+    case 2:
+      BITCOS_DISPATCH_MN(32, 64, 8, 16, 64, 1, nullptr);
+    case 3:
+      BITCOS_DISPATCH_MN(32, 128, 8, 32, 64, 1, nullptr);
+    case 4:
+      // XMX repeat count is sg_tile_m and must stay within 1..8.
+      BITCOS_DISPATCH_MN(64, 64, 8, 32, 64, 1, nullptr);
+    case 5:
+      BITCOS_DISPATCH_MN(8, 128, 8, 16, 64, 1, nullptr);
+    default:
+      // Measured best across M=512 and M=8192 on B70 against the shapes of
+      // Bonsai 8B. BITCOS has no DPAS twin yet, so long prefills still trail
+      // the int2 DPAS kernel; decode is where the format pays off.
+      BITCOS_DISPATCH_MN(16, 64, 8, 16, 64, 1, nullptr);
+  }
+#undef BITCOS_PICK
+#undef BITCOS_DISPATCH
+#undef BITCOS_DISPATCH_K
+#undef BITCOS_DISPATCH_MN
+}
+
+// ---------------------------------------------------------------------------
+// Torch op binding.
+
+torch::Tensor bitcos_fp16_upcvt_gemm_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
+    std::optional<torch::Tensor> slice_ranks = std::nullopt,
+    std::optional<torch::Tensor> C_out = std::nullopt) {
+  RECORD_FUNCTION("bitcos_fp16_upcvt_gemm", {A, B});
+  Timer t_("bitcos_fp16_upcvt_gemm");
+  TORCH_CHECK(A.dtype() == torch::kHalf, "A must be fp16");
+  TORCH_CHECK(B.dtype() == torch::kInt32, "B must be int32 (BITCOS planes)");
+  TORCH_CHECK(scale_B.dtype() == torch::kHalf, "scale_B must be fp16");
+  TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+  TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+  TORCH_CHECK(scale_B.is_contiguous(), "scale_B must be contiguous");
+  TORCH_CHECK(A.device().is_xpu(), "A must be on XPU");
+  TORCH_CHECK(
+      B.device().is_xpu() && scale_B.device().is_xpu(), "B/scale on XPU");
+  TORCH_CHECK(A.dim() == 2 && scale_B.dim() == 2, "A, scale_B must be 2D");
+
+  long m = A.size(0);
+  long k = A.size(1);
+  // B is a flat multi-plane buffer, so N comes from the scale plane.
+  long n = scale_B.size(1);
+  TORCH_CHECK(k % 32 == 0, "k must be multiple of 32 (bitmap word)");
+  TORCH_CHECK(k % 128 == 0, "k must be multiple of 128 (scale group size)");
+  TORCH_CHECK(scale_B.size(0) == k / 128, "scale_B.size(0) must be k/128");
+
+  const int64_t bitmap_words = static_cast<int64_t>(k / 32) * n;
+  TORCH_CHECK(
+      B.numel() > bitmap_words + n,
+      "B must hold bitmap, offsets, signs and one pad word");
+
+  uint32_t* ranks_ptr = nullptr;
+  int slice_count = 1;
+  if (slice_ranks.has_value() && slice_ranks->numel() > 0) {
+    TORCH_CHECK(
+        slice_ranks->dtype() == torch::kInt32, "slice_ranks must be int32");
+    TORCH_CHECK(
+        slice_ranks->is_contiguous() && slice_ranks->device().is_xpu(),
+        "slice_ranks must be contiguous XPU");
+    TORCH_CHECK(
+        slice_ranks->dim() == 2 && slice_ranks->size(1) == n,
+        "slice_ranks must be [slices-1, n]");
+    slice_count = static_cast<int>(slice_ranks->size(0)) + 1;
+    ranks_ptr = reinterpret_cast<uint32_t*>(slice_ranks->data_ptr<int32_t>());
+  }
+
+  torch::Tensor C;
+  if (C_out.has_value()) {
+    TORCH_CHECK(C_out->dtype() == torch::kHalf, "C must be fp16");
+    TORCH_CHECK(
+        C_out->is_contiguous() && C_out->device().is_xpu(),
+        "C must be contiguous XPU");
+    TORCH_CHECK(C_out->size(0) == m && C_out->size(1) == n, "C shape mismatch");
+    C = *C_out;
+  } else {
+    C = A.new_empty({m, n}, torch::kHalf);
+  }
+
+  auto q = c10::xpu::getCurrentXPUStream(A.device().index()).queue();
+  sycl::half* a_ptr = reinterpret_cast<sycl::half*>(A.data_ptr<at::Half>());
+  int32_t* b_ptr = B.data_ptr<int32_t>();
+  sycl::half* c_ptr = reinterpret_cast<sycl::half*>(C.data_ptr<at::Half>());
+  sycl::half* sb_ptr =
+      reinterpret_cast<sycl::half*>(scale_B.data_ptr<at::Half>());
+
+  {
+    RECORD_FUNCTION("bitcos_fp16_upcvt_gemm_run", {});
+    Timer t__("bitcos_fp16_upcvt_gemm_run");
+    bitcos_fp16_upcvt_gemm_run(
+        q, static_cast<size_t>(m), static_cast<size_t>(n),
+        static_cast<size_t>(k), a_ptr, b_ptr, c_ptr, sb_ptr, ranks_ptr,
+        slice_count);
+  }
+  return C;
+}

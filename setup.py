@@ -44,7 +44,12 @@ setup(
             include_dirs = include_dirs,
             extra_compile_args={
                 'cxx': ['-O3', '-std=c++20'],
-                'sycl': ['-O3', '-std=c++20', '-Wno-unusable-partial-specialization', '-Xsycl-target-backend="-vc-codegen -vc-disable-indvars-opt -Xfinalizer \' -printregusage -enableBCR -DPASTokenReduction \' -doubleGRF"'],
+                'sycl': ['-O3', '-std=c++20', '-Wno-unusable-partial-specialization',
+                         # BITCOS SOTA unpack: fp16 SLM LUT, exact 3-word sign
+                         # gather, fp16 store. See xetla bitcos test Makefile.
+                         '-DBITCOS_FP16_LUT', '-DBITCOS_SIGN_GATHER4',
+                         '-DBITCOS_SIGN_GATHER3', '-DBITCOS_FP_STORE',
+                         '-Xsycl-target-backend="-vc-codegen -vc-disable-indvars-opt -Xfinalizer \' -printregusage -enableBCR -DPASTokenReduction \' -doubleGRF"'],
             },
         ),
     ],

@@ -31,6 +31,9 @@ def parse_args():
     p.add_argument("--no-warmup", action="store_true",
                    help="report cold TTFT, including jit and first-touch cost")
     p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument("--max-num-batched-tokens", type=int, default=None,
+                   help="prefill token budget; lowering it shrinks the "
+                        "activation peak that memory profiling reserves")
     p.add_argument("--text-only", action="store_true")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--pipeline-parallel-size", type=int, default=1)
@@ -55,6 +58,8 @@ def main():
     if a.cudagraph_sizes:
         sizes = [int(s) for s in a.cudagraph_sizes.split(",")]
         extra["compilation_config"] = {"cudagraph_capture_sizes": sizes}
+    if a.max_num_batched_tokens:
+        extra["max_num_batched_tokens"] = a.max_num_batched_tokens
 
     t0 = time.perf_counter()
     llm = LLM(model=a.model, tokenizer=a.tokenizer or a.model,
