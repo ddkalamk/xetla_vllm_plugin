@@ -924,8 +924,9 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
 
         # Input embedding: the table is ternary in Bonsai checkpoints, but it
         # is looked up rather than multiplied, so it uses the row-major packed
-        # layout and is unpacked per token in embedding().
-        if not self.inplace and method == "int2_f16":
+        # layout and is unpacked per token in embedding(). The lookup is
+        # independent of the GEMM format, so bitcos reuses the same table.
+        if not self.inplace and method in ("int2_f16", "bitcos_f16"):
             lookup = _xetla_prequant_lookup(self.prefix, method)
             if lookup is not None:
                 try:
