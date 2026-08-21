@@ -162,6 +162,9 @@ struct BitcosUpcvtScratch {
 BitcosUpcvtScratch& get_bitcos_scratch(
     sycl::queue& q, size_t need_acc_bytes, size_t need_cnt_bytes) {
   static BitcosUpcvtScratch s;
+  // XETLA_SCRATCH_DEBUG: this is sycl-allocated, so it is invisible to torch
+  // and surfaces only as vLLM's "non-torch forward increase".
+  static const bool dbg = std::getenv("XETLA_SCRATCH_DEBUG") != nullptr;
   if (s.acc_bytes < need_acc_bytes) {
     if (s.acc)
       sycl::free(s.acc, q.get_context());
@@ -169,6 +172,9 @@ BitcosUpcvtScratch& get_bitcos_scratch(
         256, need_acc_bytes, q.get_device(), q.get_context()));
     s.acc_bytes = need_acc_bytes;
     q.memset(s.acc, 0, need_acc_bytes);
+    if (dbg)
+      fprintf(stderr, "[xetla] bitcos acc scratch -> %.3f GiB\n",
+              need_acc_bytes / 1073741824.0);
   }
   if (s.cnt_bytes < need_cnt_bytes) {
     if (s.cnt)
@@ -177,6 +183,9 @@ BitcosUpcvtScratch& get_bitcos_scratch(
         256, need_cnt_bytes, q.get_device(), q.get_context()));
     s.cnt_bytes = need_cnt_bytes;
     q.memset(s.cnt, 0, need_cnt_bytes);
+    if (dbg)
+      fprintf(stderr, "[xetla] bitcos cnt scratch -> %.3f GiB\n",
+              need_cnt_bytes / 1073741824.0);
   }
   return s;
 }
@@ -274,28 +283,34 @@ sycl::event bitcos_fp16_upcvt_gemm_run(
                                    false>(M, N));                             \
   widen(bitcos_upcvt_scratch_bytes<WGM_, WGN_, SGM_, SGN_, SGK_, 1, LS_,      \
                                    true>(M, N))
-  BITCOS_SCRATCH(1, 32, 1, 16, 64, 1);
-  BITCOS_SCRATCH(1, 64, 1, 16, 64, 1);
-  BITCOS_SCRATCH(1, 128, 1, 16, 64, 1);
-  BITCOS_SCRATCH(1, 256, 1, 16, 64, 1);
-  BITCOS_SCRATCH(1, 32, 1, 16, 64, 4);
-  BITCOS_SCRATCH(1, 64, 1, 16, 64, 4);
-  BITCOS_SCRATCH(1, 128, 1, 16, 64, 4);
-  BITCOS_SCRATCH(1, 256, 1, 16, 64, 4);
-  BITCOS_SCRATCH(1, 32, 1, 16, 64, 8);
-  BITCOS_SCRATCH(1, 64, 1, 16, 64, 8);
-  BITCOS_SCRATCH(1, 128, 1, 16, 64, 8);
-  BITCOS_SCRATCH(1, 256, 1, 16, 64, 8);
-  BITCOS_SCRATCH(1, 128, 1, 16, 128, 1);
-  BITCOS_SCRATCH(1, 128, 1, 16, 128, 4);
-  BITCOS_SCRATCH(1, 256, 1, 16, 128, 4);
-  BITCOS_SCRATCH(16, 64, 8, 16, 64, 1);
-  BITCOS_SCRATCH(16, 32, 8, 16, 64, 1);
-  BITCOS_SCRATCH(32, 64, 8, 16, 64, 1);
-  BITCOS_SCRATCH(32, 128, 8, 32, 64, 1);
-  BITCOS_SCRATCH(64, 64, 8, 32, 64, 1);
-  BITCOS_SCRATCH(8, 128, 8, 16, 64, 1);
-  BITCOS_SCRATCH(32, 64, 8, 16, 32, 1);
+  // Only the M==1 tiers use k-slicing. Sizing them at a prefill M charges the
+  // counter buffer LS times over: at M=1024 against the 27B's 248320-wide
+  // lm_head that reserved 12.94 GiB and drove the KV cache negative.
+  if (M == 1) {
+    BITCOS_SCRATCH(1, 32, 1, 16, 64, 1);
+    BITCOS_SCRATCH(1, 64, 1, 16, 64, 1);
+    BITCOS_SCRATCH(1, 128, 1, 16, 64, 1);
+    BITCOS_SCRATCH(1, 256, 1, 16, 64, 1);
+    BITCOS_SCRATCH(1, 32, 1, 16, 64, 4);
+    BITCOS_SCRATCH(1, 64, 1, 16, 64, 4);
+    BITCOS_SCRATCH(1, 128, 1, 16, 64, 4);
+    BITCOS_SCRATCH(1, 256, 1, 16, 64, 4);
+    BITCOS_SCRATCH(1, 32, 1, 16, 64, 8);
+    BITCOS_SCRATCH(1, 64, 1, 16, 64, 8);
+    BITCOS_SCRATCH(1, 128, 1, 16, 64, 8);
+    BITCOS_SCRATCH(1, 256, 1, 16, 64, 8);
+    BITCOS_SCRATCH(1, 128, 1, 16, 128, 1);
+    BITCOS_SCRATCH(1, 128, 1, 16, 128, 4);
+    BITCOS_SCRATCH(1, 256, 1, 16, 128, 4);
+  } else {
+    BITCOS_SCRATCH(16, 64, 8, 16, 64, 1);
+    BITCOS_SCRATCH(16, 32, 8, 16, 64, 1);
+    BITCOS_SCRATCH(32, 64, 8, 16, 64, 1);
+    BITCOS_SCRATCH(32, 128, 8, 32, 64, 1);
+    BITCOS_SCRATCH(64, 64, 8, 32, 64, 1);
+    BITCOS_SCRATCH(8, 128, 8, 16, 64, 1);
+    BITCOS_SCRATCH(32, 64, 8, 16, 32, 1);
+  }
 #undef BITCOS_SCRATCH
   auto& sc = get_bitcos_scratch(q, need_acc, need_cnt);
 
