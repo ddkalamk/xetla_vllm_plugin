@@ -294,6 +294,30 @@ sycl::event int2_upcvt_gemm_run(
   } while (0)
 
   if (M == 1) {
+    // Sweep hook: the tier table below was measured on a discrete B70, whose
+    // bandwidth is several times Lunar Lake's, so the winning tile does not
+    // carry over. -1 keeps the table.
+    static const int dcfg = [] {
+      const char* e = std::getenv("XETLA_INT2_DECODE_CFG");
+      return e ? std::atoi(e) : -1;
+    }();
+    if (dcfg >= 0) {
+      switch (dcfg) {
+        case 0: DISPATCH(32, 1, 1);
+        case 1: DISPATCH(32, 1, 2);
+        case 2: DISPATCH(32, 1, 4);
+        case 3: DISPATCH(32, 1, 8);
+        case 4: DISPATCH(64, 1, 1);
+        case 5: DISPATCH(64, 1, 2);
+        case 6: DISPATCH(64, 1, 4);
+        case 7: DISPATCH(64, 1, 8);
+        case 8: DISPATCH(128, 1, 1);
+        case 9: DISPATCH(128, 1, 2);
+        case 10: DISPATCH(128, 1, 4);
+        case 11: DISPATCH(128, 1, 8);
+        default: break;
+      }
+    }
     // ----- Bonsai-8B GEMV shapes: tuned configs from
     // xetla/int2_fp16_upcvt_dpas_fast_test/results/bonsai_8B_run1/best.csv
     // Format: (K, N) -> (WGN, KS, LS), measured GiB/s on Xe2.
