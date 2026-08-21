@@ -151,6 +151,9 @@ UpcvtScratch& get_scratch(sycl::queue& q, size_t need_acc_bytes, size_t need_cnt
   // so a singleton is sufficient and avoids the sycl::device ordering issue
   // that would prevent using std::map.
   static UpcvtScratch s;
+  // XETLA_SCRATCH_DEBUG reports every growth: this scratch is invisible to
+  // torch and shows up only as vLLM's "non-torch forward increase".
+  static const bool dbg = std::getenv("XETLA_SCRATCH_DEBUG") != nullptr;
   if (s.acc_bytes < need_acc_bytes) {
     if (s.acc)
       sycl::free(s.acc, q.get_context());
@@ -158,6 +161,9 @@ UpcvtScratch& get_scratch(sycl::queue& q, size_t need_acc_bytes, size_t need_cnt
         256, need_acc_bytes, q.get_device(), q.get_context()));
     s.acc_bytes = need_acc_bytes;
     q.memset(s.acc, 0, need_acc_bytes).wait();
+    if (dbg)
+      fprintf(stderr, "[xetla] int2 acc scratch -> %.3f GiB\n",
+              need_acc_bytes / 1073741824.0);
   }
   if (s.cnt_bytes < need_cnt_bytes) {
     if (s.cnt)
@@ -166,6 +172,9 @@ UpcvtScratch& get_scratch(sycl::queue& q, size_t need_acc_bytes, size_t need_cnt
         256, need_cnt_bytes, q.get_device(), q.get_context()));
     s.cnt_bytes = need_cnt_bytes;
     q.memset(s.cnt, 0, need_cnt_bytes).wait();
+    if (dbg)
+      fprintf(stderr, "[xetla] int2 cnt scratch -> %.3f GiB\n",
+              need_cnt_bytes / 1073741824.0);
   }
   return s;
 }
@@ -251,19 +260,28 @@ sycl::event int2_upcvt_gemm_run(
     XT* A, int32_t* B, XT* C, XT* ScaleB) {
   const bool aligned_n = (N % 4 == 0);
 
-  // Compute worst-case scratch bytes across the variants we may dispatch
-  // to (KS up to 4, LS up to 8 dominates) and ensure the cached scratch
-  // covers it.
-  auto bytes_aligned = upcvt_scratch_bytes<
-      XT, /*WGM*/ 1, /*WGN*/ 128, /*SGM*/ 1, /*SGN*/ 16, /*SGK*/ 128, /*KS*/ 4,
-      /*LS*/ 8, /*kUnaligned*/ false>(M, N);
-  auto bytes_unaligned = upcvt_scratch_bytes<
-      XT, /*WGM*/ 1, /*WGN*/ 128, /*SGM*/ 1, /*SGN*/ 16, /*SGK*/ 128, /*KS*/ 4,
-      /*LS*/ 8, /*kUnaligned*/ true>(M, N);
-  size_t need_acc =
-      std::max(bytes_aligned.first, bytes_unaligned.first);
-  size_t need_cnt =
-      std::max(bytes_aligned.second, bytes_unaligned.second);
+  // Bound the scratch by the tiers this M can actually reach. Prefill only ever
+  // dispatches (KS=1, LS=1) below, so sizing it for the decode worst case
+  // reserved 13.3 GiB of non-torch device memory on a 1024-token prefill
+  // against the 27B's 248k-wide lm_head, which left no room for a KV cache.
+  size_t need_acc = 0, need_cnt = 0;
+  auto widen = [&](std::pair<size_t, size_t> p) {
+    need_acc = std::max(need_acc, p.first);
+    need_cnt = std::max(need_cnt, p.second);
+  };
+#define INT2_SCRATCH(KS_, LS_)                                                \
+  widen(upcvt_scratch_bytes<XT, /*WGM*/ 1, /*WGN*/ 128, /*SGM*/ 1,            \
+                            /*SGN*/ 16, /*SGK*/ 128, KS_, LS_,                \
+                            /*kUnaligned*/ false>(M, N));                     \
+  widen(upcvt_scratch_bytes<XT, /*WGM*/ 1, /*WGN*/ 128, /*SGM*/ 1,            \
+                            /*SGN*/ 16, /*SGK*/ 128, KS_, LS_,                \
+                            /*kUnaligned*/ true>(M, N))
+  if (M == 1) {
+    INT2_SCRATCH(4, 8);
+  } else {
+    INT2_SCRATCH(1, 1);
+  }
+#undef INT2_SCRATCH
   auto& sc = get_scratch(q, need_acc, need_cnt);
 
   // Dispatch table. We instantiate one compiled kernel per (KS, LS, kUnaligned)
