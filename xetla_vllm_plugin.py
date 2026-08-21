@@ -1463,28 +1463,14 @@ _xprof_stats: dict = {}
 _xprof_installed = False
 
 
-def _xprof_bytes(op_name: str, m: int, n: int, k: int) -> int:
-    fp16_b = 2
-    a = m * k * fp16_b
-    c = m * n * fp16_b
-    if "int2_fp16" in op_name:
-        b = k * n // 4
-        sb = (k // 128) * n * fp16_b
-    elif "bitcos" in op_name:
-        # Data dependent; the caller passes the real buffer size as `n` bytes
-        # only for the dense planes, so bound it by the 2-bit worst case.
-        b = k * n // 4
-        sb = (k // 128) * n * fp16_b
-    elif "int1_fp16" in op_name:
-        b = k * n // 8
-        sb = (k // 128) * n * fp16_b
-    elif "int2_bf16" in op_name:
-        b = k * n // 4
-        sb = (k // 128) * n * 4
-    else:
-        b = k * n // 4
-        sb = (k // 128) * n * fp16_b
-    return a + b + sb + c
+def _xprof_nbytes(*tensors) -> int:
+    # BITCOS is data dependent, so traffic is taken from the buffers themselves
+    # rather than from a per-format formula.
+    total = 0
+    for t in tensors:
+        if t is not None and hasattr(t, "numel"):
+            total += t.numel() * t.element_size()
+    return total
 
 
 def _xprof_capturing() -> bool:
@@ -1509,7 +1495,8 @@ def _xprof_wrap(op, op_name: str):
         if not capturing:
             torch.xpu.synchronize()
         dt = time.perf_counter() - t0
-        nbytes = _xprof_bytes(op_name, m, n, k)
+        nbytes = _xprof_nbytes(A, B, scale_B, out,
+                               *(r for r in rest if hasattr(r, "numel")))
         with _xprof_lock:
             key = (op_name, m, n, k)
             s = _xprof_stats.setdefault(key, {"calls": 0, "time_s": 0.0, "bytes": 0})
