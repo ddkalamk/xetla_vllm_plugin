@@ -290,6 +290,7 @@ sycl::event bitcos_fp16_upcvt_gemm_run(
   BITCOS_SCRATCH(1, 128, 1, 16, 128, 4);
   BITCOS_SCRATCH(1, 256, 1, 16, 128, 4);
   BITCOS_SCRATCH(16, 64, 8, 16, 64, 1);
+  BITCOS_SCRATCH(16, 32, 8, 16, 64, 1);
   BITCOS_SCRATCH(32, 64, 8, 16, 64, 1);
   BITCOS_SCRATCH(32, 128, 8, 32, 64, 1);
   BITCOS_SCRATCH(64, 64, 8, 32, 64, 1);
@@ -392,7 +393,11 @@ sycl::event bitcos_fp16_upcvt_gemm_run(
       // Measured best across M=512 and M=8192 on B70 against the shapes of
       // Bonsai 8B. BITCOS has no DPAS twin yet, so long prefills still trail
       // the int2 DPAS kernel; decode is where the format pays off.
-      BITCOS_DISPATCH_MN(16, 64, 8, 16, 64, 1, nullptr);
+      // Narrow projections (Bonsai 27B has an N=96 linear-attention head) do
+      // not divide the 64-wide tile, so they fall back to a 32-wide one.
+      if (N % 64 == 0)
+        BITCOS_DISPATCH_MN(16, 64, 8, 16, 64, 1, nullptr);
+      BITCOS_DISPATCH_MN(16, 32, 8, 16, 64, 1, nullptr);
   }
 #undef BITCOS_PICK
 #undef BITCOS_DISPATCH
