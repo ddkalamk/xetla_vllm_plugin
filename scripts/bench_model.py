@@ -96,6 +96,16 @@ def main():
         warm_s = time.perf_counter() - w0
     else:
         warm_s = float("nan")
+
+    # Arm the GEMM profiler only now: its per-call sync perturbs vLLM's memory
+    # profiling badly enough to zero out the KV cache.
+    if int(os.environ.get("XETLA_PROFILE", "0")) > 0:
+        try:
+            import xetla_vllm_plugin
+            xetla_vllm_plugin.xprof_start()
+        except Exception as e:
+            print(f"[xetla] could not arm profiler: {e}")
+
     engine = llm.llm_engine
 
     print("\n" + "=" * 70)

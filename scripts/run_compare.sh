@@ -21,6 +21,9 @@ MAXLEN=${5:-1024}
 # arm goes first gets the healthiest device.
 METHODS=${METHODS:-"int2_f16 bitcos_f16"}
 PROMPT="Tell me about photosynthesis in 200 words"
+# Sampling must be identical across arms or the token streams diverge and the
+# text-parity check becomes meaningless.
+REP_PENALTY=${REP_PENALTY:-1.0}
 LOGS=/data/nfs_home/egeorgan/cpu_ternary_vllm/logs
 BENCH=$(dirname "$0")/bench_model.py
 TAG=$(basename "$PREFIX")
@@ -53,6 +56,39 @@ free_frac() {
   python3 -c 'import torch; f,t = torch.xpu.mem_get_info(); print(f"{f/t:.3f} {f/2**30:.1f}")'
 }
 
+# On unified memory the XPU driver counts the page cache of the weight files as
+# unavailable, so reading an 8 GB sidecar costs 8 GB of KV budget even though
+# the cache is reclaimable. Evicting it from a second process during the run
+# gives that memory back. REAP_CACHE=0 disables.
+reap_cache_start() {
+  [[ ${REAP_CACHE:-1} -eq 0 ]] && return
+  python3 - "$MODEL" "$(dirname "$PREFIX")" <<'PY' &
+import glob, os, sys, time
+paths = set()
+for d in sys.argv[1:]:
+    paths |= set(glob.glob(os.path.join(d, "**", "*.safetensors"), recursive=True))
+    paths |= set(glob.glob(os.path.join(d, "*.safetensors")))
+while True:
+    for f in sorted(paths):
+        try:
+            fd = os.open(f, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    time.sleep(2)
+PY
+  REAPER=$!
+}
+
+reap_cache_stop() {
+  [[ -n "${REAPER:-}" ]] && kill "$REAPER" 2>/dev/null
+  REAPER=
+}
+trap 'reap_cache_stop' EXIT
+
 cleanup
 read -r frac freegb <<<"$(free_frac)"
 if [[ -z "$UTIL" ]]; then
@@ -66,13 +102,16 @@ for r in $(seq 1 "$REPS"); do
   for m in $METHODS; do
     cleanup
     log=$(log_for "$m" "$r")
+    reap_cache_start
     XETLA_QUANT_METHOD=$m \
     XETLA_PREQUANT_PATH=$PREFIX.xetla-$m.safetensors \
     python "$BENCH" --model "$MODEL" --tokenizer "$MODEL" \
       --dtype float16 --max-model-len "$MAXLEN" --gpu-memory-utilization "$UTIL" \
       --max-num-batched-tokens "$MAXLEN" \
       --max-tokens 256 --temperature 0 --text-only --full --cudagraph-sizes 1 \
+      --repetition-penalty "$REP_PENALTY" \
       --prompt "$PROMPT" > "$log" 2>&1
+    reap_cache_stop
     printf '%-12s rep%s  ' "$m" "$r"
     grep -E '^decode ' "$log" | tr -s ' ' \
       || grep -m1 -oE 'Available KV cache memory: [-0-9.]+ GiB|less than desired GPU memory utilization|Killed' "$log" \

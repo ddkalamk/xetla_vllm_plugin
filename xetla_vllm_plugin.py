@@ -1461,6 +1461,7 @@ import threading as _threading
 _xprof_lock = _threading.Lock()
 _xprof_stats: dict = {}
 _xprof_installed = False
+_xprof_armed = False
 
 
 def _xprof_nbytes(*tensors) -> int:
@@ -1484,6 +1485,12 @@ def _xprof_capturing() -> bool:
 
 def _xprof_wrap(op, op_name: str):
     def wrapped(A, B, scale_B, *rest, **kw):
+        # Inert until armed: the per-call host sync makes the Level Zero driver
+        # accumulate ~12 GiB of command-list memory over a profiling prefill,
+        # which vLLM charges to the KV budget and which drove the cache
+        # negative. Engine init must run unperturbed.
+        if not _xprof_armed:
+            return op(A, B, scale_B, *rest, **kw)
         m = int(A.shape[0]); k = int(A.shape[1])
         # BITCOS packs every plane into one flat buffer, so N lives on scale.
         n = int(B.shape[1]) if B.dim() > 1 else int(scale_B.shape[1])
@@ -1505,6 +1512,19 @@ def _xprof_wrap(op, op_name: str):
             s["bytes"] += nbytes
         return out
     return wrapped
+
+
+def xprof_start():
+    """Arm the GEMM profiler and drop anything recorded so far."""
+    global _xprof_armed
+    with _xprof_lock:
+        _xprof_stats.clear()
+    _xprof_armed = True
+
+
+def xprof_stop():
+    global _xprof_armed
+    _xprof_armed = False
 
 
 def _xprof_print():
