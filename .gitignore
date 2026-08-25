@@ -29,3 +29,5 @@ demo/.run/
 BitTern/projects/cat-q/configs/*/export/
 BitTern/projects/cat-q/configs/*/parameters.pth
 BitTern/projects/cat-q/configs/*/config_fp16.yaml
+bonsai_gpu_*.csv
+bonsai_logs/

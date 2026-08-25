@@ -495,6 +495,19 @@ static constexpr std::pair<
         {{28672, 4096}, {64, 8, 256, 128, 64, 1}},
         {{4096, 14336}, {64, 8, 256, 128, 64, 1}},
         {{4096, 28672}, {64, 8, 256, 128, 64, 1}},
+        // Instantiation-only entries. get_int2_bf16_fused_gemm_func() clamps the
+        // selected tile with wg_m = min(m, gcd(m, wg_m)), so a batch whose m is
+        // not a multiple of the table's wg_m asks for a tile that was never
+        // instantiated and silently falls back to default_gemm_config, which is
+        // sized for tiny shapes and dies with UR_RESULT_ERROR_OUT_OF_RESOURCES on
+        // large n/k. ParetoQ-1.5B (k=1600) prefills with m=248 and m=496, giving
+        // gcd(248,64)=8 and gcd(496,32)=16. The {0,0} key is never looked up at
+        // runtime (n and k are never 0) and default_gemm_config_ is bound to
+        // idx==0, so these only add kernels to inst_map.
+        {{0, 0}, {8, 8, 160, 160, 32, 1}},
+        {{0, 0}, {16, 8, 160, 160, 32, 1}},
+        {{0, 0}, {8, 8, 256, 128, 64, 1}},
+        {{0, 0}, {16, 8, 256, 128, 64, 1}},
 };
 static constexpr std::pair<
     std::pair<int, int>, std::tuple<int, int, int, int, int, int>>
