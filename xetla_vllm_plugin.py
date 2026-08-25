@@ -431,6 +431,9 @@ def get_wrapper_load_model_fn(original_fn):
 
 def register():
     print("Hello xetla plugin!")
+    # vllm loads plugins while building the CLI arg parser, before this
+    # submodule is imported, and "import vllm" alone does not bind it
+    import vllm.entrypoints.llm
 
     register_quantization_config("xetla")(XetlaConfig)
     vllm.entrypoints.llm.log_non_default_args = log_non_default_args_xetla
