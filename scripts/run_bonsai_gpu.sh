@@ -157,11 +157,34 @@ for M in 1.7B 4B 8B 27B; do
       U=\$(python -c 'import torch;f,t=torch.xpu.mem_get_info();print(f\"{max(0.20,min(0.78,(f-4*2**30)/t)):.2f}\")')
       echo \"[util] \$U\"
       $QENV
+      B=/tmp/bonsai_bench.\$\$.log
       python -u $HERE/bench_model.py $ARGS --dtype bfloat16 \
         --max-model-len $MAXLEN --gpu-memory-utilization \$U \
         --cudagraph-sizes $CGSIZES --max-num-batched-tokens $MAXBATCHTOK \
         --max-tokens 256 --temperature 0.0 \
-        --prompt 'Tell me about photosynthesis in 200 words'" > "$LOG" 2>&1
+        --prompt 'Tell me about photosynthesis in 200 words' > \$B 2>&1 &
+      BPID=\$!
+      # The weights get charged twice on unified memory: once as the device
+      # allocation and again as the page cache left behind by reading the file,
+      # because mem_get_info reports MemFree. Evicting before the run does not
+      # help, since vllm's own prefetch refills the cache while loading. The one
+      # window that works is after the load and before the KV profiling: for
+      # Bonsai 8B in bf16 this moves the KV budget from -4.12 GiB to +5.96 GiB.
+      ( while kill -0 \$BPID 2>/dev/null; do
+          if grep -q 'Model loading took' \$B 2>/dev/null; then
+            for i in 1 2 3 4 5 6; do
+              python3 $HERE/evict_page_cache.py $HUB $(dirname "${SIDECAR[$M]}") >/dev/null 2>&1
+              sleep 1
+            done
+            break
+          fi
+          sleep 1
+        done ) &
+      WPID=\$!
+      wait \$BPID; RC=\$?
+      kill \$WPID 2>/dev/null
+      cat \$B; rm -f \$B
+      exit \$RC" > "$LOG" 2>&1
 
     tps=$(grep -aoE 'decode +: [0-9]+ tokens in [0-9.]+ s = [0-9.]+' "$LOG" | tail -1 | awk '{print $NF}')
     ttft=$(grep -aoE 'TTFT \(prefill\) +: [0-9]+' "$LOG" | tail -1 | awk '{print $NF}')
