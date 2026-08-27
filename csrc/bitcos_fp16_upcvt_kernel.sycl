@@ -257,6 +257,63 @@ static int bitcos_decode_cfg() {
   return cfg;
 }
 
+// Per-shape decode tiles, measured on the Bonsai 8B/27B decode GEMVs at
+// z=0.40 with a >=2 GB rotating footprint (xetla/bitcos_..._fast_test/
+// tune_bonsai_shapes.sh). ls has to match the sidecar's slice_count, which
+// pack_bitcos fixes via bitcos_slices_for(), so a row only applies when the
+// two agree; otherwise the generic tiers below run.
+struct BitcosDecodeTile {
+  uint32_t k, n, wg_n, ls;
+};
+
+static const BitcosDecodeTile* bitcos_tile_for(size_t K, size_t N,
+                                               int slices, bool lnl) {
+  static constexpr BitcosDecodeTile kB70[] = {
+      {4096, 6144, 32, 4},      // 8B  qkv_proj
+      {4096, 24576, 64, 1},     // 8B  gate_up_proj
+      {12288, 4096, 64, 8},     // 8B  down_proj
+      {4096, 151680, 128, 4},   // 8B  lm_head
+      {5120, 34816, 128, 8},    // 27B mlp.gate_up_proj
+      {17408, 5120, 32, 4},     // 27B mlp.down_proj
+      {5120, 16384, 128, 2},    // 27B linear_attn.in_proj_qkvz
+      {6144, 5120, 32, 4},      // 27B linear_attn.out_proj
+      {5120, 14336, 64, 2},     // 27B self_attn.qkv_proj
+      {5120, 248320, 128, 4},   // 27B lm_head
+  };
+  static constexpr BitcosDecodeTile kLNL[] = {
+      {4096, 6144, 64, 4},      // 8B  qkv_proj
+      {4096, 24576, 64, 4},     // 8B  gate_up_proj
+      {12288, 4096, 128, 2},    // 8B  down_proj
+      {4096, 151680, 64, 4},    // 8B  lm_head
+      {5120, 34816, 64, 4},     // 27B mlp.gate_up_proj
+      {17408, 5120, 128, 1},    // 27B mlp.down_proj
+      {5120, 16384, 128, 4},    // 27B linear_attn.in_proj_qkvz
+      {6144, 5120, 128, 1},     // 27B linear_attn.out_proj
+      {5120, 14336, 128, 4},    // 27B self_attn.qkv_proj
+      {5120, 248320, 64, 4},    // 27B lm_head
+  };
+  const BitcosDecodeTile* tab = lnl ? kLNL : kB70;
+  const size_t n_ent = lnl ? sizeof(kLNL) / sizeof(kLNL[0])
+                           : sizeof(kB70) / sizeof(kB70[0]);
+  for (size_t i = 0; i < n_ent; ++i) {
+    if (tab[i].k == K && tab[i].n == N &&
+        static_cast<int>(tab[i].ls) == slices)
+      return &tab[i];
+  }
+  return nullptr;
+}
+
+// The integrated part wants systematically wider wg_n and less k-slicing than
+// the discrete one, so the table is selected by device rather than shared.
+static bool bitcos_is_integrated(sycl::queue& q) {
+  static const bool lnl = [&] {
+    const auto name = q.get_device().get_info<sycl::info::device::name>();
+    return name.find("Arc(TM) Graphics") != std::string::npos &&
+           name.find("Pro") == std::string::npos;
+  }();
+  return lnl;
+}
+
 // -- Public entry point: pick a precompiled variant based on (M, N) ----------
 //
 // sg_n = 16 and sg_k = 64 are the tuned inner tile from the standalone shmoo on
@@ -291,6 +348,10 @@ sycl::event bitcos_fp16_upcvt_gemm_run(
     BITCOS_SCRATCH(1, 64, 1, 16, 64, 1);
     BITCOS_SCRATCH(1, 128, 1, 16, 64, 1);
     BITCOS_SCRATCH(1, 256, 1, 16, 64, 1);
+    BITCOS_SCRATCH(1, 32, 1, 16, 64, 2);
+    BITCOS_SCRATCH(1, 64, 1, 16, 64, 2);
+    BITCOS_SCRATCH(1, 128, 1, 16, 64, 2);
+    BITCOS_SCRATCH(1, 256, 1, 16, 64, 2);
     BITCOS_SCRATCH(1, 32, 1, 16, 64, 4);
     BITCOS_SCRATCH(1, 64, 1, 16, 64, 4);
     BITCOS_SCRATCH(1, 128, 1, 16, 64, 4);
@@ -376,14 +437,29 @@ sycl::event bitcos_fp16_upcvt_gemm_run(
         default: break;
       }
     }
-    // Measured on B70 with a >=2 GB rotating footprint at the checkpoint's own
-    // density. A work-group holds at most 64 subgroups, i.e.
-    // (wg_n / sg_n) * LS <= 64, which is why LS=8 stops at wg_n=128.
+    // Measured with a >=2 GB rotating footprint at the checkpoint's own
+    // density. XeTLA asserts local_range_m*local_range_n*LS <= 32, i.e.
+    // wg_n <= 512/LS; the previous caps read that limit as 64 and so let
+    // slices==8 select wg_n=128, which trips the assert in a debug build.
+    if (const auto* t = bitcos_tile_for(K, N, slices,
+                                        bitcos_is_integrated(q))) {
+      const int tw = static_cast<int>(t->wg_n);
+      switch (slices) {
+        case 8: BITCOS_PICK(tw, 8, SliceRanks); break;
+        case 4: BITCOS_PICK(tw, 4, SliceRanks); break;
+        case 2: BITCOS_PICK(tw, 2, SliceRanks); break;
+        case 1: BITCOS_PICK(tw, 1, nullptr); break;
+        default: break;
+      }
+    }
     if (slices == 8) {
-      BITCOS_PICK(widest_upto(128), 8, SliceRanks);
+      BITCOS_PICK(widest_upto(64), 8, SliceRanks);
     }
     if (slices == 4) {
-      BITCOS_PICK(widest_upto(64), 4, SliceRanks);
+      BITCOS_PICK(widest_upto(128), 4, SliceRanks);
+    }
+    if (slices == 2) {
+      BITCOS_PICK(widest_upto(256), 2, SliceRanks);
     }
     BITCOS_PICK(widest_upto(N <= 8192 ? 128 : 256), 1, nullptr);
   }

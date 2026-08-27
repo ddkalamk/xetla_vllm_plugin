@@ -553,12 +553,53 @@ BITCOS_LOCAL_SLICES_LONG_K = 8
 BITCOS_LONG_K = 8192
 
 
+# Per-shape slice counts for the Bonsai 8B/27B decode GEMVs, measured at
+# z=0.40 with a >=2 GB rotating footprint
+# (xetla/bitcos_fp16_dpas_fp16scales_fast_test/tune_bonsai_shapes.sh).
+# slice_count is baked into the sidecar and the two devices disagree on 7 of
+# 10 shapes, so a sidecar is tuned for one device; pick with
+# XETLA_BITCOS_SLICE_TARGET=lnl|b70 at pack time.
+_BITCOS_SLICES_LNL = {
+    (4096, 6144): 4,      # 8B  qkv_proj
+    (4096, 24576): 4,     # 8B  gate_up_proj
+    (12288, 4096): 2,     # 8B  down_proj
+    (4096, 151680): 4,    # 8B  lm_head
+    (5120, 34816): 4,     # 27B mlp.gate_up_proj
+    (17408, 5120): 1,     # 27B mlp.down_proj
+    (5120, 16384): 4,     # 27B linear_attn.in_proj_qkvz
+    (6144, 5120): 1,      # 27B linear_attn.out_proj
+    (5120, 14336): 4,     # 27B self_attn.qkv_proj
+    (5120, 248320): 4,    # 27B lm_head
+}
+_BITCOS_SLICES_B70 = {
+    (4096, 6144): 4,      # 8B  qkv_proj
+    (4096, 24576): 1,     # 8B  gate_up_proj
+    (12288, 4096): 8,     # 8B  down_proj
+    (4096, 151680): 4,    # 8B  lm_head
+    (5120, 34816): 8,     # 27B mlp.gate_up_proj
+    (17408, 5120): 4,     # 27B mlp.down_proj
+    (5120, 16384): 2,     # 27B linear_attn.in_proj_qkvz
+    (6144, 5120): 4,      # 27B linear_attn.out_proj
+    (5120, 14336): 2,     # 27B self_attn.qkv_proj
+    (5120, 248320): 4,    # 27B lm_head
+}
+BITCOS_TUNED_SLICES = (
+    _BITCOS_SLICES_B70
+    if os.environ.get("XETLA_BITCOS_SLICE_TARGET", "lnl").lower() == "b70"
+    else _BITCOS_SLICES_LNL
+)
+
+
 def bitcos_slices_for(K: int, N: int) -> int:
     """Slice count the decode kernel wants for this shape.
 
-    Measured on B70 with a >=2 GB rotating footprint at the checkpoint's own
+    Measured with a >=2 GB rotating footprint at the checkpoint's own
     density; a single cache-resident buffer ranks these the other way round.
+    Shapes outside the tuned table fall back to the original K/N rule.
     """
+    tuned = BITCOS_TUNED_SLICES.get((K, N))
+    if tuned is not None:
+        return tuned
     if K >= BITCOS_LONG_K:          # long reduction: more slices to fill it
         return BITCOS_LOCAL_SLICES_LONG_K
     if N <= 4096 or (16384 <= N < 65536):

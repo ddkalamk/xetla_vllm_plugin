@@ -95,6 +95,14 @@ declare -A PACKED=(
   [8B]=$MODELS/Ternary-Bonsai-8B-packed
   [27B]=$MODELS/Bonsai-27B-packed
 )
+# BITCOS sidecars, transcoded from the int2 ones; only 8B/27B were built.
+# slice_count is baked in and the devices disagree, so BITCOS_SFX selects a
+# device-tuned file (e.g. BITCOS_SFX=.b70).
+BITCOS_SFX=${BITCOS_SFX:-}
+declare -A BITCOS_SIDECAR=(
+  [8B]=$MODELS/Ternary-Bonsai-8B-unpacked.xetla-bitcos_f16${BITCOS_SFX}.safetensors
+  [27B]=$MODELS/Bonsai-27B.xetla-bitcos_f16${BITCOS_SFX}.safetensors
+)
 
 # order matters: the GPU runtime and oneAPI must come before the venv, else
 # torch.xpu.device_count() is 0 and vLLM fails with "Device string must not be empty"
@@ -123,8 +131,8 @@ LOGD=$PLUG/bonsai_logs
 mkdir -p "$LOGD"
 [[ -f "$OUT" ]] || echo "platform,model,wdtype,ttft_ms,tokens_per_s,status" > "$OUT"
 
-for M in 1.7B 4B 8B 27B; do
-  for WD in int2 bf16; do
+for M in ${MODELS_LIST:-1.7B 4B 8B 27B}; do
+  for WD in ${WDS:-int2 bf16}; do
     if grep -qE "^$TAG,$M,$WD,.*,(ok|OOM)$" "$OUT"; then
       echo "    $M $WD -> already recorded"; continue
     fi
@@ -138,6 +146,13 @@ for M in 1.7B 4B 8B 27B; do
     LOG="$LOGD/gpu_${TAG}_${M}_${WD}.log"
     if [[ "$WD" == "int2" ]]; then
       QENV="export XETLA_PREQUANT_PATH=${SIDECAR[$M]} XETLA_QUANT_METHOD=int2_f16"
+      ARGS="--model ${PACKED[$M]} --tokenizer ${SNAP[$M]} --quantization xetla"
+    elif [[ "$WD" == "bitcos" ]]; then
+      if [[ -z "${BITCOS_SIDECAR[$M]:-}" ]]; then
+        echo "$TAG,$M,bitcos,,,no-sidecar" >> "$OUT"
+        echo "    $M bitcos -> no sidecar built"; continue
+      fi
+      QENV="export XETLA_PREQUANT_PATH=${BITCOS_SIDECAR[$M]} XETLA_QUANT_METHOD=bitcos_f16${DECODE_CFG:+ XETLA_BITCOS_DECODE_CFG=$DECODE_CFG}"
       ARGS="--model ${PACKED[$M]} --tokenizer ${SNAP[$M]} --quantization xetla"
     else
       QENV="unset XETLA_PREQUANT_PATH XETLA_QUANT_METHOD"
