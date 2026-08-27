@@ -125,6 +125,13 @@ CGSIZES=${CGSIZES:-1,2,4,8}
 # KV budget to -4.91 GiB even though the weights are only 15.27 GiB of a 22.3 GiB
 # budget. The prompts here are 32 tokens, so profiling that wide is pure waste.
 MAXBATCHTOK=${MAXBATCHTOK:-512}
+# gpu-memory-utilization. Left empty this is sampled from free memory per arm,
+# which drifts with whatever the previous arm left behind: on LNLv2 the 8B int2
+# arm drew 0.74 and the bitcos arm 0.45. On unified memory that reservation is
+# taken out of the same DDR5 the CPU and page cache use, so the arms are not
+# comparable. Pin it to compare quantization methods.
+declare -A UTIL_BY_MODEL=( [1.7B]=0.25 [4B]=0.30 [8B]=0.35 [27B]=0.55 )
+UTIL=${UTIL:-}
 
 OUT=$PLUG/bonsai_gpu_${TAG}.csv
 LOGD=$PLUG/bonsai_logs
@@ -160,6 +167,7 @@ for M in ${MODELS_LIST:-1.7B 4B 8B 27B}; do
     fi
 
     echo ">>> $TAG $M $WD"
+    UTIL_M=${UTIL:-${UTIL_BY_MODEL[$M]:-}}
     srun --jobid="$JOB" --overlap bash -lc "$ENV_SETUP
       pids=\$(ps -u \$USER -o pid=,comm= | awk '\$2 ~ /^(vllm|VLLM::EngineCor)\$/ {print \$1}')
       [[ -n \"\$pids\" ]] && kill -9 \$pids 2>/dev/null
@@ -169,7 +177,8 @@ for M in ${MODELS_LIST:-1.7B 4B 8B 27B}; do
       # re-prefetches the checkpoints into page cache before it checks, and on
       # unified memory that is deducted from the budget. Asking for nearly the
       # whole device loses that race.
-      U=\$(python -c 'import torch;f,t=torch.xpu.mem_get_info();print(f\"{max(0.20,min(0.78,(f-4*2**30)/t)):.2f}\")')
+      U=$UTIL_M
+      [[ -n \"\$U\" ]] || U=\$(python -c 'import torch;f,t=torch.xpu.mem_get_info();print(f\"{max(0.20,min(0.78,(f-4*2**30)/t)):.2f}\")')
       echo \"[util] \$U\"
       $QENV
       B=/tmp/bonsai_bench.\$\$.log
