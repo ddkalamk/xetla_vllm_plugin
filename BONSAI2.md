@@ -3,7 +3,10 @@
 This runs **prism-ml/Ternary-Bonsai-2-27B** (ternary g128, Qwen3.8-27B based,
 GGUF-only release) with vLLM + the xetla int2 kernels on an Arc Pro B70 (or an
 Arc 140V / Lunar Lake). Every step below was executed verbatim in an empty
-directory on this cluster; the expected outputs are quoted from that run.
+directory on this cluster (`bitcos_paper/test_latest`, 2026-09-17: build 25
+min on a 28-core login node, pack 1 min, B70 run 46.1 tok/s with text
+byte-identical to the development tree); the expected outputs are quoted from
+that run.
 
 Bonsai 2 differs from Bonsai 1 in one way that matters here: its matrices are
 stored in a **rotated basis**. Before every folded GEMM the activation is
@@ -22,8 +25,10 @@ Result on this cluster (greedy, 256 output tokens, 63-token prompt):
 | Arc Pro B70 (Arrow Lake host) | 45.7-46.1 tok/s | ~965 ms | 47.9 tok/s |
 | Arc 140V (Lunar Lake, unified memory) | 7.42 tok/s | ~6.6 s | 7.51 tok/s |
 
-The generated text is byte-identical on both GPUs and to the un-fused
-(matmul) reference implementation of the transform.
+The generated text is byte-identical on both GPUs, to the un-fused (matmul)
+reference implementation of the transform, and across independent builds
+(development tree vs. the from-scratch checkout) as long as
+`--deterministic-compile` is on (default in the runner; see Knobs).
 
 ---
 
@@ -47,6 +52,9 @@ The generated text is byte-identical on both GPUs and to the un-fused
 export DEST=/path/to/empty/folder          # everything lands under here
 mkdir -p "$DEST" && cd "$DEST"
 ```
+
+Steps 1-3 are also scripted as `utils/bonsai2_from_scratch.sh "$DEST"` (this
+is what the verification run used); they are spelled out below.
 
 ## 1. Build vLLM (XPU) + the xetla plugin
 
@@ -184,11 +192,11 @@ Expected (B70; first run includes a ~30 s torch.compile, engine load ~50 s):
 [xetla] sidecar hit: language_model.model.embed_tokens embedding (int2_f16), packed (248320, 320), out dtype torch.bfloat16, inverse-hadamard
 [xetla] fused SwiGLU into the gate epilogue for 64 MLP blocks
 ...
-TTFT (prefill)       : ~965 ms
-decode               : 256 tokens in ~5.6 s = ~45.7 tok/s   [length]
+TTFT (prefill)       : 954 ms
+decode               : 256 tokens in 5.55 s = 46.13 tok/s   [length]
 repetition           : 5 lines, 5 unique; 188 words, 129 unique
 We need to respond to user: "Tell me about photosynthesis in 200 words". ...
-"Photosynthesis is the process by which plants, algae, and some bacteria convert light energy into chemical energy. Using chlorophyll in chloroplasts, they capture sunlight and use it to transform carbon dioxide and water into glucose and oxygen. ...
+"Photosynthesis is the process by which plants, algae, and some bacteria convert light energy into chemical energy. Using chlorophyll in chloroplasts, they capture sunlight and use it to transform carbon dioxide and water into glucose and oxygen. The overall reaction is: six carbon dioxide molecules plus six water molecules, powered by light, yield one glucose molecule and six oxygen molecules. ...
 ```
 
 (The model is a thinking model: the output starts with its reasoning, then
