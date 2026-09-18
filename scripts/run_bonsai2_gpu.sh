@@ -15,6 +15,7 @@
 # flip + blockwise WHT to activations before every folded GEMM.
 #
 # Env knobs:
+#   METHOD=int2|bitcos, BITCOS_SFX=.b70|.lnl  which sidecar (see below)
 #   XETLA_HADAMARD_DTYPE=fp16|fp32  transform precision (default fp32)
 #   UTIL=0.35   pin gpu-memory-utilization (LNL BKM: unified memory, the
 #               sampled value over-reserves; 0.35 is what the 27B runs used)
@@ -31,8 +32,19 @@ set -uo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PLUG=${PLUG:-$(cd -- "$HERE/.." && pwd)}
 MODELS=${MODELS:-$PLUG/../models}
-SIDECAR=${SIDECAR:-$MODELS/Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors}
 PACKED=${PACKED:-$MODELS/Ternary-Bonsai-2-27B-packed}
+# METHOD=int2 (default) | bitcos. BITCOS sidecars bake in a per-device slice
+# count, so BITCOS_SFX picks the file: .b70 or .lnl (transcode with
+# XETLA_BITCOS_SLICE_TARGET=b70|lnl).
+METHOD=${METHOD:-int2}
+BITCOS_SFX=${BITCOS_SFX:-.b70}
+if [[ "$METHOD" == "bitcos" ]]; then
+  SIDECAR=${SIDECAR:-$MODELS/Ternary-Bonsai-2-27B.xetla-bitcos_f16${BITCOS_SFX}.safetensors}
+  QMETHOD=bitcos_f16
+else
+  SIDECAR=${SIDECAR:-$MODELS/Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors}
+  QMETHOD=int2_f16
+fi
 
 JOB=${1:?usage: $0 <slurm-jobid> <TAG> [prompt ...]}
 TAG=${2:?usage: $0 <slurm-jobid> <TAG> [prompt ...]}
@@ -58,15 +70,15 @@ source /swtools/intel/2025.3/oneapi-vars.sh >/dev/null 2>&1
 source $PLUG/.venv/bin/activate
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 export VLLM_XPU_ENABLE_XPU_GRAPH=${VLLM_XPU_ENABLE_XPU_GRAPH:-1}
-export XETLA_PREQUANT_PATH=$SIDECAR XETLA_QUANT_METHOD=int2_f16
+export XETLA_PREQUANT_PATH=$SIDECAR XETLA_QUANT_METHOD=$QMETHOD
 export XETLA_HADAMARD_DTYPE=${XETLA_HADAMARD_DTYPE:-fp32}
 ${RUN_ENV:-}
 "
 
 LOGD=$PLUG/bonsai_logs
 mkdir -p "$LOGD"
-LOG="$LOGD/gpu_${TAG}_B2-27B_int2.log"
-echo ">>> $TAG Bonsai-2-27B int2 (hadamard) -> $LOG"
+LOG="$LOGD/gpu_${TAG}_B2-27B_${METHOD}.log"
+echo ">>> $TAG Bonsai-2-27B $METHOD (hadamard) -> $LOG"
 
 srun --jobid="$JOB" --overlap bash -lc "$ENV_SETUP
   pids=\$(ps -u \$USER -o pid=,comm= | awk '\$2 ~ /^(vllm|VLLM::EngineCor)\$/ {print \$1}')

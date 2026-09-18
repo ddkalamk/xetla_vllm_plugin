@@ -192,9 +192,9 @@ Expected (B70; first run includes a ~30 s torch.compile, engine load ~50 s):
 [xetla] sidecar hit: language_model.model.embed_tokens embedding (int2_f16), packed (248320, 320), out dtype torch.bfloat16, inverse-hadamard
 [xetla] fused SwiGLU into the gate epilogue for 64 MLP blocks
 ...
-TTFT (prefill)       : 954 ms
-decode               : 256 tokens in 5.55 s = 46.13 tok/s   [length]
-repetition           : 5 lines, 5 unique; 188 words, 129 unique
+TTFT (prefill)       : 179 ms
+decode               : 256 tokens in 5.54 s = 46.25 tok/s   [length]
+repetition           : 5 lines, 5 unique; 187 words, 133 unique
 We need to respond to user: "Tell me about photosynthesis in 200 words". ...
 "Photosynthesis is the process by which plants, algae, and some bacteria convert light energy into chemical energy. Using chlorophyll in chloroplasts, they capture sunlight and use it to transform carbon dioxide and water into glucose and oxygen. The overall reaction is: six carbon dioxide molecules plus six water molecules, powered by light, yield one glucose molecule and six oxygen molecules. ...
 ```
@@ -222,8 +222,42 @@ MODELS="$MODELS" UTIL=0.35 KVBYTES=$((2<<30)) MAXTOK=256 MAXLEN=512 \
 * If an engine was killed on LNL, the device memory it held stays with the
   SLURM job cgroup: `scancel` and re-`sbatch` before retrying.
 
-Expected: `decode : 256 tokens in ~34.5 s = 7.42 tok/s`, TTFT ~6.6 s, same text
+Expected: `decode : 256 tokens in ~33.8 s = 7.57 tok/s`, TTFT ~1.0 s, same text
 as the B70.
+
+### Prefill
+
+For M>1 the int2 fp16-upcvt kernel uses an M tile (WGM 8 for M<=8, 16 for
+M<=16, else 32; SGM 8, SGN 16, SGK 128, WGN 64), so the weights are streamed
+once per row tile rather than once per token. Measured against the old GEMV
+tiers on the same binary: B70 TTFT 966 -> 179 ms, LNL 6591 -> 998 ms, decode
+unchanged (M=1 path untouched). The plain GEMM is bit-exact with the old path
+at every M; the fused-SwiGLU epilogue sums its fp32 k-slices in a different
+order (1-ulp differences), which is enough to pick the other of the two known
+greedy trajectories for this prompt. `XETLA_INT2_PREFILL_CFG=-1` restores the
+old tiers; `python tests/test_int2_prefill_mtile.py` (GPU) sweeps the
+alternatives and checks each against the legacy result.
+
+### BITCOS
+
+The int2 sidecar transcodes to BITCOS exactly as for Bonsai 1; the
+`hadamard.*` tensors are carried over. BITCOS bakes in a per-device slice
+count, so make one file per GPU:
+
+```bash
+python scripts/zero_density.py "$MODELS/Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors"   # 0.328
+for dev in b70 lnl; do
+  XETLA_BITCOS_SLICE_TARGET=$dev python scripts/transcode_int2_to_bitcos.py \
+      --in  "$MODELS/Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors" \
+      --out "$MODELS/Ternary-Bonsai-2-27B.xetla-bitcos_f16.$dev.safetensors"
+done
+METHOD=bitcos BITCOS_SFX=.b70 MAXTOK=256 MAXLEN=512 \
+    bash scripts/run_bonsai2_gpu.sh "$JOB" B70 "Tell me about photosynthesis in 200 words"
+```
+
+Measured: B70 47.8 tok/s, TTFT 151 ms; LNL (`UTIL=0.35 KVBYTES=$((2<<30))
+BITCOS_SFX=.lnl`) 8.31 tok/s, TTFT 969 ms. Sidecar 6.19 GB vs 7.14 GB int2;
+greedy text identical on the two GPUs.
 
 ## 5. Knobs
 
@@ -231,7 +265,9 @@ as the B70.
 | --- | --- | --- |
 | `XETLA_HADAMARD_IMPL` | `fused` | `matmul` = reference implementation (sign multiply + matmul with H_1024). Same text, ~10% slower decode. |
 | `XETLA_HADAMARD_DTYPE` | `fp32` | accumulation dtype of the matmul reference only |
-| `XETLA_DISABLE_DPAS` | `1` | **`0` enables the DPAS (XMX) int2 prefill kernel**: activations are quantised to int8 for prefill, TTFT on the B70 drops 965 -> 391 ms and decode is unchanged. The output stays coherent and on-topic but is *not* bit-identical to the fp16 path (the argmax flips at some token and the continuation differs). Keep it off for reproducibility studies; turn it on for interactive use. |
+| `XETLA_INT2_PREFILL_CFG` | `0` | M>1 tile for the int2 upcvt kernel: `-1` = old per-token GEMV tiers (B70 TTFT 966 ms vs 179 ms), `1..5` alternative tiles (see `csrc/int2_fp16_upcvt_kernel.sycl`). |
+| `XETLA_DISABLE_DPAS` | `1` | `0` enables the DPAS (XMX) int2 prefill kernel: activations are quantised to int8 for prefill (B70 TTFT ~391 ms, now slower than the default M-tiled fp16 path). The output stays coherent and on-topic but is *not* bit-identical to the fp16 path. |
+| `METHOD=bitcos`, `BITCOS_SFX=.b70\|.lnl` | `int2` | run-script switch to the BITCOS sidecar (section 4, BITCOS) |
 | `--deterministic-compile` (`DETERMINISTIC=1` in the script) | on | disables inductor's benchmark-selected combo kernels; without it the greedy text can differ between two fresh compiles (different fusions, different fp rounding). No measurable perf cost. |
 | `XETLA_FUSE_SWIGLU` | `1` | SwiGLU folded into the gate GEMM epilogue |
 | `KVBYTES`, `UTIL`, `MAXLEN`, `MAXTOK`, `CGSIZES`, `RUN_ENV="export ..."` | | run-script knobs, see its header |
@@ -251,6 +287,8 @@ as the B70.
 | --- | --- |
 | `scripts/pack_bonsai2_gguf.py` | GGUF (PQ2_0 + mmproj) -> sidecar + packed model dir |
 | `scripts/run_bonsai2_gpu.sh` | SLURM runner used for the numbers above |
+| `scripts/transcode_int2_to_bitcos.py`, `scripts/zero_density.py` | int2 -> BITCOS sidecar (keeps `hadamard.*`); zero density of a sidecar |
+| `tests/test_int2_prefill_mtile.py`, `tests/mbench_smallM.py` | M-tiled prefill sweep vs legacy tiers; small-M microbench |
 | `scripts/bench_model.py` | the benchmark (`--deterministic-compile`, `--kv-cache-memory-bytes`) |
 | `csrc/hadamard_fwht_kernel.sycl` | fused sign flip + blockwise WHT (block 1024), op `xetla_int2.hadamard_fwht_run` |
 | `xetla_vllm_plugin.py` | `_xetla_hadamard_*`: attaches sign vectors from the sidecar, applies the transform before folded GEMMs and after the embedding lookup |

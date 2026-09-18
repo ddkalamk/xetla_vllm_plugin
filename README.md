@@ -63,11 +63,24 @@ The sign flip + blockwise Walsh-Hadamard transform runs as one fused SYCL kernel
 decode is 46 tok/s vs 47.9 for the un-rotated Bonsai 1 27B, and the greedy text
 is bit-identical on B70 and LNL.
 
+**Prefill.** For M>1 the fp16 upcvt kernel now runs with a real M tile
+(WGM 8/16/32 by M, SGM 8, one pass over the weights per row tile) instead of
+looping the M=1 GEMV tiers: B70 TTFT 966 -> 179 ms, LNL 6.6 s -> 1.0 s, decode
+unchanged, per-GEMM results bit-exact with the old path. `XETLA_INT2_PREFILL_CFG`
+(-1 = old GEMV tiers, 1..5 = alternative tiles) is a sweep hook;
+`tests/test_int2_prefill_mtile.py` sweeps and checks them.
+
 **Prefill DPAS option.** `XETLA_DISABLE_DPAS=0` switches prefill to the DPAS
-(XMX) int2 kernel, which quantises activations to int8: B70 TTFT drops from
-~965 ms to ~391 ms with unchanged decode speed. The output remains coherent
-and on-topic but is not bit-identical to the default fp16-activation path
-(greedy argmax flips at some token). Default is off (`XETLA_DISABLE_DPAS=1`).
+(XMX) int2 kernel, which quantises activations to int8 (B70 TTFT ~391 ms; it
+predates the M-tiled fp16 path above and is now slower than it). The output
+remains coherent and on-topic but is not bit-identical to the fp16-activation
+path (greedy argmax flips at some token). Default is off (`XETLA_DISABLE_DPAS=1`).
+
+**BITCOS.** `scripts/transcode_int2_to_bitcos.py` carries the `hadamard.*`
+tensors over, so the Bonsai 2 sidecar transcodes like Bonsai 1
+(`METHOD=bitcos BITCOS_SFX=.b70|.lnl` in `scripts/run_bonsai2_gpu.sh`). Zero
+density is 0.328 (`scripts/zero_density.py`), sidecar 6.19 GB vs 7.14 GB int2;
+B70 47.8 tok/s / TTFT 151 ms, LNL 8.31 tok/s / 969 ms, text identical on both.
 
 ## Bonsai-27B: pack the int2 sidecar first
 

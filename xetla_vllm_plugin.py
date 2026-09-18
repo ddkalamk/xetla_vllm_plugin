@@ -284,9 +284,9 @@ def _xetla_prequant_try_load(layer: torch.nn.Module, prefix: str,
         _xetla_pre_convert_bias(layer)
         k_local = qw.shape[0] * 16 if method == "int2_f16" else 0
         _xetla_hadamard_attach(layer, lookup_prefix, dev, k_local)
-        if layer.xetla_hadamard is not None and method != "int2_f16":
+        if layer.xetla_hadamard is not None and method not in ("int2_f16", "bitcos_f16"):
             raise ValueError(f"{prefix}: hadamard-folded weights are only "
-                             f"wired for int2_f16, not {method}")
+                             f"wired for int2_f16/bitcos_f16, not {method}")
         return True
     except Exception as e:
         print(f"[xetla] WARN: sidecar load failed for {prefix} (lookup={lookup_prefix}): {e}",
@@ -1329,6 +1329,7 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
             return out if out.dtype == x.dtype else out.to(x.dtype)
         if self.quant_config.method == "bitcos_f16" and getattr(layer, "xetla_quantized", False):
             x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+            x16 = _xetla_hadamard_fwd(layer, x16)
             b16 = bias if bias is None or bias.dtype == torch.float16 else bias.to(torch.float16)
             ranks = getattr(layer, "xetla_slice_ranks", None)
             if not _xetla_is_compiling():
@@ -1701,6 +1702,7 @@ class XetlaLinearMethod(LinearMethodBase):
             return c if c.dtype == x.dtype else c.to(x.dtype)
         if method == "bitcos_f16":
             x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+            x16 = _xetla_hadamard_fwd(layer, x16)
             b16 = bias if bias is None or bias.dtype == torch.float16 else bias.to(torch.float16)
             ranks = getattr(layer, "xetla_slice_ranks", None)
             if not _xetla_is_compiling():

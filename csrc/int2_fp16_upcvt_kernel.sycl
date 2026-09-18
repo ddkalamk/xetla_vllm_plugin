@@ -366,9 +366,51 @@ sycl::event int2_upcvt_gemm_run(
     INT2_SCRATCH(4, 8);
   } else {
     INT2_SCRATCH(1, 1);
+    widen(upcvt_scratch_bytes<XT, 16, 64, 8, 16, 128, 1, 1, false>(M, N));
+    widen(upcvt_scratch_bytes<XT, 32, 128, 8, 32, 128, 1, 1, false>(M, N));
   }
 #undef INT2_SCRATCH
   auto& sc = get_scratch(q, need_acc, need_cnt);
+
+  // Prefill (M > 1). A GEMV tile (wg_tile_m == 1) re-reads and re-dequantises
+  // the whole weight matrix once per row, so TTFT grows linearly with the
+  // prompt. These tiles apply every unpacked weight tile to WGM rows through
+  // the fp16 XMX path (sg_tile_m is the DPAS repeat count, max 8), i.e. M/WGM
+  // sweeps instead of M. Activations stay fp16, so results match the GEMV
+  // tier up to accumulation order. XETLA_INT2_PREFILL_CFG: -1 = legacy GEMV
+  // fallback, 0 = default, 1.. = alternatives for sweeps.
+#define DISPATCH_MN(WGM_, WGN_, SGM_, SGN_, SGK_)                             \
+  do {                                                                        \
+    if (aligned_n)                                                            \
+      return upcvt_dispatch<XT, WGM_, WGN_, SGM_, SGN_, SGK_, 1, 1, false>(    \
+          q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt);                        \
+    else                                                                      \
+      return upcvt_dispatch<XT, WGM_, WGN_, SGM_, SGN_, SGK_, 1, 1, true>(     \
+          q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt);                        \
+  } while (0)
+  if (M > 1) {
+    static const int pcfg = [] {
+      const char* e = std::getenv("XETLA_INT2_PREFILL_CFG");
+      return e ? std::atoi(e) : 0;
+    }();
+    switch (pcfg) {
+      case -1: break;                                  // legacy GEMV fallback
+      case 1: DISPATCH_MN(32, 64, 8, 16, 128);
+      case 2: DISPATCH_MN(16, 128, 8, 16, 128);
+      case 3: DISPATCH_MN(8, 64, 8, 16, 128);
+      case 4: DISPATCH_MN(32, 128, 8, 32, 128);
+      case 5: DISPATCH_MN(64, 64, 8, 16, 128);
+      default:
+        // B70 sweep (tests/test_int2_prefill_mtile.py): WGM 8 wins up to
+        // M=8 (1.5-2x over WGM 16), WGM 16 at M=16, WGM 32 from ~M=32 on;
+        // all within a few % of each other at M>=512. Bit-exact with the
+        // GEMV tier at every M.
+        if (M <= 8) DISPATCH_MN(8, 64, 8, 16, 128);
+        if (M <= 16) DISPATCH_MN(16, 64, 8, 16, 128);
+        DISPATCH_MN(32, 64, 8, 16, 128);
+    }
+  }
+#undef DISPATCH_MN
 
   // Dispatch table. We instantiate one compiled kernel per (KS, LS, kUnaligned)
   // triple that we want to use; tile shape is fixed at WGM=1/SGM=1/SGN=16/SGK=128
@@ -538,6 +580,27 @@ sycl::event int2_upcvt_gemm_postop_run(
 
   // Same tiers the un-fused decode path picks for these shapes; the epilogue
   // does not change which tile wins because it touches no extra weight bytes.
+  if (M > 1) {
+    // M-tiled prefill, see int2_upcvt_gemm_run. Post-ops need aligned N.
+    static const int pcfg = [] {
+      const char* e = std::getenv("XETLA_INT2_PREFILL_CFG");
+      return e ? std::atoi(e) : 0;
+    }();
+    if (pcfg != -1) {
+#define DISPATCH_PO_MN(WGM_)                                                  \
+  do {                                                                        \
+    if (postop == 1)                                                          \
+      return upcvt_dispatch<XT, WGM_, 64, 8, 16, 128, 1, 1, false, 1>(        \
+          q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt, Other);                \
+    return upcvt_dispatch<XT, WGM_, 64, 8, 16, 128, 1, 1, false, 2>(          \
+        q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt, Other);                  \
+  } while (0)
+      if (M <= 8) DISPATCH_PO_MN(8);
+      if (M <= 16) DISPATCH_PO_MN(16);
+      DISPATCH_PO_MN(32);
+#undef DISPATCH_PO_MN
+    }
+  }
   if (K % (1 * 2 * 128) == 0 && K == 4096 && N == 12288) { DISPATCH_PO(32, 1, 2); }
   if (N <= 4096 && K % (8 * 128) == 0)                   { DISPATCH_PO(32, 1, 8); }
   if (N <= 8192 && K % (4 * 128) == 0)                   { DISPATCH_PO(64, 1, 4); }

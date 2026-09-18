@@ -59,7 +59,13 @@ def main():
     with safe_open(a.src, framework="pt") as f:
         meta = json.loads((f.metadata() or {}).get("xetla_meta", "{}"))
         src_layers = meta.get("layers", {})
-        prefixes = sorted({k.rsplit(".", 1)[0] for k in f.keys()})
+        # Hadamard-folded checkpoints (Bonsai 2): sign vectors and the fold
+        # contract are format independent, pass them through.
+        extra_keys = [k for k in f.keys() if k.startswith("hadamard.")]
+        for k in extra_keys:
+            out[k] = f.get_tensor(k)
+        prefixes = sorted({k.rsplit(".", 1)[0] for k in f.keys()
+                           if not k.startswith("hadamard.")})
         for i, prefix in enumerate(prefixes, 1):
             kind = src_layers.get(prefix, {}).get("kind", "linear")
             qw = f.get_tensor(f"{prefix}.qweight")
@@ -85,11 +91,17 @@ def main():
                 print(f"  {i}/{len(prefixes)} {prefix}", flush=True)
 
     os.makedirs(os.path.dirname(a.dst) or ".", exist_ok=True)
+    new_meta = {k: v for k, v in meta.items() if k != "layers"}
+    new_meta["layers"] = layers_meta
+    new_meta["bitcos_slice_target"] = os.environ.get("XETLA_BITCOS_SLICE_TARGET", "lnl")
     save_file(out, a.dst, metadata={
         "xetla_format_version": "1",
         "xetla_method": "bitcos_f16",
-        "xetla_meta": json.dumps({"layers": layers_meta}),
+        "xetla_meta": json.dumps(new_meta),
     })
+    if "hadamard" in meta:
+        print(f"  carried hadamard contract: {len(meta['hadamard'].get('layers', {}))} "
+              f"folded, {len(extra_keys)} sign vectors")
     src_gb = os.path.getsize(a.src) / 1e9
     dst_gb = os.path.getsize(a.dst) / 1e9
     print(f"\nint2   {src_gb:6.2f} GB")
