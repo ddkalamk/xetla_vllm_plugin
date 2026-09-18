@@ -202,6 +202,11 @@ torch::Tensor int2_fp16_upcvt_gemm_run_torch(
     torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
     std::optional<torch::Tensor> C_out);
 
+// Same kernel with a fused epilogue: 1 = silu(acc)*other, 2 = acc+other.
+torch::Tensor int2_fp16_upcvt_gemm_postop_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
+    torch::Tensor other, int64_t postop);
+
 // Forward declaration of the int2 x fp16 DPAS GEMM torch wrapper. The kernel
 // implementation lives in csrc/int2_fp16_dpas_kernel.sycl.
 torch::Tensor int2_fp16_dpas_gemm_run_torch(
@@ -235,12 +240,20 @@ torch::Tensor int2_bf16_upcvt_gemm_run_torch(
     torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
     std::optional<torch::Tensor> C_out);
 
+// Fused sign flip + blockwise Walsh-Hadamard transform (rotated-basis
+// checkpoints). Implementation in csrc/hadamard_fwht_kernel.sycl.
+torch::Tensor hadamard_fwht_run_torch(
+    torch::Tensor x, std::optional<torch::Tensor> signs, int64_t block,
+    bool inverse);
+
 TORCH_LIBRARY(xetla_int2, m) {
   m.def("int2_bf16_fused_gemm_run", &int2_bf16_fused_gemm_run_torch);
   m.def("int2_fp16_upcvt_gemm_run", &int2_fp16_upcvt_gemm_run_torch);
+  m.def("int2_fp16_upcvt_gemm_postop_run", &int2_fp16_upcvt_gemm_postop_run_torch);
   m.def("int2_bf16_upcvt_gemm_run", &int2_bf16_upcvt_gemm_run_torch);
   m.def("int2_fp16_dpas_gemm_run", &int2_fp16_dpas_gemm_run_torch);
   m.def("int1_fp16_upcvt_gemm_run", &int1_fp16_upcvt_gemm_run_torch);
   m.def("bitcos_fp16_upcvt_gemm_run", &bitcos_fp16_upcvt_gemm_run_torch);
   m.def("int2_fp16_moe_gemv_run", &int2_fp16_moe_gemv_run_torch);
+  m.def("hadamard_fwht_run", &hadamard_fwht_run_torch);
 }

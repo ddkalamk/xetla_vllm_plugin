@@ -282,6 +282,11 @@ def _xetla_prequant_try_load(layer: torch.nn.Module, prefix: str,
         else:
             layer._xetla_dpas_capable = False
         _xetla_pre_convert_bias(layer)
+        k_local = qw.shape[0] * 16 if method == "int2_f16" else 0
+        _xetla_hadamard_attach(layer, lookup_prefix, dev, k_local)
+        if layer.xetla_hadamard is not None and method != "int2_f16":
+            raise ValueError(f"{prefix}: hadamard-folded weights are only "
+                             f"wired for int2_f16, not {method}")
         return True
     except Exception as e:
         print(f"[xetla] WARN: sidecar load failed for {prefix} (lookup={lookup_prefix}): {e}",
@@ -377,6 +382,125 @@ def _xetla_pre_convert_bias(layer: torch.nn.Module) -> None:
             b.data = b.data.to(torch.float16)
     elif isinstance(b, torch.Tensor) and b.dtype != torch.float16:
         layer.bias = b.to(torch.float16)
+
+
+# ---- Hadamard rotated basis (Bonsai 2) --------------------------------------
+# Bonsai 2 stores every folded matrix in a rotated input basis: the runtime has
+# to multiply the activation by a fixed +-1 sign vector and then apply a
+# blockwise normalised Walsh-Hadamard transform (block 1024) before the GEMM,
+# and undo the same rotation on token embeddings after the lookup. The packer
+# (scripts/pack_bonsai2_gguf.py) carries the GGUF's prism.hadamard contract in
+# the sidecar metadata plus one `hadamard.signs.<K>` tensor per width.
+#
+# The transform runs as one fused SYCL kernel (csrc/hadamard_fwht_kernel.sycl)
+# when the extension provides it; XETLA_HADAMARD_IMPL=matmul falls back to a
+# matmul with the (symmetric) H_block/sqrt(block) matrix, which is what the
+# PrismML llama.cpp fork does and serves as the reference here.
+_xetla_hadamard_mats: dict = {}
+_xetla_hadamard_dtype = (torch.float16
+                         if os.environ.get("XETLA_HADAMARD_DTYPE", "fp32") == "fp16"
+                         else torch.float32)
+_xetla_hadamard_impl = os.environ.get("XETLA_HADAMARD_IMPL", "fused").lower()
+
+
+def _xetla_hadamard_fused_available() -> bool:
+    if _xetla_hadamard_impl != "fused":
+        return False
+    return hasattr(torch.ops.xetla_int2, "hadamard_fwht_run")
+
+
+def _xetla_hadamard_matrix(block: int, device) -> torch.Tensor:
+    key = (block, str(device))
+    h = _xetla_hadamard_mats.get(key)
+    if h is None:
+        h = torch.ones(1, 1, dtype=torch.float32)
+        while h.shape[0] < block:          # Sylvester construction
+            h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+        h = (h / float(block) ** 0.5).to(device=device, dtype=_xetla_hadamard_dtype)
+        _xetla_hadamard_mats[key] = h
+    return h
+
+
+def _xetla_hadamard_attach(layer: torch.nn.Module, lookup_prefix: str,
+                           dev: torch.device, k_local: int = 0) -> None:
+    """Pin the layer's sign vector when the sidecar marks it as folded.
+
+    `k_local` is the layer's input width after tensor-parallel slicing; when it
+    is smaller than the stored width the matching K-range of the sign vector
+    is taken (RowParallelLinear splits K contiguously per rank).
+    """
+    layer.xetla_hadamard = None
+    layer.xetla_hadamard_inverse = None
+    had = (_xetla_prequant_meta.get("extra") or {}).get("hadamard") or {}
+    if not had:
+        return
+    fwd = (had.get("layers") or {}).get(lookup_prefix)
+    inv = (had.get("inverse_layers") or {}).get(lookup_prefix)
+    rec = fwd or inv
+    if rec is None:
+        return
+    width, block = int(rec["width"]), int(had["block_size"])
+    from safetensors import safe_open  # noqa: WPS433
+    with safe_open(_xetla_prequant_load_path, framework="pt") as f:
+        signs = f.get_tensor(f"hadamard.signs.{width}")
+    if k_local and k_local != width:
+        if width % k_local or k_local % block:
+            raise ValueError(f"[xetla] hadamard: cannot slice K={width} to "
+                             f"{k_local} on block {block}")
+        rank = getattr(layer, "tp_rank", 0)
+        signs = signs[rank * k_local:(rank + 1) * k_local]
+    signs = signs.to(device=dev, dtype=_xetla_hadamard_dtype).contiguous()
+    fused = _xetla_hadamard_fused_available() and block == 1024
+    if fused:
+        signs = signs.to(torch.float16).contiguous()
+    else:
+        _xetla_hadamard_matrix(block, dev)   # materialise before graph capture
+    layer.xetla_hadamard_fused = fused
+    if fwd:
+        layer.xetla_hadamard = (signs, block)
+    else:
+        layer.xetla_hadamard_inverse = (signs, block)
+
+
+def _xetla_hadamard_fwd(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """x -> H_block (signs * x), blockwise along the last dim. Keeps x.dtype."""
+    had = getattr(layer, "xetla_hadamard", None)
+    if had is None:
+        return x
+    signs, block = had
+    if getattr(layer, "xetla_hadamard_fused", False):
+        x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+        if not x16.is_contiguous():
+            x16 = x16.contiguous()
+        if _xetla_is_compiling():
+            y = xetla_hadamard_fwht(x16, signs, block, False)
+        else:
+            y = torch.ops.xetla_int2.hadamard_fwht_run(x16, signs, block, False)
+        return y if y.dtype == x.dtype else y.to(x.dtype)
+    h = _xetla_hadamard_matrix(block, x.device)
+    y = (x.to(_xetla_hadamard_dtype) * signs).reshape(-1, block) @ h
+    return y.reshape(x.shape).to(x.dtype)
+
+
+def _xetla_hadamard_inv(layer: torch.nn.Module, e: torch.Tensor) -> torch.Tensor:
+    """Inverse for a rotated embedding row: signs * (H_block e)."""
+    had = getattr(layer, "xetla_hadamard_inverse", None)
+    if had is None:
+        return e
+    signs, block = had
+    if getattr(layer, "xetla_hadamard_fused", False):
+        e16 = e if e.dtype == torch.float16 else e.to(torch.float16)
+        if not e16.is_contiguous():
+            e16 = e16.contiguous()
+        if _xetla_is_compiling():
+            y = xetla_hadamard_fwht(e16, signs, block, True)
+        else:
+            y = torch.ops.xetla_int2.hadamard_fwht_run(e16, signs, block, True)
+        return y if y.dtype == e.dtype else y.to(e.dtype)
+    h = _xetla_hadamard_matrix(block, e.device)
+    y = (e.to(_xetla_hadamard_dtype).reshape(-1, block) @ h).reshape(e.shape)
+    return (y * signs).to(e.dtype)
+
 
 class Timer:
     """A simple context manager for measuring execution time."""
@@ -477,6 +601,50 @@ def _xetla_int2_fp16_upcvt_gemm_fake(
     return input.new_empty([input.shape[0], weight.shape[1]])
 
 
+@torch.library.custom_op("xetla::int2_fp16_upcvt_postop_gemm", mutates_args=())
+def xetla_int2_fp16_upcvt_postop_gemm(
+    input: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
+    other: torch.Tensor, postop: int,
+) -> torch.Tensor:
+    """int2 GEMV with the epilogue folded in, as the OpenVINO integration does.
+
+    postop 1 is silu(acc) * other, which is the SwiGLU gate; 2 is acc + other.
+    Folding the activation here removes the separate silu and multiply launches
+    that otherwise sit between the two MLP projections.
+    """
+    with Timer(input, weight):
+        return torch.ops.xetla_int2.int2_fp16_upcvt_gemm_postop_run(
+            input, weight, scale, other, postop
+        )
+
+
+@xetla_int2_fp16_upcvt_postop_gemm.register_fake
+def _xetla_int2_fp16_upcvt_postop_gemm_fake(
+    input: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
+    other: torch.Tensor, postop: int,
+) -> torch.Tensor:
+    return input.new_empty([input.shape[0], weight.shape[1]])
+
+
+@torch.library.custom_op("xetla::hadamard_fwht", mutates_args=())
+def xetla_hadamard_fwht(
+    x: torch.Tensor, signs: Optional[torch.Tensor], block: int, inverse: bool,
+) -> torch.Tensor:
+    """Fused sign flip + blockwise normalised Walsh-Hadamard transform (fp16).
+
+    forward: H(signs*x)/sqrt(block) per block of the last dim; inverse:
+    signs*(H x)/sqrt(block). One launch, no Hadamard matrix reads.
+    """
+    return torch.ops.xetla_int2.hadamard_fwht_run(x, signs, block, inverse)
+
+
+@xetla_hadamard_fwht.register_fake
+def _xetla_hadamard_fwht_fake(
+    x: torch.Tensor, signs: Optional[torch.Tensor], block: int, inverse: bool,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 # ---- int1 weights with per-K-group fp16 scales (gs=128), fp16 activations ----
 INT1_F16_GROUP_SIZE = 128
 
@@ -570,6 +738,25 @@ _BITCOS_SLICES_LNL = {
     (6144, 5120): 1,      # 27B linear_attn.out_proj
     (5120, 14336): 4,     # 27B self_attn.qkv_proj
     (5120, 248320): 4,    # 27B lm_head
+    # CAT-Q 1.7B/32B and Bonsai 1.7B/4B, measured the same way
+    # (tune_extra_shapes.sh LNL). 14 of these 16 shapes want a different slice
+    # count on the two devices, so the tables must not be shared.
+    (2048, 2048): 4,      # 1.7B o_proj
+    (2048, 4096): 2,      # 1.7B qkv_proj
+    (2048, 12288): 4,     # 1.7B gate_up_proj
+    (6144, 2048): 4,      # 1.7B down_proj
+    (2048, 151680): 2,    # Bonsai 1.7B lm_head
+    (2048, 151936): 2,    # CAT-Q 1.7B lm_head
+    (2560, 6144): 4,      # 4B  qkv_proj
+    (2560, 19456): 2,     # 4B  gate_up_proj
+    (9728, 2560): 2,      # 4B  down_proj
+    (4096, 2560): 2,      # 4B  o_proj
+    (2560, 151680): 2,    # 4B  lm_head
+    (5120, 10240): 4,     # 32B qkv_proj
+    (5120, 51200): 4,     # 32B gate_up_proj
+    (25600, 5120): 1,     # 32B down_proj
+    (8192, 5120): 1,      # 32B o_proj
+    (5120, 151936): 4,    # 32B lm_head
 }
 _BITCOS_SLICES_B70 = {
     (4096, 6144): 4,      # 8B  qkv_proj
@@ -582,6 +769,23 @@ _BITCOS_SLICES_B70 = {
     (6144, 5120): 4,      # 27B linear_attn.out_proj
     (5120, 14336): 2,     # 27B self_attn.qkv_proj
     (5120, 248320): 4,    # 27B lm_head
+    # CAT-Q 1.7B/32B and Bonsai 1.7B/4B (tune_extra_shapes.sh B70)
+    (2048, 2048): 8,      # 1.7B o_proj
+    (2048, 4096): 4,      # 1.7B qkv_proj
+    (2048, 12288): 2,     # 1.7B gate_up_proj
+    (6144, 2048): 8,      # 1.7B down_proj
+    (2048, 151680): 4,    # Bonsai 1.7B lm_head
+    (2048, 151936): 4,    # CAT-Q 1.7B lm_head
+    (2560, 6144): 4,      # 4B  qkv_proj
+    (2560, 19456): 1,     # 4B  gate_up_proj
+    (9728, 2560): 8,      # 4B  down_proj
+    (4096, 2560): 8,      # 4B  o_proj
+    (2560, 151680): 4,    # 4B  lm_head
+    (5120, 10240): 2,     # 32B qkv_proj
+    (5120, 51200): 8,     # 32B gate_up_proj
+    (25600, 5120): 4,     # 32B down_proj
+    (8192, 5120): 4,      # 32B o_proj
+    (5120, 151936): 4,    # 32B lm_head
 }
 BITCOS_TUNED_SLICES = (
     _BITCOS_SLICES_B70
@@ -950,6 +1154,10 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
         flat = input_.reshape(-1)
         out = unpack_int2_rowwise(layer.weight.data[flat],
                                   layer.scale.data[flat])
+        out = _xetla_hadamard_inv(layer, out)
+        # Hidden states must carry the model dtype: dense (non-ternary)
+        # layers downstream, e.g. Bonsai 2's bf16 in_proj_ba, mm against it.
+        out = out.to(getattr(layer, "xetla_out_dtype", out.dtype))
         return out.view(*input_.shape, -1)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -973,6 +1181,7 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
                 try:
                     from safetensors import safe_open  # noqa: WPS433
                     dev = _xetla_target_device(layer)
+                    layer.xetla_out_dtype = layer.weight.dtype
                     with safe_open(_xetla_prequant_load_path,
                                    framework="pt") as f:
                         qw = f.get_tensor(f"{lookup}.qweight")
@@ -983,8 +1192,12 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
                         sc.to(dev).contiguous(), requires_grad=False)
                     layer.xetla_embed_packed = True
                     layer.xetla_quantized = True
+                    _xetla_hadamard_attach(layer, lookup, dev)
                     print(f"[xetla] sidecar hit: {self.prefix} embedding "
-                          f"({method}), packed {tuple(qw.shape)}", flush=True)
+                          f"({method}), packed {tuple(qw.shape)}, out dtype "
+                          f"{layer.xetla_out_dtype}"
+                          f"{', inverse-hadamard' if layer.xetla_hadamard_inverse else ''}",
+                          flush=True)
                 except Exception as e:  # noqa: BLE001
                     print(f"[xetla] WARN: packed embedding load failed for "
                           f"{self.prefix}: {e}", flush=True)
@@ -1089,6 +1302,7 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
             return output
         if self.quant_config.method == "int2_f16" and getattr(layer, "xetla_quantized", False):
             x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+            x16 = _xetla_hadamard_fwd(layer, x16)
             b16 = bias if bias is None or bias.dtype == torch.float16 else bias.to(torch.float16)
             if not _xetla_is_compiling():
                 if x16.shape[0] > 1 and getattr(layer, "_xetla_dpas_capable", False):
@@ -1446,9 +1660,17 @@ class XetlaLinearMethod(LinearMethodBase):
         if method in ("int2_f16", "int1_f16", "bitcos_f16") and \
                 not getattr(layer, "xetla_quantized", False):
             # Layer was deliberately left dense (mixed-precision checkpoint).
+            # The xetla GEMMs hand the residual stream on in fp16, so a dense
+            # bf16 layer (Bonsai 2's in_proj_ba) needs the activation cast.
+            w_dtype = layer.weight.dtype
+            if x.dtype != w_dtype and w_dtype in (torch.float16, torch.bfloat16):
+                b = bias if bias is None or bias.dtype == w_dtype else bias.to(w_dtype)
+                return UnquantizedLinearMethod.apply(
+                    self, layer, x.to(w_dtype), b).to(x.dtype)
             return UnquantizedLinearMethod.apply(self, layer, x, bias)
         if method == "int2_f16":
             x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+            x16 = _xetla_hadamard_fwd(layer, x16)
             # B8: prefer the pre-converted layer.bias (always fp16 already).
             b16 = bias if bias is None or bias.dtype == torch.float16 else bias.to(torch.float16)
             # B7: under eager (no torch.compile tracing), skip the dispatch
@@ -1725,6 +1947,103 @@ def _xetla_quantize_lm_head(model: torch.nn.Module) -> None:
             print(f"[xetla] WARN: could not quantize {name}: {e}", flush=True)
 
 
+# ---- SwiGLU fused into the gate projection's epilogue -----------------------
+#
+# vLLM merges gate and up into one MergedColumnParallelLinear and applies
+# SiluAndMul afterwards, so the activation costs two extra launches and two
+# round trips of the intermediate per layer. OpenVINO instead keeps gate and up
+# as separate FCs and folds silu*other into the gate's epilogue. We reproduce
+# that by splitting the packed gate_up weight once at load time and replacing
+# the MLP forward with two GEMVs, the second carrying the activation.
+fuse_swiglu = int(os.environ.get("XETLA_FUSE_SWIGLU", "1")) > 0
+
+
+def _xetla_split_gate_up(gu: torch.nn.Module) -> bool:
+    """Split a packed gate_up projection into contiguous gate/up halves.
+
+    Only the int2 layout qualifies: it is the one stored as a 2-D [K/16, N]
+    table and the only one with a fused-epilogue kernel. BITCOS packs into a
+    flat 1-D buffer whose columns cannot be sliced this way.
+    """
+    sizes = getattr(gu, "output_sizes", None)
+    if not sizes or len(sizes) != 2 or sizes[0] != sizes[1]:
+        return False
+    q = getattr(gu, "weight", None)
+    s = getattr(gu, "scale", None)
+    if q is None or s is None:
+        return False
+    q, s = q.data, s.data
+    if q.dim() != 2 or s.dim() != 2:
+        return False
+    if q.dtype != torch.int32 or s.dtype != torch.float16:
+        return False
+    inter = sizes[0]
+    if q.shape[1] != 2 * inter or inter % 4 != 0:
+        return False
+    gu.xetla_gate_q = q[:, :inter].contiguous()
+    gu.xetla_up_q = q[:, inter:].contiguous()
+    gu.xetla_gate_s = s[:, :inter].contiguous()
+    gu.xetla_up_s = s[:, inter:].contiguous()
+    # The fused forward never touches the merged tensors again; keeping them
+    # would hold a second copy of every gate_up (~3 GiB for the 27B).
+    gu.weight.data = q.new_empty(0)
+    gu.scale.data = s.new_empty(0)
+    return True
+
+
+def _xetla_fused_mlp_forward(self, x):
+    gu = self.gate_up_proj
+    orig = x.shape
+    xf = x.reshape(-1, orig[-1])
+    if xf.dtype != torch.float16:
+        xf = xf.to(torch.float16)
+    # This bypasses XetlaLinearMethod.apply, so the rotated-basis transform
+    # of a Hadamard-folded gate_up has to be applied here.
+    xf = _xetla_hadamard_fwd(gu, xf).contiguous()
+    up = torch.ops.xetla.int2_fp16_upcvt_gemm(
+        xf, gu.xetla_up_q, gu.xetla_up_s, None)
+    act = torch.ops.xetla.int2_fp16_upcvt_postop_gemm(
+        xf, gu.xetla_gate_q, gu.xetla_gate_s, up, 1)
+    out, _ = self.down_proj(act)
+    # Hand the residual stream back in the model dtype, as apply() does.
+    if out.dtype != x.dtype:
+        out = out.to(x.dtype)
+    return out.reshape(*orig[:-1], out.shape[-1])
+
+
+def _xetla_fuse_swiglu(model: torch.nn.Module) -> None:
+    if not fuse_swiglu:
+        return
+    try:
+        from vllm.model_executor.layers.activation import SiluAndMul
+    except Exception:
+        return
+    n = 0
+    for mod in model.modules():
+        gu = getattr(mod, "gate_up_proj", None)
+        act = getattr(mod, "act_fn", None)
+        if gu is None or not isinstance(act, SiluAndMul):
+            continue
+        if getattr(mod, "down_proj", None) is None:
+            continue
+        # Only the int2 upcvt path has a fused-epilogue kernel; bias on the
+        # gate_up projection would need a third post-op slot.
+        if not getattr(gu, "xetla_quantized", False):
+            continue
+        if getattr(gu, "bias", None) is not None:
+            continue
+        try:
+            if not _xetla_split_gate_up(gu):
+                continue
+        except Exception as e:
+            print(f"[xetla] SwiGLU fusion skipped for one block: {e}")
+            continue
+        mod.forward = _xetla_fused_mlp_forward.__get__(mod, type(mod))
+        n += 1
+    if n:
+        print(f"[xetla] fused SwiGLU into the gate epilogue for {n} MLP blocks")
+
+
 def register():
     print("Hello xetla plugin!")
     _maybe_disable_triton_stride_versioning()
@@ -1757,6 +2076,7 @@ def register():
             model = args[0] if args else kwargs.get("model")
             if isinstance(model, torch.nn.Module):
                 _xetla_quantize_lm_head(model)
+                _xetla_fuse_swiglu(model)
             _xetla_prequant_flush_dump()
 
         _mu.process_weights_after_loading = _wrapped_pwal

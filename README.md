@@ -43,6 +43,31 @@ bash ./intel-deep-learning-essentials-2025.3.3.16_offline.sh -a --silent --eula 
 | --- | --- | --- |
 | `Ternary-Bonsai-8B` | GGUF or `prism-ml/Bonsai-8B-unpacked` | text-only |
 | `prism-ml/Ternary-Bonsai-27B-unpacked` | HF safetensors | vision-language, **needs a pre-packed sidecar** (below) |
+| `prism-ml/Ternary-Bonsai-2-27B-gguf` | GGUF (PQ2_0 + mmproj) | Hadamard **rotated basis**; packed by `scripts/pack_bonsai2_gguf.py`, see [BONSAI2.md](BONSAI2.md) |
+
+## Bonsai 2 27B (rotated basis)
+
+Bonsai 2 stores its ternary matrices in a Hadamard-rotated basis and ships only
+as GGUF. [BONSAI2.md](BONSAI2.md) is the from-scratch, step-by-step guide
+(build, download, pack, run, expected numbers). Short version:
+
+```bash
+python scripts/pack_bonsai2_gguf.py --gguf <PQ2_0.gguf> --mmproj <mmproj-BF16.gguf> \
+    --ref-dir <dir with tokenizer.json/config.json> \
+    --out Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors --packed Ternary-Bonsai-2-27B-packed
+bash scripts/run_bonsai2_gpu.sh <slurm-jobid> B70 "Tell me about photosynthesis in 200 words"
+```
+
+The sign flip + blockwise Walsh-Hadamard transform runs as one fused SYCL kernel
+(`csrc/hadamard_fwht_kernel.sycl`) in front of every folded int2 GEMM; B70
+decode is 46 tok/s vs 47.9 for the un-rotated Bonsai 1 27B, and the greedy text
+is bit-identical on B70 and LNL.
+
+**Prefill DPAS option.** `XETLA_DISABLE_DPAS=0` switches prefill to the DPAS
+(XMX) int2 kernel, which quantises activations to int8: B70 TTFT drops from
+~965 ms to ~391 ms with unchanged decode speed. The output remains coherent
+and on-topic but is not bit-identical to the default fp16-activation path
+(greedy argmax flips at some token). Default is off (`XETLA_DISABLE_DPAS=1`).
 
 ## Bonsai-27B: pack the int2 sidecar first
 

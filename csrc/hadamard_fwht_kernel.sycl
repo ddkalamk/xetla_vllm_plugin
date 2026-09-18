@@ -1,0 +1,164 @@
+/*******************************************************************************
+ * Fused sign flip + blockwise Walsh-Hadamard transform for Hadamard-folded
+ * (rotated basis) checkpoints such as Bonsai 2.
+ *
+ *   forward : y = H_n (s * x) / sqrt(n)      (before every folded GEMM)
+ *   inverse : y = s * (H_n x) / sqrt(n)      (after the embedding lookup)
+ *
+ * applied independently to every n-wide block along the last dimension of a
+ * [rows, K] fp16 activation (K % n == 0, s is a +-1 vector of length K).
+ * H_n is the Sylvester (natural order) Hadamard matrix, matching
+ * ggml/llama.cpp's `prism.hadamard` runtime and the MLX reference.
+ *
+ * One work-group of 128 items handles one 1024-wide block. The 10 radix-2
+ * stages run as four passes over registers: bits 0-2 straight from the load,
+ * bits 3-5 and 6-8 as radix-8 gathers through SLM, bit 9 as a radix-2 pass
+ * that writes straight to global memory. Accumulation is fp32 throughout;
+ * only the load and the store touch fp16. Each item rewrites exactly the SLM
+ * slots it read, so one barrier per pass boundary suffices; no matrix reads,
+ * so at decode the cost is essentially the launch.
+ *******************************************************************************/
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#include "timing_utils.h"
+
+namespace {
+
+constexpr int kBlock = 1024;
+constexpr int kWG = 128;              // work-items per block
+constexpr int kPerItem = kBlock / kWG; // 8 elements per item per pass
+
+// In-register radix-8 butterfly over 8 values whose indices differ in three
+// consecutive bits (stages h=1,2,4 of a length-8 WHT).
+inline void wht8(float* v) {
+#pragma unroll
+  for (int h = 1; h < 8; h <<= 1) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      if ((i & h) == 0) {
+        const float a = v[i], b = v[i + h];
+        v[i] = a + b;
+        v[i + h] = a - b;
+      }
+    }
+  }
+}
+
+sycl::event hadamard_fwht_1024_run(
+    sycl::queue& q, int64_t nblocks, int64_t K, const sycl::half* x,
+    const sycl::half* signs, sycl::half* y, bool inverse) {
+  const float scale = 1.0f / 32.0f;  // 1/sqrt(1024)
+  return q.submit([&](sycl::handler& h) {
+    sycl::local_accessor<float, 1> slm(sycl::range<1>(kBlock), h);
+    h.parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(nblocks * kWG), sycl::range<1>(kWG)),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+          const int64_t blk = it.get_group(0);
+          const int lid = static_cast<int>(it.get_local_id(0));
+          const int64_t blocks_per_row = K / kBlock;
+          const int64_t row = blk / blocks_per_row;
+          const int64_t col0 = (blk % blocks_per_row) * kBlock;
+          const sycl::half* xb = x + row * K + col0;
+          sycl::half* yb = y + row * K + col0;
+          const sycl::half* sb = signs ? signs + col0 : nullptr;
+
+          float v[kPerItem];
+
+          // pass 1: bits 0-2, elements lid*8 .. lid*8+7 (contiguous load)
+          {
+            const int base = lid * kPerItem;
+            const auto xv = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(xb + base);
+            if (sb && !inverse) {
+              const auto sv = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(sb + base);
+#pragma unroll
+              for (int j = 0; j < kPerItem; ++j)
+                v[j] = static_cast<float>(xv[j]) * static_cast<float>(sv[j]);
+            } else {
+#pragma unroll
+              for (int j = 0; j < kPerItem; ++j) v[j] = static_cast<float>(xv[j]);
+            }
+            wht8(v);
+#pragma unroll
+            for (int j = 0; j < kPerItem; ++j) slm[base + j] = v[j];
+          }
+          it.barrier(sycl::access::fence_space::local_space);
+
+          // pass 2: bits 3-5. base keeps bits 0-2 from lid&7 and bits 6-9
+          // from lid>>3; j walks bits 3-5.
+          {
+            const int base = (lid & 7) | ((lid >> 3) << 6);
+#pragma unroll
+            for (int j = 0; j < kPerItem; ++j) v[j] = slm[base + (j << 3)];
+            wht8(v);
+#pragma unroll
+            for (int j = 0; j < kPerItem; ++j) slm[base + (j << 3)] = v[j];
+          }
+          it.barrier(sycl::access::fence_space::local_space);
+
+          // pass 3: bits 6-8. base keeps bits 0-5 from lid&63 and bit 9 from
+          // lid>>6; j walks bits 6-8.
+          {
+            const int base = (lid & 63) | ((lid >> 6) << 9);
+#pragma unroll
+            for (int j = 0; j < kPerItem; ++j) v[j] = slm[base + (j << 6)];
+            wht8(v);
+#pragma unroll
+            for (int j = 0; j < kPerItem; ++j) slm[base + (j << 6)] = v[j];
+          }
+          it.barrier(sycl::access::fence_space::local_space);
+
+          // pass 4: bit 9, radix-2 on (i, i+512), 4 pairs per item, then scale
+          // (and the inverse's sign flip) and store fp16.
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const int i = lid + j * kWG;      // 0..511
+            const float a = slm[i], b = slm[i + 512];
+            float lo = (a + b) * scale, hi = (a - b) * scale;
+            if (sb && inverse) {
+              lo *= static_cast<float>(sb[i]);
+              hi *= static_cast<float>(sb[i + 512]);
+            }
+            yb[i] = static_cast<sycl::half>(lo);
+            yb[i + 512] = static_cast<sycl::half>(hi);
+          }
+        });
+  });
+}
+
+}  // namespace
+
+// x: [rows, K] fp16 (any leading shape is flattened); signs: [K] fp16 or none.
+torch::Tensor hadamard_fwht_run_torch(
+    torch::Tensor x, std::optional<torch::Tensor> signs, int64_t block,
+    bool inverse) {
+  RECORD_FUNCTION("hadamard_fwht", {x});
+  Timer t_("hadamard_fwht");
+  TORCH_CHECK(x.dtype() == torch::kHalf, "hadamard_fwht: x must be fp16");
+  TORCH_CHECK(x.is_contiguous(), "hadamard_fwht: x must be contiguous");
+  TORCH_CHECK(x.device().is_xpu(), "hadamard_fwht: x must be on XPU");
+  TORCH_CHECK(block == kBlock, "hadamard_fwht: only block 1024 is built");
+  const int64_t K = x.size(-1);
+  TORCH_CHECK(K % kBlock == 0, "hadamard_fwht: last dim must be a multiple of 1024");
+  const int64_t rows = x.numel() / K;
+
+  const sycl::half* s_ptr = nullptr;
+  if (signs.has_value() && signs->defined()) {
+    TORCH_CHECK(signs->dtype() == torch::kHalf, "hadamard_fwht: signs must be fp16");
+    TORCH_CHECK(signs->is_contiguous() && signs->numel() == K,
+                "hadamard_fwht: signs must be contiguous [K]");
+    TORCH_CHECK(signs->device() == x.device(), "hadamard_fwht: signs device");
+    s_ptr = reinterpret_cast<const sycl::half*>(signs->data_ptr<at::Half>());
+  }
+
+  auto y = torch::empty_like(x);
+  if (rows == 0) return y;
+  auto q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+  hadamard_fwht_1024_run(
+      q, rows * (K / kBlock), K,
+      reinterpret_cast<const sycl::half*>(x.data_ptr<at::Half>()), s_ptr,
+      reinterpret_cast<sycl::half*>(y.data_ptr<at::Half>()), inverse);
+  return y;
+}

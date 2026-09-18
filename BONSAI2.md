@@ -1,0 +1,249 @@
+# Bonsai 2 27B (Hadamard rotated basis) on Intel Xe2 GPUs, from an empty folder
+
+This runs **prism-ml/Ternary-Bonsai-2-27B** (ternary g128, Qwen3.8-27B based,
+GGUF-only release) with vLLM + the xetla int2 kernels on an Arc Pro B70 (or an
+Arc 140V / Lunar Lake). Every step below was executed verbatim in an empty
+directory on this cluster; the expected outputs are quoted from that run.
+
+Bonsai 2 differs from Bonsai 1 in one way that matters here: its matrices are
+stored in a **rotated basis**. Before every folded GEMM the activation is
+multiplied by a fixed ±1 sign vector and passed through a blockwise (1024)
+normalised Walsh-Hadamard transform; the token embedding is stored rotated and
+is un-rotated after lookup (`prism.hadamard.*` GGUF metadata; see the Bonsai 2
+whitepaper, A.2). Stock runtimes load the file and emit gibberish. Here the
+transform is one fused SYCL kernel (`csrc/hadamard_fwht_kernel.sycl`) applied
+by the plugin in front of the int2 GEMMs; the GGUF -> sidecar packer carries the
+contract (block size, sign vectors, which modules are folded) into the sidecar.
+
+Result on this cluster (greedy, 256 output tokens, 63-token prompt):
+
+| GPU | decode | TTFT | vs Bonsai 1 27B (no rotation) |
+| --- | --- | --- | --- |
+| Arc Pro B70 (Arrow Lake host) | 45.7-46.1 tok/s | ~965 ms | 47.9 tok/s |
+| Arc 140V (Lunar Lake, unified memory) | 7.42 tok/s | ~6.6 s | 7.51 tok/s |
+
+The generated text is byte-identical on both GPUs and to the un-fused
+(matmul) reference implementation of the transform.
+
+---
+
+## 0. Prerequisites
+
+* Intel GPU user-space driver + Level Zero, and oneAPI 2025.3 (icpx). On this
+  cluster:
+  ```bash
+  source /swtools/intel-gpu/latest/intel_gpu_vars.sh
+  source /swtools/intel/2025.3/oneapi-vars.sh --force
+  icpx --version      # Intel(R) oneAPI DPC++/C++ Compiler 2025.3.0
+  ```
+* `git`, `curl`; `uv` is bootstrapped by the setup script if missing
+  (`~/.local/bin/uv`).
+* ~40 GB free disk: venv + vLLM source build (~15 GB), the two GGUFs (8.1 GB),
+  sidecar + packed model dir (8.2 GB), inductor/triton caches.
+* Access to the GPU for the run steps (here: a SLURM allocation on the B70 or
+  LNL node; the build steps run anywhere with icpx).
+
+```bash
+export DEST=/path/to/empty/folder          # everything lands under here
+mkdir -p "$DEST" && cd "$DEST"
+```
+
+## 1. Build vLLM (XPU) + the xetla plugin
+
+```bash
+git clone -b feature/bitcos-int2-integration --recurse-submodules \
+    https://github.com/ddkalamk/xetla_vllm_plugin.git "$DEST/xetla_vllm_plugin"
+PLUGIN_BRANCH=feature/bitcos-int2-integration \
+    bash "$DEST/xetla_vllm_plugin/utils/setup_fresh.sh" "$DEST"
+```
+
+`setup_fresh.sh` (re-runnable, skips finished steps):
+
+1. initialises the `xetla` submodule (kernel headers, branch
+   `feature/bitcos-int2-integration` of `egeor/xetla`);
+2. creates `xetla_vllm_plugin/.venv` (Python 3.12 via uv);
+3. clones upstream `vllm-project/vllm` at **v0.21.0** into
+   `xetla_vllm_plugin/vllm` and applies the vendored `vllm.patch` (4 files:
+   GGUF/xetla quant hooks, XPU graph on TP=1, ...);
+4. `pip install -r requirements/xpu.txt`, then
+   `VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -e vllm`,
+   then `triton-xpu==3.7.0`;
+5. `python setup.py install` for the plugin: builds `xetla_pt_ext` (all
+   `csrc/*.sycl`, including the fused Hadamard kernel) and registers the
+   `vllm.general_plugins` entry point.
+
+Sanity check (needs a GPU; on SLURM prefix with `srun --jobid=<id> --overlap`):
+
+```bash
+source "$DEST/xetla_vllm_plugin/.venv/bin/activate"
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+python -c 'import torch, xetla_vllm_plugin, xetla_pt_ext; print(torch.xpu.get_device_name(0), hasattr(torch.ops.xetla_int2, "hadamard_fwht_run"))'
+# -> Intel(R) Arc(TM) Pro B70 Graphics True
+python "$DEST/xetla_vllm_plugin/tests/test_hadamard_xpu.py"
+# -> per-shape rel.err ~3e-4 (fp16 rounding), fused 7-22x faster than the matmul path, "OK"
+```
+
+## 2. Download the model files
+
+```bash
+source "$DEST/xetla_vllm_plugin/.venv/bin/activate"
+export MODELS="$DEST/models"; mkdir -p "$MODELS"
+
+# language model (PQ2_0, 7.2 GB) + vision projector (mmproj BF16, 0.93 GB)
+hf download prism-ml/Ternary-Bonsai-2-27B-gguf \
+    Ternary-Bonsai-2-27B-PQ2_0.gguf Ternary-Bonsai-2-27B-mmproj-BF16.gguf \
+    --local-dir "$MODELS/Ternary-Bonsai-2-27B-gguf"
+
+# tokenizer + HF-style config (small files from the MLX release of the same model)
+hf download prism-ml/Ternary-Bonsai-2-27B-mlx-2bit \
+    config.json tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json \
+    --local-dir "$MODELS/Ternary-Bonsai-2-27B-ref"
+
+# PrismML llama.cpp fork: its gguf-py knows the PQ2_0 type (id 142); stock gguf does not
+git clone --depth 1 -b prism https://github.com/PrismML-Eng/llama.cpp \
+    "$DEST/xetla_vllm_plugin/third_party/llama.cpp-prism"
+```
+
+## 3. Pack the sidecar and the model directory
+
+```bash
+cd "$DEST/xetla_vllm_plugin"
+python scripts/pack_bonsai2_gguf.py \
+    --gguf    "$MODELS/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf" \
+    --mmproj  "$MODELS/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-mmproj-BF16.gguf" \
+    --ref-dir "$MODELS/Ternary-Bonsai-2-27B-ref" \
+    --out     "$MODELS/Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors" \
+    --packed  "$MODELS/Ternary-Bonsai-2-27B-packed"
+```
+
+Expected tail (~1 min, CPU only):
+
+```
+[pack] hadamard: H1024, 401 folded, 1 inverse, sign widths [5120, 6144, 17408]
+[pack] GDN nv=48 nk=16 hd=128 hk=128; layers=64
+[pack] 257 quantized modules, 449 residual tensors
+...
+[pack] embedding (248320, 320) words, inverse-hadamard=True
+[pack] 258 sidecar modules (6.80 GB), 257 hadamard-folded, 1 inverse; 449 residual tensors
+[pack] wrote .../Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors (7.14 GB, ...s)
+[pack] wrote .../Ternary-Bonsai-2-27B-packed (782 tensors incl. 333 vision, 0.97 GB; eos=248046 bos=248044)
+```
+
+What it does (lossless; no re-quantisation):
+
+* PQ2_0 blocks (fp16 scale + 128 two-bit codes) are re-mapped bit-wise into
+  the xetla `int2_f16` layout (`qweight int32 [K/16, N]`, `scale fp16
+  [K/128, N]`), fused into vLLM's `qkv_proj` / `gate_up_proj` /
+  `in_proj_qkvz` modules, with `lm_head` and a row-major packed
+  `embed_tokens`.
+* The GGUF `prism.hadamard` contract goes into the sidecar metadata plus one
+  `hadamard.signs.<K>` tensor per folded width.
+* llama.cpp conventions are undone for HF/vLLM layout: tiled -> grouped GDN
+  value-head order, `A = -exp(A_log)` -> `A_log`, and the `w+1` norm weights
+  (Qwen3.5 norms are `x*(1+w)`).
+* The vision tower is converted from the mmproj GGUF (`v.blk.*` -> 
+  `model.visual.blocks.*`, `mm.0/mm.2` -> merger, split Conv3d slices re-stacked).
+* `config.json` is synthesised from the MLX release's config
+  (`Qwen3_5ForConditionalGeneration`; text/vision configs identical to
+  Qwen3.5-27B, `mtp_num_hidden_layers=0` because the GGUF has no MTP head).
+
+## 4. Run on the B70
+
+With SLURM (the script does the page-cache eviction, stale-process reclaim,
+memory-utilisation choice and XPU-graph settings that the B70/LNL runs need):
+
+```bash
+cd "$DEST/xetla_vllm_plugin"
+JOB=$(sbatch -p b70 -w pcl-arl01 -t 4:00:00 --parsable --wrap "sleep 14400")
+MODELS="$MODELS" MAXTOK=256 MAXLEN=512 \
+    bash scripts/run_bonsai2_gpu.sh "$JOB" B70 "Tell me about photosynthesis in 200 words"
+```
+
+Without SLURM, on a machine with the GPU:
+
+```bash
+cd "$DEST/xetla_vllm_plugin"
+source /swtools/intel-gpu/latest/intel_gpu_vars.sh
+source /swtools/intel/2025.3/oneapi-vars.sh --force
+source .venv/bin/activate
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+export VLLM_XPU_ENABLE_XPU_GRAPH=1
+export XETLA_PREQUANT_PATH="$MODELS/Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors"
+export XETLA_QUANT_METHOD=int2_f16
+python scripts/bench_model.py --model "$MODELS/Ternary-Bonsai-2-27B-packed" \
+    --quantization xetla --dtype bfloat16 --max-model-len 512 \
+    --gpu-memory-utilization 0.78 --cudagraph-sizes 1,2,4,8 --max-num-batched-tokens 512 \
+    --deterministic-compile --max-tokens 256 --temperature 0.0 --full \
+    --prompt "Tell me about photosynthesis in 200 words"
+```
+
+Expected (B70; first run includes a ~30 s torch.compile, engine load ~50 s):
+
+```
+[xetla] sidecar loaded: .../Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors (519 tensors, method=int2_f16)
+[xetla] sidecar hit: language_model.model.embed_tokens embedding (int2_f16), packed (248320, 320), out dtype torch.bfloat16, inverse-hadamard
+[xetla] fused SwiGLU into the gate epilogue for 64 MLP blocks
+...
+TTFT (prefill)       : ~965 ms
+decode               : 256 tokens in ~5.6 s = ~45.7 tok/s   [length]
+repetition           : 5 lines, 5 unique; 188 words, 129 unique
+We need to respond to user: "Tell me about photosynthesis in 200 words". ...
+"Photosynthesis is the process by which plants, algae, and some bacteria convert light energy into chemical energy. Using chlorophyll in chloroplasts, they capture sunlight and use it to transform carbon dioxide and water into glucose and oxygen. ...
+```
+
+(The model is a thinking model: the output starts with its reasoning, then
+`</think>`, then the answer. `--full` prints everything.)
+
+### Lunar Lake / Arc 140V (unified memory)
+
+Same script, two knobs from the LNL BKM plus one specific to a fresh compile:
+
+```bash
+JOB=$(sbatch -p lnl -w pcl-lnl01 -t 3:00:00 --parsable --wrap "sleep 10800")
+MODELS="$MODELS" UTIL=0.35 KVBYTES=$((2<<30)) MAXTOK=256 MAXLEN=512 \
+    bash scripts/run_bonsai2_gpu.sh "$JOB" LNL "Tell me about photosynthesis in 200 words"
+```
+
+* `UTIL=0.35` pins `--gpu-memory-utilization`; the sampled value over-reserves
+  on unified memory.
+* `KVBYTES` pins the KV-cache size. vLLM otherwise sizes it from a memory
+  profile taken right after torch.compile, and on LNL a *fresh* compile
+  inflates that profile by >10 GiB, so the budget goes negative
+  ("No available memory for the cache blocks"). 2 GiB is plenty for these
+  prompts (KV is 64 KiB/token).
+* If an engine was killed on LNL, the device memory it held stays with the
+  SLURM job cgroup: `scancel` and re-`sbatch` before retrying.
+
+Expected: `decode : 256 tokens in ~34.5 s = 7.42 tok/s`, TTFT ~6.6 s, same text
+as the B70.
+
+## 5. Knobs
+
+| Env / flag | Default | Effect |
+| --- | --- | --- |
+| `XETLA_HADAMARD_IMPL` | `fused` | `matmul` = reference implementation (sign multiply + matmul with H_1024). Same text, ~10% slower decode. |
+| `XETLA_HADAMARD_DTYPE` | `fp32` | accumulation dtype of the matmul reference only |
+| `XETLA_DISABLE_DPAS` | `1` | **`0` enables the DPAS (XMX) int2 prefill kernel**: activations are quantised to int8 for prefill, TTFT on the B70 drops 965 -> 391 ms and decode is unchanged. The output stays coherent and on-topic but is *not* bit-identical to the fp16 path (the argmax flips at some token and the continuation differs). Keep it off for reproducibility studies; turn it on for interactive use. |
+| `--deterministic-compile` (`DETERMINISTIC=1` in the script) | on | disables inductor's benchmark-selected combo kernels; without it the greedy text can differ between two fresh compiles (different fusions, different fp rounding). No measurable perf cost. |
+| `XETLA_FUSE_SWIGLU` | `1` | SwiGLU folded into the gate GEMM epilogue |
+| `KVBYTES`, `UTIL`, `MAXLEN`, `MAXTOK`, `CGSIZES`, `RUN_ENV="export ..."` | | run-script knobs, see its header |
+
+## 6. Verifying a change
+
+* `python tests/test_hadamard_cpu.py` (no GPU): helper math vs a butterfly
+  FWHT and ggml's parity construction.
+* `python tests/test_hadamard_xpu.py` (GPU): fused kernel vs matmul reference,
+  with timings.
+* End-to-end: run step 4 twice with `XETLA_HADAMARD_IMPL=fused` and `=matmul`
+  and `diff` the printed text; they must match.
+
+## Files
+
+| | |
+| --- | --- |
+| `scripts/pack_bonsai2_gguf.py` | GGUF (PQ2_0 + mmproj) -> sidecar + packed model dir |
+| `scripts/run_bonsai2_gpu.sh` | SLURM runner used for the numbers above |
+| `scripts/bench_model.py` | the benchmark (`--deterministic-compile`, `--kv-cache-memory-bytes`) |
+| `csrc/hadamard_fwht_kernel.sycl` | fused sign flip + blockwise WHT (block 1024), op `xetla_int2.hadamard_fwht_run` |
+| `xetla_vllm_plugin.py` | `_xetla_hadamard_*`: attaches sign vectors from the sidecar, applies the transform before folded GEMMs and after the embedding lookup |
+| `tests/test_hadamard_{cpu,xpu}.py` | unit checks |

@@ -43,6 +43,14 @@ def parse_args():
                    help="comma-separated batch sizes to capture graphs for")
     p.add_argument("--prompt", action="append", default=None,
                    help="repeat to benchmark several prompts off one load")
+    p.add_argument("--kv-cache-memory-bytes", type=int, default=None,
+                   help="pin the KV cache size instead of profiling for it "
+                        "(unified-memory parts charge a fresh torch.compile "
+                        "against the budget)")
+    p.add_argument("--deterministic-compile", action="store_true",
+                   help="turn off inductor's benchmark-selected combo kernels "
+                        "so a fresh compile picks the same fusions every time "
+                        "(otherwise greedy output can differ between compiles)")
     return p.parse_args()
 
 
@@ -58,8 +66,13 @@ def main():
     if a.cudagraph_sizes:
         sizes = [int(s) for s in a.cudagraph_sizes.split(",")]
         extra["compilation_config"] = {"cudagraph_capture_sizes": sizes}
+    if a.deterministic_compile:
+        extra.setdefault("compilation_config", {})["inductor_compile_config"] = {
+            "combo_kernels": False, "benchmark_combo_kernel": False}
     if a.max_num_batched_tokens:
         extra["max_num_batched_tokens"] = a.max_num_batched_tokens
+    if a.kv_cache_memory_bytes:
+        extra["kv_cache_memory_bytes"] = a.kv_cache_memory_bytes
 
     t0 = time.perf_counter()
     llm = LLM(model=a.model, tokenizer=a.tokenizer or a.model,
@@ -90,9 +103,11 @@ def main():
     # a realistic length is what triggers triton jit and first-touch of the
     # attention/graph buckets, and that lands entirely in the first TTFT
     # (2.2 s against 66 ms warmed).
+    # Only the first prompt: the timed loop submits one request at a time, so
+    # warming on all of them would prefill a batch the timed path never sees.
     if not a.no_warmup:
         w0 = time.perf_counter()
-        llm.generate(templated, SamplingParams(max_tokens=8, temperature=0.0))
+        llm.generate(templated[:1], SamplingParams(max_tokens=8, temperature=0.0))
         warm_s = time.perf_counter() - w0
     else:
         warm_s = float("nan")
