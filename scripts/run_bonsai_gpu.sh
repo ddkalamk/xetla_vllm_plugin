@@ -95,14 +95,6 @@ declare -A PACKED=(
   [8B]=$MODELS/Ternary-Bonsai-8B-packed
   [27B]=$MODELS/Bonsai-27B-packed
 )
-# BITCOS sidecars, transcoded from the int2 ones; only 8B/27B were built.
-# slice_count is baked in and the devices disagree, so BITCOS_SFX selects a
-# device-tuned file (e.g. BITCOS_SFX=.b70).
-BITCOS_SFX=${BITCOS_SFX:-}
-declare -A BITCOS_SIDECAR=(
-  [8B]=$MODELS/Ternary-Bonsai-8B-unpacked.xetla-bitcos_f16${BITCOS_SFX}.safetensors
-  [27B]=$MODELS/Bonsai-27B.xetla-bitcos_f16${BITCOS_SFX}.safetensors
-)
 
 # order matters: the GPU runtime and oneAPI must come before the venv, else
 # torch.xpu.device_count() is 0 and vLLM fails with "Device string must not be empty"
@@ -125,21 +117,14 @@ CGSIZES=${CGSIZES:-1,2,4,8}
 # KV budget to -4.91 GiB even though the weights are only 15.27 GiB of a 22.3 GiB
 # budget. The prompts here are 32 tokens, so profiling that wide is pure waste.
 MAXBATCHTOK=${MAXBATCHTOK:-512}
-# gpu-memory-utilization. Left empty this is sampled from free memory per arm,
-# which drifts with whatever the previous arm left behind: on LNLv2 the 8B int2
-# arm drew 0.74 and the bitcos arm 0.45. On unified memory that reservation is
-# taken out of the same DDR5 the CPU and page cache use, so the arms are not
-# comparable. Pin it to compare quantization methods.
-declare -A UTIL_BY_MODEL=( [1.7B]=0.25 [4B]=0.30 [8B]=0.35 [27B]=0.55 )
-UTIL=${UTIL:-}
 
 OUT=$PLUG/bonsai_gpu_${TAG}.csv
 LOGD=$PLUG/bonsai_logs
 mkdir -p "$LOGD"
 [[ -f "$OUT" ]] || echo "platform,model,wdtype,ttft_ms,tokens_per_s,status" > "$OUT"
 
-for M in ${MODELS_LIST:-1.7B 4B 8B 27B}; do
-  for WD in ${WDS:-int2 bf16}; do
+for M in 1.7B 4B 8B 27B; do
+  for WD in int2 bf16; do
     if grep -qE "^$TAG,$M,$WD,.*,(ok|OOM)$" "$OUT"; then
       echo "    $M $WD -> already recorded"; continue
     fi
@@ -154,20 +139,12 @@ for M in ${MODELS_LIST:-1.7B 4B 8B 27B}; do
     if [[ "$WD" == "int2" ]]; then
       QENV="export XETLA_PREQUANT_PATH=${SIDECAR[$M]} XETLA_QUANT_METHOD=int2_f16"
       ARGS="--model ${PACKED[$M]} --tokenizer ${SNAP[$M]} --quantization xetla"
-    elif [[ "$WD" == "bitcos" ]]; then
-      if [[ -z "${BITCOS_SIDECAR[$M]:-}" ]]; then
-        echo "$TAG,$M,bitcos,,,no-sidecar" >> "$OUT"
-        echo "    $M bitcos -> no sidecar built"; continue
-      fi
-      QENV="export XETLA_PREQUANT_PATH=${BITCOS_SIDECAR[$M]} XETLA_QUANT_METHOD=bitcos_f16${DECODE_CFG:+ XETLA_BITCOS_DECODE_CFG=$DECODE_CFG}"
-      ARGS="--model ${PACKED[$M]} --tokenizer ${SNAP[$M]} --quantization xetla"
     else
       QENV="unset XETLA_PREQUANT_PATH XETLA_QUANT_METHOD"
       ARGS="--model ${SNAP[$M]} --quantization none"
     fi
 
     echo ">>> $TAG $M $WD"
-    UTIL_M=${UTIL:-${UTIL_BY_MODEL[$M]:-}}
     srun --jobid="$JOB" --overlap bash -lc "$ENV_SETUP
       pids=\$(ps -u \$USER -o pid=,comm= | awk '\$2 ~ /^(vllm|VLLM::EngineCor)\$/ {print \$1}')
       [[ -n \"\$pids\" ]] && kill -9 \$pids 2>/dev/null
@@ -177,8 +154,7 @@ for M in ${MODELS_LIST:-1.7B 4B 8B 27B}; do
       # re-prefetches the checkpoints into page cache before it checks, and on
       # unified memory that is deducted from the budget. Asking for nearly the
       # whole device loses that race.
-      U=$UTIL_M
-      [[ -n \"\$U\" ]] || U=\$(python -c 'import torch;f,t=torch.xpu.mem_get_info();print(f\"{max(0.20,min(0.78,(f-4*2**30)/t)):.2f}\")')
+      U=\$(python -c 'import torch;f,t=torch.xpu.mem_get_info();print(f\"{max(0.20,min(0.78,(f-4*2**30)/t)):.2f}\")')
       echo \"[util] \$U\"
       $QENV
       B=/tmp/bonsai_bench.\$\$.log

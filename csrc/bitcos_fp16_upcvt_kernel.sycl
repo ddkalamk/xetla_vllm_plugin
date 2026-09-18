@@ -279,6 +279,23 @@ static const BitcosDecodeTile* bitcos_tile_for(size_t K, size_t N,
       {6144, 5120, 32, 4},      // 27B linear_attn.out_proj
       {5120, 14336, 64, 2},     // 27B self_attn.qkv_proj
       {5120, 248320, 128, 4},   // 27B lm_head
+      // CAT-Q 1.7B/32B and Bonsai 1.7B/4B (tune_extra_shapes.sh B70)
+      {2048, 2048, 32, 8},      // 1.7B o_proj
+      {2048, 4096, 32, 4},      // 1.7B qkv_proj
+      {2048, 12288, 32, 2},     // 1.7B gate_up_proj
+      {6144, 2048, 32, 8},      // 1.7B down_proj
+      {2048, 151680, 128, 4},   // Bonsai 1.7B lm_head
+      {2048, 151936, 128, 4},   // CAT-Q 1.7B lm_head
+      {2560, 6144, 32, 4},      // 4B  qkv_proj
+      {2560, 19456, 32, 1},     // 4B  gate_up_proj
+      {9728, 2560, 32, 8},      // 4B  down_proj
+      {4096, 2560, 32, 8},      // 4B  o_proj
+      {2560, 151680, 128, 4},   // 4B  lm_head
+      {5120, 10240, 64, 2},     // 32B qkv_proj
+      {5120, 51200, 64, 8},     // 32B gate_up_proj
+      {25600, 5120, 32, 4},     // 32B down_proj
+      {8192, 5120, 32, 4},      // 32B o_proj
+      {5120, 151936, 128, 4},   // 32B lm_head
   };
   static constexpr BitcosDecodeTile kLNL[] = {
       {4096, 6144, 64, 4},      // 8B  qkv_proj
@@ -291,6 +308,23 @@ static const BitcosDecodeTile* bitcos_tile_for(size_t K, size_t N,
       {6144, 5120, 128, 1},     // 27B linear_attn.out_proj
       {5120, 14336, 128, 4},    // 27B self_attn.qkv_proj
       {5120, 248320, 64, 4},    // 27B lm_head
+      // CAT-Q 1.7B/32B and Bonsai 1.7B/4B (tune_extra_shapes.sh LNL)
+      {2048, 2048, 128, 4},     // 1.7B o_proj
+      {2048, 4096, 64, 2},      // 1.7B qkv_proj
+      {2048, 12288, 128, 4},    // 1.7B gate_up_proj
+      {6144, 2048, 64, 4},      // 1.7B down_proj
+      {2048, 151680, 64, 2},    // Bonsai 1.7B lm_head
+      {2048, 151936, 128, 2},   // CAT-Q 1.7B lm_head
+      {2560, 6144, 64, 4},      // 4B  qkv_proj
+      {2560, 19456, 128, 2},    // 4B  gate_up_proj
+      {9728, 2560, 32, 2},      // 4B  down_proj
+      {4096, 2560, 64, 2},      // 4B  o_proj
+      {2560, 151680, 128, 2},   // 4B  lm_head
+      {5120, 10240, 128, 4},    // 32B qkv_proj
+      {5120, 51200, 64, 4},     // 32B gate_up_proj
+      {25600, 5120, 128, 1},    // 32B down_proj
+      {8192, 5120, 128, 1},     // 32B o_proj
+      {5120, 151936, 64, 4},    // 32B lm_head
   };
   const BitcosDecodeTile* tab = lnl ? kLNL : kB70;
   const size_t n_ent = lnl ? sizeof(kLNL) / sizeof(kLNL[0])

@@ -31,22 +31,52 @@ namespace {
 // Fixed K-group for the fp16-scales upcvt kernel (matches the xetla test).
 static constexpr int kScaleGS = 128;
 
+// XeTLA's own sigmoid_op_t predates chained_tile_op_t and takes no arguments_t,
+// so it cannot be chained. This mirrors silu_op_t without the final multiply.
+struct sigmoid_chain_op_t {
+  struct arguments_t {};
+  template <typename matAcc_t, typename coord_t>
+  __XETLA_API KERNEL_FUNC void operator()(
+      matAcc_t& matAcc, [[maybe_unused]] const coord_t& coord,
+      [[maybe_unused]] const arguments_t& args,
+      [[maybe_unused]] uint32_t slm_base = 0,
+      [[maybe_unused]] uint32_t nbarrier_base = 0) {
+    constexpr int elems = matAcc_t::tile_desc::block_elems;
+    constexpr int rounds = matAcc_t::tile_desc::tile_elems / elems;
+#pragma unroll
+    for (int i = 0; i < rounds; ++i) {
+      auto sub_vec = matAcc.reg.xetla_select<elems, 1>(elems * i);
+      sub_vec = xetla_sigmoid<typename matAcc_t::dtype, elems>(sub_vec);
+    }
+    constexpr int remaining_elems = matAcc_t::tile_desc::tile_elems % elems;
+    if constexpr (remaining_elems != 0) {
+      auto sub_vec = matAcc.reg.xetla_select<remaining_elems, 1>(
+          elems * (matAcc_t::tile_elems / elems));
+      sub_vec =
+          xetla_sigmoid<typename matAcc_t::dtype, remaining_elems>(sub_vec);
+    }
+  }
+};
+
 // Unique kernel-name tag to avoid mangled-name collisions between
 // (XT, WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned) instantiations.
 template <
     typename XT, int WGM, int WGN, int SGM, int SGN, int SGK, int KS, int LS,
-    bool kUnaligned>
+    bool kUnaligned, int POSTOP>
 class int2_upcvt_kernel_tag;
 
 // XT is the activation / scale / output element type: gpu::xetla::fp16 or
 // gpu::xetla::bf16. The dequant is bit work on 16-bit lanes, so both work.
+// POSTOP selects the fused epilogue: 0 none, 1 silu*other, 2 +other,
+// 3 +bias, 4 sigmoid -- the same numbering the OpenVINO integration uses.
 template <
     typename XT, int WGM, int WGN, int SGM, int SGN, int SGK, int KS, int LS,
-    bool kUnaligned>
+    bool kUnaligned, int POSTOP = 0>
 sycl::event int2_upcvt_gemm_impl(
     sycl::queue& queue, const size_t M, const size_t N, const size_t K,
     XT* A_d, int32_t* B_d, XT* C_d, XT* ScaleB_d,
-    float* Acc_d, uint32_t* Cnt_d) {
+    float* Acc_d, uint32_t* Cnt_d, XT* Other_d = nullptr,
+    XT* Bias_d = nullptr, size_t BiasN = 0) {
   using data_type_a = XT;
   using data_type_b = int2x16;
   using data_type_c = XT;
@@ -84,9 +114,29 @@ sycl::event int2_upcvt_gemm_impl(
   using gemm_t = gpu::xetla::group::gemm_t<
       compute_policy, tile_shape, mem_desc_a_t, mem_desc_b_t>;
 
+  using silu_t = gpu::xetla::subgroup::silu_op_t;
+  using sigmoid_t = sigmoid_chain_op_t;
+  using bias_t = gpu::xetla::subgroup::bias_add_op_t<XT, arch_tag>;
+  using prod_t = gpu::xetla::subgroup::elemwise_reduce_op_t<
+      gpu::xetla::reduce_op::prod, XT, arch_tag>;
+  using sum_t = gpu::xetla::subgroup::elemwise_reduce_op_t<
+      gpu::xetla::reduce_op::sum, XT, arch_tag>;
+  using tile_op_t = std::conditional_t<
+      POSTOP == 1, gpu::xetla::subgroup::chained_tile_op_t<silu_t, prod_t>,
+      std::conditional_t<
+          POSTOP == 2, gpu::xetla::subgroup::chained_tile_op_t<sum_t>,
+          std::conditional_t<
+              POSTOP == 3, gpu::xetla::subgroup::chained_tile_op_t<bias_t>,
+              gpu::xetla::subgroup::chained_tile_op_t<sigmoid_t>>>>;
+
+  // Post-ops need the aligned epilogue; every shape that uses one has N
+  // divisible by 4, so the unaligned path is never selected with POSTOP != 0.
   using epilogue_policy_t = std::conditional_t<
-      kUnaligned, gpu::xetla::group::epilogue_policy_unaligned<arch_tag>,
-      gpu::xetla::group::epilogue_policy_default<arch_tag>>;
+      POSTOP != 0,
+      gpu::xetla::group::epilogue_policy_tile_op<tile_op_t, arch_tag>,
+      std::conditional_t<
+          kUnaligned, gpu::xetla::group::epilogue_policy_unaligned<arch_tag>,
+          gpu::xetla::group::epilogue_policy_default<arch_tag>>>;
   using mem_desc_c_epilogue_t = std::conditional_t<
       kUnaligned,
       gpu::xetla::mem_desc_t<
@@ -107,10 +157,34 @@ sycl::event int2_upcvt_gemm_impl(
   uint32_t ldc = static_cast<uint32_t>(N);
   uint32_t lds = static_cast<uint32_t>(N);
 
-  typename gemm_op_t::arguments_t gemm_arg(
-      static_cast<uint32_t>(M), static_cast<uint32_t>(K),
-      static_cast<uint32_t>(N), A_d, lda, reinterpret_cast<int2x16*>(B_d), ldb,
-      C_d, ldc, ScaleB_d, lds, Acc_d, Cnt_d);
+  auto make_args = [&]() {
+    if constexpr (POSTOP == 0) {
+      return typename gemm_op_t::arguments_t(
+          static_cast<uint32_t>(M), static_cast<uint32_t>(K),
+          static_cast<uint32_t>(N), A_d, lda, reinterpret_cast<int2x16*>(B_d),
+          ldb, C_d, ldc, ScaleB_d, lds, Acc_d, Cnt_d);
+    } else {
+      typename tile_op_t::arguments_t tile_args;
+      if constexpr (POSTOP == 1 || POSTOP == 2) {
+        using reduce_t = std::conditional_t<POSTOP == 1, prod_t, sum_t>;
+        typename reduce_t::arguments_t other_args(
+            Other_d, {static_cast<uint32_t>(N), static_cast<uint32_t>(M),
+                      static_cast<uint32_t>(N)});
+        // silu occupies slot 0 when present, so the reduce op shifts to slot 1.
+        tile_args.template set<POSTOP == 1 ? 1 : 0>(other_args);
+      } else if constexpr (POSTOP == 3) {
+        const uint32_t bn = static_cast<uint32_t>(BiasN != 0 ? BiasN : N);
+        typename bias_t::arguments_t bias_args(Bias_d, {bn, 1, bn});
+        tile_args.template set<0>(bias_args);
+      }
+      typename epilogue_t::arguments_t epilogue_args(tile_args);
+      return typename gemm_op_t::arguments_t(
+          static_cast<uint32_t>(M), static_cast<uint32_t>(K),
+          static_cast<uint32_t>(N), A_d, lda, reinterpret_cast<int2x16*>(B_d),
+          ldb, C_d, ldc, ScaleB_d, lds, Acc_d, Cnt_d, epilogue_args);
+    }
+  };
+  typename gemm_op_t::arguments_t gemm_arg = make_args();
 
   if (!gemm_op_t::can_implement(gemm_arg)) {
     std::cout << "int2_fp16_upcvt: arguments not supported (M=" << M
@@ -119,8 +193,8 @@ sycl::event int2_upcvt_gemm_impl(
   }
   sycl::nd_range<3> nd_range = gemm_op_t::get_nd_range(gemm_arg);
 
-  using kernel_name_t =
-      int2_upcvt_kernel_tag<XT, WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned>;
+  using kernel_name_t = int2_upcvt_kernel_tag<
+      XT, WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned, POSTOP>;
 
   Timer t("int2_fp16_upcvt_submit");
   return queue.submit([&](handler& cgh) {
@@ -189,12 +263,13 @@ using upcvt_fn_t = sycl::event (*)(
 // compile-time params via gemm_op_t::get_acc_buf_size / get_cnt_buf_size).
 template <
     typename XT, int WGM, int WGN, int SGM, int SGN, int SGK, int KS, int LS,
-    bool kUnaligned>
+    bool kUnaligned, int POSTOP = 0>
 sycl::event upcvt_dispatch(
     sycl::queue& q, size_t M, size_t N, size_t K, XT* A, int32_t* B,
-    XT* C, XT* SB, float* acc, uint32_t* cnt) {
-  return int2_upcvt_gemm_impl<XT, WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned>(
-      q, M, N, K, A, B, C, SB, acc, cnt);
+    XT* C, XT* SB, float* acc, uint32_t* cnt, XT* Other = nullptr) {
+  return int2_upcvt_gemm_impl<
+      XT, WGM, WGN, SGM, SGN, SGK, KS, LS, kUnaligned, POSTOP>(
+      q, M, N, K, A, B, C, SB, acc, cnt, Other);
 }
 
 // Compute scratch byte requirements for a given (M, N, KS, LS) by
@@ -247,6 +322,17 @@ std::pair<size_t, size_t> upcvt_scratch_bytes(size_t M, size_t N) {
 }
 
 } // namespace
+
+// The integrated part wants systematically less k-slicing than the discrete
+// one, so the decode tiers are selected by device rather than shared.
+static bool int2_is_integrated(sycl::queue& q) {
+  static const bool lnl = [&] {
+    const auto name = q.get_device().get_info<sycl::info::device::name>();
+    return name.find("Arc(TM) Graphics") != std::string::npos &&
+           name.find("Pro") == std::string::npos;
+  }();
+  return lnl;
+}
 
 // -- Public entry point: pick a precompiled variant based on (M, N) ----------
 //
@@ -336,6 +422,38 @@ sycl::event int2_upcvt_gemm_run(
         default: break;
       }
     }
+    // ----- Integrated part (Arc 140V / Lunar Lake). The tiers below were
+    // measured on a discrete B70 and do not carry over: retuning is worth 2.6%
+    // on the 8B decode step and 5.8% on the 27B one. Measured with
+    // xetla/int2_fp16_upcvt_dpas_fast_test/tune_bonsai_int2_paced.sh, which
+    // paces the sweep -- this device drops to roughly half its bandwidth under
+    // back-to-back load, and an unpaced sweep ranks whichever tile happened to
+    // run while it was coolest. Effective GiB/s, canary-verified steady state:
+    //   (4096,   6144)  qkv_proj          (32, 1, 1)   65.5
+    //   (4096,  24576)  gate_up_proj     (256, 1, 1)   62.5
+    //   (12288,  4096)  down_proj         (32, 1, 2)   64.3
+    //   (4096, 151680)  lm_head          (128, 1, 2)   77.0
+    //   (5120,  34816)  mlp.gate_up_proj  (64, 1, 1)   64.2
+    //   (17408,  5120)  mlp.down_proj     (32, 1, 1)   61.8
+    //   (5120,  16384)  in_proj_qkvz      (32, 1, 1)   63.5
+    //   (6144,   5120)  out_proj          (32, 1, 1)   63.7
+    //   (5120,  14336)  self_attn.qkv     (32, 1, 4)   61.7
+    //   (5120, 248320)  lm_head           (64, 1, 1)   78.5
+    if (int2_is_integrated(q)) {
+      if (K == 4096 && N == 6144)         { DISPATCH(32, 1, 1); }
+      // o_proj: without this the shape falls to the generic N<=4096 tier, the
+      // only one in the model that global-k-slices. 69.6 against 60.7 GiB/s.
+      else if (K == 4096 && N == 4096)    { DISPATCH(32, 1, 2); }
+      else if (K == 4096 && N == 24576)   { DISPATCH(256, 1, 1); }
+      else if (K == 12288 && N == 4096)   { DISPATCH(32, 1, 2); }
+      else if (K == 4096 && N == 151680)  { DISPATCH(128, 1, 2); }
+      else if (K == 5120 && N == 34816)   { DISPATCH(64, 1, 1); }
+      else if (K == 17408 && N == 5120)   { DISPATCH(32, 1, 1); }
+      else if (K == 5120 && N == 16384)   { DISPATCH(32, 1, 1); }
+      else if (K == 6144 && N == 5120)    { DISPATCH(32, 1, 1); }
+      else if (K == 5120 && N == 14336)   { DISPATCH(32, 1, 4); }
+      else if (K == 5120 && N == 248320)  { DISPATCH(64, 1, 1); }
+    }
     // ----- Bonsai-8B GEMV shapes: tuned configs from
     // xetla/int2_fp16_upcvt_dpas_fast_test/results/bonsai_8B_run1/best.csv
     // Format: (K, N) -> (WGN, KS, LS), measured GiB/s on Xe2.
@@ -345,6 +463,7 @@ sycl::event int2_upcvt_gemm_run(
     //   (4096, 151680)  -> (32, 1, 4)   434.78 GiB/s   (lm_head)
     //   (12288,  4096)  -> (32, 1, 8)   418.83 GiB/s   (down_proj)
     if (K == 4096 && N == 6144)        { DISPATCH(32, 1, 4); }
+    else if (K == 4096 && N == 4096)   { DISPATCH(32, 1, 8); }
     else if (K == 4096 && N == 12288)  { DISPATCH(32, 1, 2); }
     else if (K == 4096 && N == 24576)  { DISPATCH(32, 1, 4); }
     else if (K == 4096 && N == 151680) { DISPATCH(32, 1, 4); }
@@ -391,6 +510,42 @@ sycl::event int2_upcvt_gemm_run(
 #undef K_DIVIDES
 }
 
+// Decode GEMV with a fused epilogue, mirroring the OpenVINO integration:
+// POSTOP 1 is silu(acc)*Other (the SwiGLU gate), 2 is acc+Other (a residual).
+// Kept separate from int2_upcvt_gemm_run so the un-fused path keeps its full
+// tuned tier table without multiplying every tier by every post-op.
+template <typename XT>
+sycl::event int2_upcvt_gemm_postop_run(
+    sycl::queue& q, const size_t M, const size_t N, const size_t K,
+    XT* A, int32_t* B, XT* C, XT* ScaleB, XT* Other, int postop) {
+  size_t need_acc = 0, need_cnt = 0;
+  auto widen = [&](std::pair<size_t, size_t> p) {
+    need_acc = std::max(need_acc, p.first);
+    need_cnt = std::max(need_cnt, p.second);
+  };
+  widen(upcvt_scratch_bytes<XT, 1, 128, 1, 16, 128, 1, 8, false>(M, N));
+  auto& sc = get_scratch(q, need_acc, need_cnt);
+
+#define DISPATCH_PO(WGN_, KS_, LS_)                                           \
+  do {                                                                        \
+    if (postop == 1)                                                          \
+      return upcvt_dispatch<                                                  \
+          XT, 1, WGN_, 1, 16, 128, KS_, LS_, false, 1>(                       \
+          q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt, Other);                \
+    return upcvt_dispatch<XT, 1, WGN_, 1, 16, 128, KS_, LS_, false, 2>(       \
+        q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt, Other);                  \
+  } while (0)
+
+  // Same tiers the un-fused decode path picks for these shapes; the epilogue
+  // does not change which tile wins because it touches no extra weight bytes.
+  if (K % (1 * 2 * 128) == 0 && K == 4096 && N == 12288) { DISPATCH_PO(32, 1, 2); }
+  if (N <= 4096 && K % (8 * 128) == 0)                   { DISPATCH_PO(32, 1, 8); }
+  if (N <= 8192 && K % (4 * 128) == 0)                   { DISPATCH_PO(64, 1, 4); }
+  if (N <= 16384 && K % (2 * 128) == 0)                  { DISPATCH_PO(64, 1, 2); }
+  DISPATCH_PO(128, 1, 1);
+#undef DISPATCH_PO
+}
+
 // Concrete entry points. fp16 is what Bonsai and the existing sidecars use;
 // bf16 is for checkpoints that are natively bf16 (CAT-Q exports with
 // use_bfloat16: true), where converting to fp16 would be an extra round trip.
@@ -399,6 +554,14 @@ sycl::event int2_fp16_upcvt_gemm_run(
     gpu::xetla::fp16* A, int32_t* B, gpu::xetla::fp16* C,
     gpu::xetla::fp16* ScaleB) {
   return int2_upcvt_gemm_run<gpu::xetla::fp16>(q, M, N, K, A, B, C, ScaleB);
+}
+
+sycl::event int2_fp16_upcvt_gemm_postop(
+    sycl::queue& q, const size_t M, const size_t N, const size_t K,
+    gpu::xetla::fp16* A, int32_t* B, gpu::xetla::fp16* C,
+    gpu::xetla::fp16* ScaleB, gpu::xetla::fp16* Other, int postop) {
+  return int2_upcvt_gemm_postop_run<gpu::xetla::fp16>(
+      q, M, N, K, A, B, C, ScaleB, Other, postop);
 }
 
 sycl::event int2_bf16_upcvt_gemm_run(
@@ -459,6 +622,53 @@ torch::Tensor int2_fp16_upcvt_gemm_run_torch(
     int2_fp16_upcvt_gemm_run(
         q, static_cast<size_t>(m), static_cast<size_t>(n),
         static_cast<size_t>(k), a_ptr, b_ptr, c_ptr, sb_ptr);
+  }
+  return C;
+}
+
+// Same GEMV with a fused epilogue: postop 1 = silu(acc) * other (SwiGLU gate),
+// 2 = acc + other (residual). `other` must match C in shape and dtype.
+torch::Tensor int2_fp16_upcvt_gemm_postop_run_torch(
+    torch::Tensor A, torch::Tensor B, torch::Tensor scale_B,
+    torch::Tensor other, int64_t postop) {
+  RECORD_FUNCTION("int2_fp16_upcvt_gemm_postop", {A, B});
+  Timer t_("int2_fp16_upcvt_gemm_postop");
+  TORCH_CHECK(postop == 1 || postop == 2, "postop must be 1 (silu*other) or 2 (+other)");
+  TORCH_CHECK(A.dtype() == torch::kHalf && other.dtype() == torch::kHalf,
+              "A and other must be fp16");
+  TORCH_CHECK(B.dtype() == torch::kInt32, "B must be int32 (int2x16)");
+  TORCH_CHECK(scale_B.dtype() == torch::kHalf, "scale_B must be fp16");
+  TORCH_CHECK(A.is_contiguous() && B.is_contiguous() && scale_B.is_contiguous()
+                  && other.is_contiguous(),
+              "A, B, scale_B and other must be contiguous");
+  TORCH_CHECK(A.device().is_xpu() && B.device().is_xpu()
+                  && scale_B.device().is_xpu() && other.device().is_xpu(),
+              "all tensors must be on XPU");
+  TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && scale_B.dim() == 2, "A,B,scale_B must be 2D");
+
+  long m = A.size(0);
+  long k = A.size(1);
+  long n = B.size(1);
+  TORCH_CHECK(k % 128 == 0, "k must be multiple of 128 (scale group size)");
+  TORCH_CHECK(B.size(0) == k / 16, "B.size(0) must be k/16");
+  TORCH_CHECK(scale_B.size(0) == k / 128 && scale_B.size(1) == n, "scale shape");
+  // The fused epilogue only has an aligned variant.
+  TORCH_CHECK(n % 4 == 0, "n must be a multiple of 4 for the fused epilogue");
+  TORCH_CHECK(other.numel() == m * n, "other must have m*n elements");
+
+  torch::Tensor C = A.new_empty({m, n}, torch::kHalf);
+  auto q = c10::xpu::getCurrentXPUStream(A.device().index()).queue();
+  {
+    RECORD_FUNCTION("int2_fp16_upcvt_gemm_postop_run", {});
+    int2_fp16_upcvt_gemm_postop(
+        q, static_cast<size_t>(m), static_cast<size_t>(n),
+        static_cast<size_t>(k),
+        reinterpret_cast<sycl::half*>(A.data_ptr<at::Half>()),
+        B.data_ptr<int32_t>(),
+        reinterpret_cast<sycl::half*>(C.data_ptr<at::Half>()),
+        reinterpret_cast<sycl::half*>(scale_B.data_ptr<at::Half>()),
+        reinterpret_cast<sycl::half*>(other.data_ptr<at::Half>()),
+        static_cast<int>(postop));
   }
   return C;
 }
