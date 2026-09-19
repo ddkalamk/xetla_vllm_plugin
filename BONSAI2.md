@@ -71,8 +71,9 @@ PLUGIN_BRANCH=feature/bitcos-int2-integration \
    `feature/bitcos-int2-integration` of `egeor/xetla`);
 2. creates `xetla_vllm_plugin/.venv` (Python 3.12 via uv);
 3. clones upstream `vllm-project/vllm` at **v0.21.0** into
-   `xetla_vllm_plugin/vllm` and applies the vendored `vllm.patch` (4 files:
-   GGUF/xetla quant hooks, XPU graph on TP=1, ...);
+   `xetla_vllm_plugin/vllm` and applies the vendored `vllm.patch` (5 files:
+   GGUF/xetla quant hooks, XPU graph on TP=1, and the XPU GDN kernel call
+   sliced to `num_actual_tokens` so graph-padded batches of >2 sequences run);
 4. `pip install -r requirements/xpu.txt`, then
    `VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -e vllm`,
    then `triton-xpu==3.7.0`;
@@ -281,12 +282,51 @@ greedy text identical on the two GPUs.
 * End-to-end: run step 4 twice with `XETLA_HADAMARD_IMPL=fused` and `=matmul`
   and `diff` the printed text; they must match.
 
+### Accuracy with a standard harness
+
+The single greedy prompt above catches gross breakage, not a subtle numeric
+bug. For that, run the standard lm-evaluation-harness against the vLLM engine
+(same plugin, same kernels, batched):
+
+```bash
+.venv/bin/pip install "lm_eval>=0.4.8"        # torch/vLLM pinned via constraints
+LIMIT=300 bash scripts/eval_bonsai2_lm_eval.sh "$JOB" gsm8k300
+```
+
+The script writes a YAML config (`--model vllm`, `quantization=xetla`, chat
+template, thinking on with `reasoning_effort=medium`, answers taken after
+`</think>`, greedy, `max_num_seqs=16`, cudagraph sizes 1..16) and runs
+`gsm8k_cot_llama` (8-shot, "The final answer is N": prompts of ~900 tokens,
+answers from a few hundred to 4096 tokens, so both the M-tiled prefill and the
+batched decode path are exercised). Results land in
+`bonsai_logs/lm_eval_<TAG>/` with per-sample outputs. Knobs: `LIMIT`, `TASKS`,
+`EFFORT=xhigh`, `THINK=0` (instruct mode), `MAXGEN`, `NSEQ`, `METHOD=bitcos`.
+
+Bonsai 2 27B, int2 + fused Hadamard + M-tiled prefill, B70:
+
+| Examples | exact match | wall time |
+| --- | --- | --- |
+| GSM8K test, first 300 | **98.0%** (294/300; 1 of the 6 misses hit the 4096-token budget) | 21 min |
+
+The model card reports the math group (GSM8K/MATH-500/AIME25/AIME26, EvalScope,
+thinking mode, H100) at 96.57 for Bonsai 2 and 97.06 for the FP16 base, so a
+GSM8K score in the high 90s is what an intact model gives; a kernel or packing
+bug shows up as a collapse (the pre-fix norm-fold bug, for instance, produced
+fluent gibberish at 0%).
+
+Batched decode needed one vLLM-side fix (now in `vllm.patch`): the XPU GDN
+kernel asserts `rows == num_actual_tokens`, but with >2 sequences the model
+runner pads the batch to the graph capture size; the call is now sliced to the
+actual tokens. `python tests/batched_generate.py --model <packed> --n 16` is
+the quick check (16 prompts in one `generate`, ~170 tok/s aggregate on the B70).
+
 ## Files
 
 | | |
 | --- | --- |
 | `scripts/pack_bonsai2_gguf.py` | GGUF (PQ2_0 + mmproj) -> sidecar + packed model dir |
 | `scripts/run_bonsai2_gpu.sh` | SLURM runner used for the numbers above |
+| `scripts/eval_bonsai2_lm_eval.sh`, `scripts/gpu_py.sh`, `tests/batched_generate.py` | lm-evaluation-harness run (GSM8K), generic GPU-node python launcher, batched-generation smoke test |
 | `scripts/transcode_int2_to_bitcos.py`, `scripts/zero_density.py` | int2 -> BITCOS sidecar (keeps `hadamard.*`); zero density of a sidecar |
 | `tests/test_int2_prefill_mtile.py`, `tests/mbench_smallM.py` | M-tiled prefill sweep vs legacy tiers; small-M microbench |
 | `scripts/bench_model.py` | the benchmark (`--deterministic-compile`, `--kv-cache-memory-bytes`) |
