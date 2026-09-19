@@ -306,7 +306,8 @@ Bonsai 2 27B, int2 + fused Hadamard + M-tiled prefill, B70:
 
 | Examples | exact match | wall time |
 | --- | --- | --- |
-| GSM8K test, first 300 | **98.0%** (294/300; 1 of the 6 misses hit the 4096-token budget) | 21 min |
+| GSM8K test, first 300 | 98.0% (294/300) | 21 min |
+| **GSM8K test, all 1319** | **96.7%** (1276/1319, ±0.5; 1 answer hit the 4096-token budget, 1 extraction miss, the rest model errors) | 90 min |
 
 The model card reports the math group (GSM8K/MATH-500/AIME25/AIME26, EvalScope,
 thinking mode, H100) at 96.57 for Bonsai 2 and 97.06 for the FP16 base, so a

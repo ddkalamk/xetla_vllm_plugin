@@ -117,13 +117,12 @@ else
     log "vllm already present; leaving as-is"
 fi
 
-# Apply vendored vllm.patch (best-effort): the plugin tree carries vllm.patch
-# at vllm/vllm.patch (next to its vllm/ snapshot). Apply it on top of the
-# cloned upstream vllm.
-PATCH_FILE="$PLUGIN_DIR/vllm/vllm.patch"
+# Apply the vendored vllm.patch on top of the cloned upstream vllm. The
+# tracked copy lives at the plugin root (vllm.patch); an older layout kept it
+# next to the vllm/ snapshot.
+PATCH_FILE="$PLUGIN_DIR/vllm.patch"
 if [[ ! -f "$PATCH_FILE" ]]; then
-    # Some plugin checkouts may keep it at the repo root.
-    [[ -f "$PLUGIN_DIR/vllm.patch" ]] && PATCH_FILE="$PLUGIN_DIR/vllm.patch"
+    [[ -f "$PLUGIN_DIR/vllm/vllm.patch" ]] && PATCH_FILE="$PLUGIN_DIR/vllm/vllm.patch"
 fi
 if [[ -f "$PATCH_FILE" ]]; then
     cp "$PATCH_FILE" "$VLLM_DIR/vllm.patch"
@@ -133,7 +132,7 @@ if [[ -f "$PATCH_FILE" ]]; then
     elif (cd "$VLLM_DIR" && git apply --reverse --check vllm.patch >/dev/null 2>&1); then
         log "vllm.patch already applied; skipping"
     else
-        err "vllm.patch FAILED to apply cleanly to $VLLM_DIR (this will silently disable xetla quant hooks)"
+        err "vllm.patch FAILED to apply cleanly to $VLLM_DIR (xetla quant hooks and the batched XPU GDN fix would be missing)"
         (cd "$VLLM_DIR" && git apply --check vllm.patch) || true
         exit 1
     fi
