@@ -264,11 +264,22 @@ Plugin-side changes for v0.30: `XetlaLinearMethod` initialises
 the runners pass `--max-num-seqs` (v0.30 refuses `max_num_seqs` larger than
 the Mamba state cache; default 256).
 
-B70 (pcl-zen4), Bonsai 2 27B, v0.21.0 -> v0.30.0: int2 decode 45.7 -> 46.1
-tok/s (TTFT 176 -> 180 ms), BITCOS 47.3 -> 48.6 tok/s, batched 16x256
-241.7 -> 242.9 tok/s, GSM8K-300 98.0% -> 98.0%. Greedy text is coherent but
-not byte-identical across the two versions (new torch/inductor and GDN
-kernel); it diverges after ~50 tokens.
+Bonsai 2 27B, v0.21.0 -> v0.30.0, same node and settings for both:
+
+| | B70 (pcl-zen4) | Arc 140V (LNL) |
+| --- | --- | --- |
+| int2 decode, 256 tok | 45.7 -> 46.1 tok/s | 7.78 -> 8.16 tok/s |
+| int2 TTFT | 176 -> 180 ms | 1001 -> 991 ms |
+| BITCOS decode | 47.3 -> 48.6 tok/s | 8.19 -> 9.33 tok/s |
+| batched 16x256 (`tests/batched_generate.py --ignore-eos --warmup`) | 241.7 -> 242.9 tok/s | 31.5 -> 31.3 tok/s |
+| GSM8K (`scripts/eval_bonsai2_lm_eval.sh`) | 98.0% -> 98.0% (300) | 95.3% -> 96.9% (64) |
+
+LNL needs `UTIL=0.35` plus a pinned KV cache (`KVBYTES=$((2<<30))` for the
+runner, `--kv-cache-memory-bytes` for `batched_generate.py`, `KVBYTES` for the
+eval), and a fresh allocation per engine start (a finished engine leaves
+~13 GiB of unified memory held until the job ends, on both versions). Greedy
+text is coherent but not byte-identical across the two versions (new
+torch/inductor and GDN kernel); it diverges after ~50 tokens.
 
 ## torch.compile cache
 
