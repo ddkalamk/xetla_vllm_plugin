@@ -296,6 +296,23 @@ B70, 256 tokens, batch 1 (baseline 46.2 tok/s):
 | 2 | 2.42 | 73.9 | 1.60x |
 | 3 | 2.88 | 80.2 | 1.73x |
 
+LNL (`UTIL=0.35 KVBYTES=$((2<<30))`), same prompt, baseline 7.66 tok/s,
+130 ms/step:
+
+| draft tokens | tok/step | ms/step | tok/s | speedup |
+| --- | --- | --- | --- | --- |
+| 1 | 1.79 | 179 | 9.94 | 1.30x |
+| 2 | 2.37 | 216 | 10.87 | 1.42x |
+| 3 | 2.72 | 244 | 11.06 | 1.44x |
+| 4 | 2.84 | 266 | 10.59 | 1.38x |
+| 5 | 3.01 | 282 | 10.56 | 1.38x |
+| 6 | 3.05 | 308 | 9.79 | 1.28x |
+| 7 | 3.08 | 330 | 9.22 | 1.20x |
+
+Acceptance saturates at ~3 tokens/step beyond k=4 while the step keeps
+growing, so k=3 is best. The small-M tile is tuned on the B70 only; a k=3
+verify step costs 1.87x a decode step on LNL vs ~1.6x on the B70.
+
 Before the small-M tile the same runs gave 43.3 / 52.9 / 56.9 tok/s. GSM8K
 (`gsm8k_cot_llama`, 300 examples, thinking, batch 16): MTP k=3 97.7%
 against 98.0% without MTP (one question, within the 0.9% stderr), 1311 s
