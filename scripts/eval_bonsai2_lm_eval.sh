@@ -17,6 +17,7 @@
 #   MAXGEN=N         max generated tokens (default 4096 thinking, 1024 not)
 #   MAXLEN=N         max_model_len (default MAXGEN+2048)
 #   NSEQ=N           max_num_seqs (default 16)
+#   SPEC=N           MTP speculative decoding with N draft tokens (DRAFT dir)
 #   METHOD=int2|bitcos, BITCOS_SFX, MODELS, PACKED, SIDECAR as in run_bonsai2_gpu.sh
 ###############################################################################
 set -uo pipefail
@@ -55,6 +56,12 @@ NSEQ=${NSEQ:-16}
 UTIL=${UTIL:-0.78}
 OUT=$PLUG/bonsai_logs/lm_eval_${TAG}
 mkdir -p "$OUT"
+SPEC_ARGS=""
+if [[ -n "${SPEC:-}" ]]; then
+  DRAFT=${DRAFT:-$MODELS/Ternary-Bonsai-2-27B-MTP-draft}
+  SPEC_ARGS="speculative_config: {method: mtp, model: $DRAFT, num_speculative_tokens: $SPEC}
+  hf_overrides: {text_config: {mtp_num_hidden_layers: 1}}"
+fi
 
 cat > "$OUT/config.yaml" <<EOF
 model: vllm
@@ -72,6 +79,7 @@ model_args:
   limit_mm_per_prompt: {image: 0, video: 0}
   compilation_config: {cudagraph_capture_sizes: [1, 2, 4, 8, 16], inductor_compile_config: {combo_kernels: false, benchmark_combo_kernel: false}}
   $THINK_ARGS
+  $SPEC_ARGS
 tasks: [$TASKS]
 apply_chat_template: true
 fewshot_as_multiturn: true

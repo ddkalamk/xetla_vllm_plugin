@@ -260,6 +260,52 @@ Measured: B70 47.8 tok/s, TTFT 151 ms; LNL (`UTIL=0.35 KVBYTES=$((2<<30))
 BITCOS_SFX=.lnl`) 8.31 tok/s, TTFT 969 ms. Sidecar 6.19 GB vs 7.14 GB int2;
 greedy text identical on the two GPUs.
 
+### MTP speculative decoding
+
+The community MTP head
+[ProCreations/Ternary-Bonsai-2-27B-MTP](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP)
+(`model_mtp.safetensors`, bf16, one Qwen3.5 decoder layer + `fc` + norms,
+~425M params) drafts tokens for the int2 target. It shares the target's
+`embed_tokens`/`lm_head`, which are loaded through the xetla sidecar.
+
+```bash
+huggingface-cli download ProCreations/Ternary-Bonsai-2-27B-MTP --local-dir "$MODELS/Ternary-Bonsai-2-27B-MTP"
+D=$MODELS/Ternary-Bonsai-2-27B-MTP-draft; mkdir -p $D
+cp $PACKED/{config.json,generation_config.json,tokenizer.json,tokenizer_config.json,chat_template.jinja} $D/
+python - <<EOF   # the packed config says mtp_num_hidden_layers: 0
+import json; p="$D/config.json"; c=json.load(open(p))
+c.setdefault("text_config", c)["mtp_num_hidden_layers"] = 1; json.dump(c, open(p, "w"), indent=2)
+EOF
+ln -sf $MODELS/Ternary-Bonsai-2-27B-MTP/model_mtp.safetensors $D/model.safetensors
+SPEC=3 MAXTOK=256 bash scripts/run_bonsai2_gpu.sh "$JOB" B70 "Explain photosynthesis in detail."
+SPEC=3 bash scripts/eval_bonsai2_lm_eval.sh "$JOB" B70_mtp3       # GSM8K with MTP
+```
+
+Needed pieces: XPU GDN attention runs verify rows through vLLM's Triton
+recurrent kernels (the SYCL kernel has no per-token state slots) and mixed
+batches split between the two (`vllm/_xpu_ops.py`); and a k-sliced small-M
+tile (1 < M <= 8) in the int2 kernel, because the plain M tile made the M=4
+verify GEMMs 1.2-3.8x slower than the M=1 GEMV (down_proj 202 vs 54 us; now
+61). `XETLA_INT2_SMALLM_CFG=0` turns it off, `1..6` sweeps (WGN, LS).
+
+B70, 256 tokens, batch 1 (baseline 46.2 tok/s):
+
+| draft tokens | tok/step | tok/s | speedup |
+| --- | --- | --- | --- |
+| 1 | 1.79 | 61.2 | 1.32x |
+| 2 | 2.42 | 73.9 | 1.60x |
+| 3 | 2.88 | 80.2 | 1.73x |
+
+Before the small-M tile the same runs gave 43.3 / 52.9 / 56.9 tok/s. GSM8K
+(`gsm8k_cot_llama`, 300 examples, thinking, batch 16): MTP k=3 97.7%
+against 98.0% without MTP (one question, within the 0.9% stderr), 1311 s
+against 1299 s. At batch 16 MTP brings no throughput gain because the
+verify GEMMs are M=64 and no longer bandwidth-bound. Without the small-M tile the MTP text is
+identical to the non-speculative run. With it, the tile's k-slices are
+summed in a different order (rel. err ~3e-4 against the GEMV tier), so the
+greedy trajectory drifts after a few tokens. k=1, 2 and 3 all produce the
+same text.
+
 ## 5. Knobs
 
 | Env / flag | Default | Effect |
@@ -267,6 +313,8 @@ greedy text identical on the two GPUs.
 | `XETLA_HADAMARD_IMPL` | `fused` | `matmul` = reference implementation (sign multiply + matmul with H_1024). Same text, ~10% slower decode. |
 | `XETLA_HADAMARD_DTYPE` | `fp32` | accumulation dtype of the matmul reference only |
 | `XETLA_INT2_PREFILL_CFG` | `0` | M>1 tile for the int2 upcvt kernel: `-1` = old per-token GEMV tiers (B70 TTFT 966 ms vs 179 ms), `1..5` alternative tiles (see `csrc/int2_fp16_upcvt_kernel.sycl`). |
+| `XETLA_INT2_SMALLM_CFG` | per-shape | 1<M<=8 k-sliced tile (MTP verify): `0` = plain M tile, `1..6` = (WGN, LS) (32,2) (32,4) (32,8) (64,2) (64,4) (64,8) |
+| `SPEC=N` (run / eval scripts) | off | MTP speculative decoding with N draft tokens, draft dir `DRAFT` |
 | `XETLA_DISABLE_DPAS` | `1` | `0` enables the DPAS (XMX) int2 prefill kernel: activations are quantised to int8 for prefill (B70 TTFT ~391 ms, now slower than the default M-tiled fp16 path). The output stays coherent and on-topic but is *not* bit-identical to the fp16 path. |
 | `METHOD=bitcos`, `BITCOS_SFX=.b70\|.lnl` | `int2` | run-script switch to the BITCOS sidecar (section 4, BITCOS) |
 | `--deterministic-compile` (`DETERMINISTIC=1` in the script) | on | disables inductor's benchmark-selected combo kernels; without it the greedy text can differ between two fresh compiles (different fusions, different fp rounding). No measurable perf cost. |

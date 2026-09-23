@@ -62,6 +62,9 @@ UTIL=${UTIL:-}
 KVBYTES=${KVBYTES:-}
 DETERMINISTIC=${DETERMINISTIC:-1}
 EXTRA=${EXTRA:-}${KVBYTES:+ --kv-cache-memory-bytes $KVBYTES}
+# SPEC=N enables MTP speculative decoding with N draft tokens (draft dir DRAFT)
+DRAFT=${DRAFT:-$MODELS/Ternary-Bonsai-2-27B-MTP-draft}
+[[ -n "${SPEC:-}" ]] && EXTRA+=" --speculative-config method=mtp,model=$DRAFT,num_speculative_tokens=$SPEC"
 [[ "$DETERMINISTIC" == "1" ]] && EXTRA+=" --deterministic-compile"
 
 ENV_SETUP="
@@ -77,7 +80,7 @@ ${RUN_ENV:-}
 
 LOGD=$PLUG/bonsai_logs
 mkdir -p "$LOGD"
-LOG="$LOGD/gpu_${TAG}_B2-27B_${METHOD}.log"
+LOG="$LOGD/gpu_${TAG}_B2-27B_${METHOD}${SPEC:+_mtp$SPEC}.log"
 echo ">>> $TAG Bonsai-2-27B $METHOD (hadamard) -> $LOG"
 
 srun --jobid="$JOB" --overlap bash -lc "$ENV_SETUP

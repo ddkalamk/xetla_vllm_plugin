@@ -9,11 +9,11 @@ import subprocess
 import sys
 import time
 
-CFGS = [-1, 0, 1, 2, 3, 4, 5]
+CFGS = [int(c) for c in os.environ.get("MTILE_CFGS", "-1,0,1,2,3,4,5").split(",")]
 SHAPES = [(5120, 16384, "in_proj_qkvz"), (5120, 34816, "gate_up"),
           (17408, 5120, "down"), (6144, 5120, "out_proj"),
           (5120, 14336, "qkv_proj"), (5120, 248320, "lm_head")]
-MS = [2, 4, 8, 16, 63, 128, 512]
+MS = [int(m) for m in os.environ.get("MTILE_MS", "2,4,8,16,63,128,512").split(",")]
 
 
 def worker(cfg: int):
@@ -68,7 +68,7 @@ def main():
         print(f"\n{name} K={K} N={N}   (us per GEMM; rel.err vs legacy GEMV tier)")
         print("  M     " + "".join(f"cfg{c:>3}          " for c in res))
         for M in MS:
-            if (name, M) not in ref:
+            if ref is None or (name, M) not in ref:
                 continue
             row = f"  {M:<5d} "
             for c, d in res.items():

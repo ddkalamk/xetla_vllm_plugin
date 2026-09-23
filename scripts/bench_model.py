@@ -47,6 +47,10 @@ def parse_args():
                    help="pin the KV cache size instead of profiling for it "
                         "(unified-memory parts charge a fresh torch.compile "
                         "against the budget)")
+    p.add_argument("--torch-profile-dir", default=None,
+                   help="write a torch profiler trace of the timed requests here")
+    p.add_argument("--speculative-config", default=None,
+                   help='JSON, e.g. {"method":"mtp","model":"<dir>","num_speculative_tokens":2}')
     p.add_argument("--deterministic-compile", action="store_true",
                    help="turn off inductor's benchmark-selected combo kernels "
                         "so a fresh compile picks the same fusions every time "
@@ -73,6 +77,25 @@ def main():
         extra["max_num_batched_tokens"] = a.max_num_batched_tokens
     if a.kv_cache_memory_bytes:
         extra["kv_cache_memory_bytes"] = a.kv_cache_memory_bytes
+    if a.torch_profile_dir:
+        extra["profiler_config"] = {"profiler": "torch", "torch_profiler_dir": a.torch_profile_dir,
+                                    "torch_profiler_with_stack": False}
+    if a.speculative_config:
+        # "method=mtp,model=/x,num_speculative_tokens=2" (shell-safe) or JSON
+        import json
+        sc = a.speculative_config
+        if sc.strip().startswith("{"):
+            extra["speculative_config"] = json.loads(sc)
+        else:
+            d = dict(kv.split("=", 1) for kv in sc.split(","))
+            for k in ("num_speculative_tokens",):
+                if k in d:
+                    d[k] = int(d[k])
+            extra["speculative_config"] = d
+        # The draft model is built from the *target's* hf config; the packed
+        # Bonsai 2 config says 0 MTP layers because the GGUF ships none.
+        if extra["speculative_config"].get("method") == "mtp":
+            extra["hf_overrides"] = {"text_config": {"mtp_num_hidden_layers": 1}}
 
     t0 = time.perf_counter()
     llm = LLM(model=a.model, tokenizer=a.tokenizer or a.model,
@@ -135,6 +158,8 @@ def main():
     print(f"device memory in use : {(total_b - free_b) / 2**30:.2f} GiB "
           f"of {total_b / 2**30:.2f} GiB")
 
+    if a.torch_profile_dir:
+        llm.start_profile()
     for idx, (raw, prompt) in enumerate(zip(prompts, templated)):
         sp = SamplingParams(max_tokens=a.max_tokens, temperature=a.temperature,
                             repetition_penalty=a.repetition_penalty)
@@ -143,9 +168,11 @@ def main():
         t0 = time.perf_counter()
         first_tok = None
         n = 0
+        steps = 0
         text = ""
         finish = ""
         while engine.has_unfinished_requests():
+            steps += 1
             for out in engine.step():
                 if out.request_id != req:
                     continue
@@ -164,11 +191,16 @@ def main():
         print(f"TTFT (prefill)       : {ttft * 1000:.0f} ms")
         print(f"decode               : {n} tokens in {decode_s:.2f} s = "
               f"{n / decode_s if decode_s else 0:.2f} tok/s   [{finish}]")
+        if a.speculative_config:
+            # steps include the prefill step; tokens/step > 1 means drafts got accepted
+            print(f"engine steps         : {steps} -> {n / max(steps - 1, 1):.2f} tokens per decode step")
         if a.full:
             print(f"repetition           : {_repetition_report(text)}")
             print(text.strip())
         else:
             print(text.strip()[:700])
+    if a.torch_profile_dir:
+        llm.stop_profile()
     return
 
 

@@ -114,6 +114,18 @@ def _xetla_prequant_lookup(prefix: str, method: str = "") -> Optional[str]:
     for cand in candidates:
         if f"{cand}.qweight" in keys and f"{cand}.scale" in keys:
             return cand
+    # A speculative draft (MTP) shares the target's embedding and lm_head but
+    # names them from its own root (`mtp.embed_tokens`, `lm_head`), which need
+    # not match a VL-wrapped sidecar key (`language_model.model.embed_tokens`).
+    # Both kinds are unique per model, so the leaf name alone identifies them.
+    leaf = parts[-1]
+    if leaf in ("embed_tokens", "lm_head"):
+        kind = "embedding" if leaf == "embed_tokens" else "lm_head"
+        layers = (_xetla_prequant_meta.get("extra") or {}).get("layers") or {}
+        hits = [k for k, v in layers.items() if v.get("kind") == kind
+                and f"{k}.qweight" in keys]
+        if len(hits) == 1:
+            return hits[0]
     return None
 
 

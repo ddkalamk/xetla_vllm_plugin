@@ -393,6 +393,51 @@ sycl::event int2_upcvt_gemm_run(
       const char* e = std::getenv("XETLA_INT2_PREFILL_CFG");
       return e ? std::atoi(e) : 0;
     }();
+    // 1 < M <= 8 (speculative-decoding verify, tiny batches) is as
+    // bandwidth-bound as M = 1, but the plain M tile does not k-slice, which
+    // costs 3-4x on the narrow deep shapes (down_proj, out_proj). This keeps
+    // the M tile and adds local k-slicing. XETLA_INT2_SMALLM_CFG sweeps it:
+    // 0 = plain M tile, 1..6 = (WGN, LS) of (32,2) (32,4) (32,8) (64,2)
+    // (64,4) (64,8).
+#define DISPATCH_SM(WGN_, LS_)                                                \
+  do {                                                                        \
+    if (K % ((LS_) * 128) == 0) {                                             \
+      if (aligned_n)                                                          \
+        return upcvt_dispatch<XT, 8, WGN_, 8, 16, 128, 1, LS_, false>(        \
+            q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt);                      \
+      return upcvt_dispatch<XT, 8, WGN_, 8, 16, 128, 1, LS_, true>(           \
+          q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt);                        \
+    }                                                                         \
+  } while (0)
+    if (M <= 8 && pcfg == 0) {
+      static const int scfg = [] {
+        const char* e = std::getenv("XETLA_INT2_SMALLM_CFG");
+        return e ? std::atoi(e) : -1;
+      }();
+      switch (scfg) {
+        case 0: break;
+        case 1: DISPATCH_SM(32, 2); break;
+        case 2: DISPATCH_SM(32, 4); break;
+        case 3: DISPATCH_SM(32, 8); break;
+        case 4: DISPATCH_SM(64, 2); break;
+        case 5: DISPATCH_SM(64, 4); break;
+        case 6: DISPATCH_SM(64, 8); break;
+        default:
+          // B70, M = 2..4, us per GEMM vs the plain M tile / the M=1 GEMV:
+          //   down     (17408, 5120)  (32,4)  61 / 202 / 54
+          //   out_proj ( 6144, 5120)  (32,4)  23 /  67 / 21
+          //   qkvz     ( 5120,16384)  (64,2)  56 /  92 / 55
+          //   gate_up  ( 5120,34816)  (32,4) 123 / 166 / 109
+          //   qkv      ( 5120,14336)  (64,2)  48 /  60 / 43
+          //   lm_head  ( 5120,248320) (32,2) 817 / 839 / 727
+          if (K == 5120 && N == 16384)        { DISPATCH_SM(64, 2); }
+          else if (K == 5120 && N == 14336)   { DISPATCH_SM(64, 2); }
+          else if (K == 5120 && N == 248320)  { DISPATCH_SM(32, 2); }
+          else if (N <= 65536)                { DISPATCH_SM(32, 4); }
+          break;
+      }
+    }
+#undef DISPATCH_SM
     switch (pcfg) {
       case -1: break;                                  // legacy GEMV fallback
       case 1: DISPATCH_MN(32, 64, 8, 16, 128);
@@ -587,6 +632,18 @@ sycl::event int2_upcvt_gemm_postop_run(
       return e ? std::atoi(e) : 0;
     }();
     if (pcfg != -1) {
+      static const int scfg = [] {
+        const char* e = std::getenv("XETLA_INT2_SMALLM_CFG");
+        return e ? std::atoi(e) : -1;
+      }();
+      // k-sliced small-M tile, see int2_upcvt_gemm_run
+      if (M <= 8 && pcfg == 0 && scfg != 0 && K % (4 * 128) == 0) {
+        if (postop == 1)
+          return upcvt_dispatch<XT, 8, 32, 8, 16, 128, 1, 4, false, 1>(
+              q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt, Other);
+        return upcvt_dispatch<XT, 8, 32, 8, 16, 128, 1, 4, false, 2>(
+            q, M, N, K, A, B, C, ScaleB, sc.acc, sc.cnt, Other);
+      }
 #define DISPATCH_PO_MN(WGM_)                                                  \
   do {                                                                        \
     if (postop == 1)                                                          \
