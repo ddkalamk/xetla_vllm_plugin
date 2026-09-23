@@ -10,7 +10,7 @@ QMETHOD=${QMETHOD:-int2_f16}
 JOB=${1:?jobid}; shift
 srun --jobid="$JOB" --overlap bash -lc "
 source /swtools/intel-gpu/latest/intel_gpu_vars.sh >/dev/null 2>&1
-source /swtools/intel/2025.3/oneapi-vars.sh >/dev/null 2>&1
+source /swtools/intel/2026.0/oneapi-vars.sh >/dev/null 2>&1
 source $PLUG/.venv/bin/activate
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 export VLLM_XPU_ENABLE_XPU_GRAPH=${VLLM_XPU_ENABLE_XPU_GRAPH:-1}

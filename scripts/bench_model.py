@@ -34,6 +34,7 @@ def parse_args():
     p.add_argument("--max-num-batched-tokens", type=int, default=None,
                    help="prefill token budget; lowering it shrinks the "
                         "activation peak that memory profiling reserves")
+    p.add_argument("--max-num-seqs", type=int, default=None)
     p.add_argument("--text-only", action="store_true")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--pipeline-parallel-size", type=int, default=1)
@@ -71,6 +72,8 @@ def main():
             "combo_kernels": False, "benchmark_combo_kernel": False}
     if a.max_num_batched_tokens:
         extra["max_num_batched_tokens"] = a.max_num_batched_tokens
+    if a.max_num_seqs:
+        extra["max_num_seqs"] = a.max_num_seqs
     if a.kv_cache_memory_bytes:
         extra["kv_cache_memory_bytes"] = a.kv_cache_memory_bytes
 

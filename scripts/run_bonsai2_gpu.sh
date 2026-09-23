@@ -58,6 +58,8 @@ MAXLEN=${MAXLEN:-512}
 MAXTOK=${MAXTOK:-256}
 CGSIZES=${CGSIZES:-1,2,4,8}
 MAXBATCHTOK=${MAXBATCHTOK:-512}
+# vLLM >= 0.30 requires max_num_seqs <= Mamba state-cache blocks
+MAXSEQS=${MAXSEQS:-16}
 UTIL=${UTIL:-}
 KVBYTES=${KVBYTES:-}
 DETERMINISTIC=${DETERMINISTIC:-1}
@@ -66,7 +68,7 @@ EXTRA=${EXTRA:-}${KVBYTES:+ --kv-cache-memory-bytes $KVBYTES}
 
 ENV_SETUP="
 source /swtools/intel-gpu/latest/intel_gpu_vars.sh >/dev/null 2>&1
-source /swtools/intel/2025.3/oneapi-vars.sh >/dev/null 2>&1
+source /swtools/intel/2026.0/oneapi-vars.sh >/dev/null 2>&1
 source $PLUG/.venv/bin/activate
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 export VLLM_XPU_ENABLE_XPU_GRAPH=${VLLM_XPU_ENABLE_XPU_GRAPH:-1}
@@ -91,7 +93,7 @@ srun --jobid="$JOB" --overlap bash -lc "$ENV_SETUP
   B=/tmp/bonsai2_bench.\$\$.log
   python -u $HERE/bench_model.py --model $PACKED --quantization xetla --dtype bfloat16 \
     --max-model-len $MAXLEN --gpu-memory-utilization \$U \
-    --cudagraph-sizes $CGSIZES --max-num-batched-tokens $MAXBATCHTOK \
+    --cudagraph-sizes $CGSIZES --max-num-batched-tokens $MAXBATCHTOK --max-num-seqs $MAXSEQS \
     --max-tokens $MAXTOK --temperature 0.0 --full $EXTRA $PROMPT_ARGS > \$B 2>&1 &
   BPID=\$!
   ( while kill -0 \$BPID 2>/dev/null; do

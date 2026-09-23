@@ -9,6 +9,12 @@ vLLM + the xetla plugin, including the `demo_record.py` cast capture used in
 > against an empty directory, drop the GGUF and (optionally) the prequant
 > sidecar next to it, then run [`scripts/chat.sh`](scripts/chat.sh).
 
+> **vLLM version.** This demo loads the `.gguf` directly, which vLLM removed
+> after 0.21; `setup_fresh.sh` now defaults to v0.30.0. Keep the pinned combo
+> below by passing `VLLM_BRANCH=xetla_v0.21.0` (as in the snippet) and
+> `ONEAPI_VARS=/swtools/intel/2025.3/oneapi-vars.sh`, or use a packed
+> safetensors dir + sidecar on v0.30 (see [`BONSAI2.md`](BONSAI2.md)).
+
 Tested combo:
 - Linux x86_64
 - Intel oneAPI 2025.3 + Intel GPU driver 26.05.37020.3

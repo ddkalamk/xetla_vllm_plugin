@@ -231,7 +231,7 @@ if [[ "${do_run}" == "1" ]]; then
     # The vendor env scripts assume a permissive shell.
     set +eu
     GPU_VARS="${INTEL_GPU_VARS:-/swtools/intel-gpu/26.05.37020.3/intel_gpu_vars.sh}"
-    ONEAPI="${ONEAPI_VARS:-/swtools/intel/2025.3/oneapi-vars.sh}"
+    ONEAPI="${ONEAPI_VARS:-/swtools/intel/2026.0/oneapi-vars.sh}"
     [[ -f "${GPU_VARS}" ]] && source "${GPU_VARS}" >/dev/null 2>&1
     [[ -f "${ONEAPI}" ]] && source "${ONEAPI}" --force >/dev/null 2>&1
     set -eu

@@ -11,7 +11,7 @@ PLUGIN_BRANCH=${PLUGIN_BRANCH:-feature/bitcos-int2-integration}
 export PATH="$HOME/.local/bin:$PATH"
 # the Intel env scripts reference unset vars; keep set -u off around them
 source /swtools/intel-gpu/latest/intel_gpu_vars.sh >/dev/null 2>&1 || true
-source /swtools/intel/2025.3/oneapi-vars.sh --force >/dev/null 2>&1 || true
+source /swtools/intel/2026.0/oneapi-vars.sh --force >/dev/null 2>&1 || true
 set -u
 command -v icpx >/dev/null || { echo "icpx not found: source the oneAPI env first"; exit 1; }
 icpx --version | head -1

@@ -70,7 +70,7 @@ MODELS=${MODELS:-$PLUG/../models}
 HUB=${HUB:-${HF_HOME:-$HOME/.cache/huggingface}/hub}
 # sourced inside the compute-node step; point these at the local install
 GPU_VARS=${GPU_VARS:-/swtools/intel-gpu/latest/intel_gpu_vars.sh}
-ONEAPI_VARS=${ONEAPI_VARS:-/swtools/intel/2025.3/oneapi-vars.sh}
+ONEAPI_VARS=${ONEAPI_VARS:-/swtools/intel/2026.0/oneapi-vars.sh}
 
 # hub ids: let huggingface resolve them, so no snapshot hashes are baked in
 declare -A SNAP=(
@@ -100,7 +100,7 @@ declare -A PACKED=(
 # torch.xpu.device_count() is 0 and vLLM fails with "Device string must not be empty"
 ENV_SETUP="
 source /swtools/intel-gpu/latest/intel_gpu_vars.sh >/dev/null 2>&1
-source /swtools/intel/2025.3/oneapi-vars.sh >/dev/null 2>&1
+source /swtools/intel/2026.0/oneapi-vars.sh >/dev/null 2>&1
 source $PLUG/.venv/bin/activate
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 export VLLM_XPU_ENABLE_XPU_GRAPH=1
@@ -117,6 +117,8 @@ CGSIZES=${CGSIZES:-1,2,4,8}
 # KV budget to -4.91 GiB even though the weights are only 15.27 GiB of a 22.3 GiB
 # budget. The prompts here are 32 tokens, so profiling that wide is pure waste.
 MAXBATCHTOK=${MAXBATCHTOK:-512}
+# vLLM >= 0.30 requires max_num_seqs <= Mamba state-cache blocks (27B)
+MAXSEQS=${MAXSEQS:-16}
 
 OUT=$PLUG/bonsai_gpu_${TAG}.csv
 LOGD=$PLUG/bonsai_logs
@@ -160,7 +162,7 @@ for M in 1.7B 4B 8B 27B; do
       B=/tmp/bonsai_bench.\$\$.log
       python -u $HERE/bench_model.py $ARGS --dtype bfloat16 \
         --max-model-len $MAXLEN --gpu-memory-utilization \$U \
-        --cudagraph-sizes $CGSIZES --max-num-batched-tokens $MAXBATCHTOK \
+        --cudagraph-sizes $CGSIZES --max-num-batched-tokens $MAXBATCHTOK --max-num-seqs $MAXSEQS \
         --max-tokens 256 --temperature 0.0 \
         --prompt 'Tell me about photosynthesis in 200 words' > \$B 2>&1 &
       BPID=\$!

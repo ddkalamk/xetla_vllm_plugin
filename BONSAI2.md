@@ -34,12 +34,13 @@ reference implementation of the transform, and across independent builds
 
 ## 0. Prerequisites
 
-* Intel GPU user-space driver + Level Zero, and oneAPI 2025.3 (icpx). On this
-  cluster:
+* Intel GPU user-space driver + Level Zero, and oneAPI 2026.0 (icpx; must
+  match the SYCL runtime torch 2.13 xpu ships). On this cluster:
   ```bash
+  unset LD_LIBRARY_PATH   # a stale libur_loader breaks torch 2.13's libsycl
   source /swtools/intel-gpu/latest/intel_gpu_vars.sh
-  source /swtools/intel/2025.3/oneapi-vars.sh --force
-  icpx --version      # Intel(R) oneAPI DPC++/C++ Compiler 2025.3.0
+  source /swtools/intel/2026.0/oneapi-vars.sh --force
+  icpx --version      # Intel(R) oneAPI DPC++/C++ Compiler 2026.0.0
   ```
 * `git`, `curl`; `uv` is bootstrapped by the setup script if missing
   (`~/.local/bin/uv`).
@@ -70,13 +71,11 @@ PLUGIN_BRANCH=feature/bitcos-int2-integration \
 1. initialises the `xetla` submodule (kernel headers, branch
    `feature/bitcos-int2-integration` of `egeor/xetla`);
 2. creates `xetla_vllm_plugin/.venv` (Python 3.12 via uv);
-3. clones upstream `vllm-project/vllm` at **v0.21.0** into
-   `xetla_vllm_plugin/vllm` and applies the vendored `vllm.patch` (5 files:
-   GGUF/xetla quant hooks, XPU graph on TP=1, and the XPU GDN kernel call
-   sliced to `num_actual_tokens` so graph-padded batches of >2 sequences run);
-4. `pip install -r requirements/xpu.txt`, then
-   `VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -e vllm`,
-   then `triton-xpu==3.7.0`;
+3. clones upstream `vllm-project/vllm` at **v0.30.0** into
+   `xetla_vllm_plugin/vllm` (no local patch needed; see README, "vLLM version
+   and patches");
+4. `pip install -r requirements/xpu.txt` (torch 2.13 xpu, triton-xpu 3.7.2
+   shim), then `VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -e vllm`;
 5. `python setup.py install` for the plugin: builds `xetla_pt_ext` (all
    `csrc/*.sycl`, including the fused Hadamard kernel) and registers the
    `vllm.general_plugins` entry point.
@@ -173,7 +172,7 @@ Without SLURM, on a machine with the GPU:
 ```bash
 cd "$DEST/xetla_vllm_plugin"
 source /swtools/intel-gpu/latest/intel_gpu_vars.sh
-source /swtools/intel/2025.3/oneapi-vars.sh --force
+source /swtools/intel/2026.0/oneapi-vars.sh --force
 source .venv/bin/activate
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 export VLLM_XPU_ENABLE_XPU_GRAPH=1
@@ -315,11 +314,10 @@ GSM8K score in the high 90s is what an intact model gives; a kernel or packing
 bug shows up as a collapse (the pre-fix norm-fold bug, for instance, produced
 fluent gibberish at 0%).
 
-Batched decode needed one vLLM-side fix (now in `vllm.patch`): the XPU GDN
-kernel asserts `rows == num_actual_tokens`, but with >2 sequences the model
-runner pads the batch to the graph capture size; the call is now sliced to the
-actual tokens. `python tests/batched_generate.py --model <packed> --n 16` is
-the quick check (16 prompts in one `generate`, ~170 tok/s aggregate on the B70).
+Batched decode on vLLM v0.21 needed a local fix to the XPU GDN kernel call
+(graph-padded batches); v0.30's GDN op handles it upstream.
+`python tests/batched_generate.py --model <packed> --n 16 --max-tokens 256
+--ignore-eos --warmup` is the quick check (242.9 tok/s aggregate on the B70).
 
 ## Files
 

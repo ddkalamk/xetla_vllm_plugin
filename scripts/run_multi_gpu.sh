@@ -89,7 +89,7 @@ fi
 # No `set -u` while the vendor env scripts run; they trip over unbound vars.
 set +eu
 source /swtools/intel-gpu/26.05.37020.3/intel_gpu_vars.sh >/dev/null 2>&1
-source /swtools/intel/2025.3/oneapi-vars.sh --force >/dev/null 2>&1
+source /swtools/intel/2026.0/oneapi-vars.sh --force >/dev/null 2>&1
 source "${ROOT_DIR}/.venv/bin/activate"
 set -eu
 

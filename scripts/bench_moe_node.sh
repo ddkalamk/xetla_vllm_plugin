@@ -2,7 +2,7 @@
 # Benchmark the CAT-Q MoE model on the GPU node. Args are passed to bench_model.py.
 # No `set -u`: the oneAPI env scripts trip over unbound variables.
 source /swtools/intel-gpu/26.05.37020.3/intel_gpu_vars.sh >/dev/null 2>&1
-source /swtools/intel/2025.3/oneapi-vars.sh --force >/dev/null 2>&1
+source /swtools/intel/2026.0/oneapi-vars.sh --force >/dev/null 2>&1
 source /data/nfs_home/egeorgan/FRESH/xetla_vllm_plugin/.venv/bin/activate
 cd /data/nfs_home/egeorgan/FRESH/xetla_vllm_plugin
 
