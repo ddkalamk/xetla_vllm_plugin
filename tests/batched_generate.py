@@ -16,8 +16,14 @@ def main():
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--max-num-batched-tokens", type=int, default=2048)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.78)
+    p.add_argument("--kv-cache-memory-bytes", type=int, default=None,
+                   help="pin the KV cache (LNL: profiling over-reserves)")
     p.add_argument("--cudagraph-sizes", default="1,2,4,8,16")
     p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument("--ignore-eos", action="store_true",
+                   help="fixed-length outputs, for throughput comparisons")
+    p.add_argument("--warmup", action="store_true",
+                   help="run the batch once untimed first")
     a = p.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -29,6 +35,7 @@ def main():
               max_num_batched_tokens=a.max_num_batched_tokens,
               max_num_seqs=max(sizes),
               gpu_memory_utilization=a.gpu_memory_utilization,
+              kv_cache_memory_bytes=a.kv_cache_memory_bytes,
               limit_mm_per_prompt={"image": 0, "video": 0},
               enforce_eager=a.enforce_eager,
               compilation_config={"cudagraph_capture_sizes": sizes,
@@ -47,7 +54,9 @@ def main():
     prompts = [tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False,
                                        add_generation_prompt=True, enable_thinking=False)
                for q in qs[: a.n]]
-    sp = SamplingParams(max_tokens=a.max_tokens, temperature=0.0)
+    sp = SamplingParams(max_tokens=a.max_tokens, temperature=0.0, ignore_eos=a.ignore_eos)
+    if a.warmup:
+        llm.generate(prompts, sp)
     t0 = time.perf_counter()
     outs = llm.generate(prompts, sp)
     dt = time.perf_counter() - t0

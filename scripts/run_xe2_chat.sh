@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 source /swtools/intel-gpu/26.05.37020.3/intel_gpu_vars.sh >/dev/null 2>&1 || true
-source /swtools/intel/2025.3/oneapi-vars.sh --force >/dev/null 2>&1 || true
+source /swtools/intel/2026.0/oneapi-vars.sh --force >/dev/null 2>&1 || true
 cd ~/fresh_int2_fp16_setup/xetla_vllm_plugin
 echo "[xe2] node=$(hostname)"
 export ONEAPI_DEVICE_SELECTOR="level_zero:0"

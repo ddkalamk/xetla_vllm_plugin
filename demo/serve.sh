@@ -26,7 +26,7 @@ fi
 # These vendor scripts assume a permissive shell (unset vars, non-zero probes),
 # so relax -eu while they run.
 GPU_VARS="${INTEL_GPU_VARS:-/swtools/intel-gpu/26.05.37020.3/intel_gpu_vars.sh}"
-ONEAPI="${ONEAPI_VARS:-/swtools/intel/2025.3/oneapi-vars.sh}"
+ONEAPI="${ONEAPI_VARS:-/swtools/intel/2026.0/oneapi-vars.sh}"
 set +eu
 [[ -f "${GPU_VARS}" ]] && source "${GPU_VARS}" >/dev/null 2>&1
 [[ -f "${ONEAPI}" ]] && source "${ONEAPI}" --force >/dev/null 2>&1

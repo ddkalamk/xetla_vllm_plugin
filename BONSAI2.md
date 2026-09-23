@@ -34,12 +34,13 @@ reference implementation of the transform, and across independent builds
 
 ## 0. Prerequisites
 
-* Intel GPU user-space driver + Level Zero, and oneAPI 2025.3 (icpx). On this
-  cluster:
+* Intel GPU user-space driver + Level Zero, and oneAPI 2026.0 (icpx; must
+  match the SYCL runtime torch 2.13 xpu ships). On this cluster:
   ```bash
+  unset LD_LIBRARY_PATH   # a stale libur_loader breaks torch 2.13's libsycl
   source /swtools/intel-gpu/latest/intel_gpu_vars.sh
-  source /swtools/intel/2025.3/oneapi-vars.sh --force
-  icpx --version      # Intel(R) oneAPI DPC++/C++ Compiler 2025.3.0
+  source /swtools/intel/2026.0/oneapi-vars.sh --force
+  icpx --version      # Intel(R) oneAPI DPC++/C++ Compiler 2026.0.0
   ```
 * `git`, `curl`; `uv` is bootstrapped by the setup script if missing
   (`~/.local/bin/uv`).
@@ -70,13 +71,11 @@ PLUGIN_BRANCH=feature/bitcos-int2-integration \
 1. initialises the `xetla` submodule (kernel headers, branch
    `feature/bitcos-int2-integration` of `egeor/xetla`);
 2. creates `xetla_vllm_plugin/.venv` (Python 3.12 via uv);
-3. clones upstream `vllm-project/vllm` at **v0.21.0** into
-   `xetla_vllm_plugin/vllm` and applies the vendored `vllm.patch` (5 files:
-   GGUF/xetla quant hooks, XPU graph on TP=1, and the XPU GDN kernel call
-   sliced to `num_actual_tokens` so graph-padded batches of >2 sequences run);
-4. `pip install -r requirements/xpu.txt`, then
-   `VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -e vllm`,
-   then `triton-xpu==3.7.0`;
+3. clones upstream `vllm-project/vllm` at **v0.30.0** into
+   `xetla_vllm_plugin/vllm` (no local patch needed; see README, "vLLM version
+   and patches");
+4. `pip install -r requirements/xpu.txt` (torch 2.13 xpu, triton-xpu 3.7.2
+   shim), then `VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -e vllm`;
 5. `python setup.py install` for the plugin: builds `xetla_pt_ext` (all
    `csrc/*.sycl`, including the fused Hadamard kernel) and registers the
    `vllm.general_plugins` entry point.
@@ -173,7 +172,7 @@ Without SLURM, on a machine with the GPU:
 ```bash
 cd "$DEST/xetla_vllm_plugin"
 source /swtools/intel-gpu/latest/intel_gpu_vars.sh
-source /swtools/intel/2025.3/oneapi-vars.sh --force
+source /swtools/intel/2026.0/oneapi-vars.sh --force
 source .venv/bin/activate
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 export VLLM_XPU_ENABLE_XPU_GRAPH=1
@@ -281,47 +280,42 @@ SPEC=3 MAXTOK=256 bash scripts/run_bonsai2_gpu.sh "$JOB" B70 "Explain photosynth
 SPEC=3 bash scripts/eval_bonsai2_lm_eval.sh "$JOB" B70_mtp3       # GSM8K with MTP
 ```
 
-Needed pieces: XPU GDN attention runs verify rows through vLLM's Triton
-recurrent kernels (the SYCL kernel has no per-token state slots) and mixed
-batches split between the two (`vllm/_xpu_ops.py`); and a k-sliced small-M
-tile (1 < M <= 8) in the int2 kernel, because the plain M tile made the M=4
-verify GEMMs 1.2-3.8x slower than the M=1 GEMV (down_proj 202 vs 54 us; now
-61). `XETLA_INT2_SMALLM_CFG=0` turns it off, `1..6` sweeps (WGN, LS).
+Needed pieces: on vLLM v0.30 nothing on the vLLM side (its SYCL GDN kernel
+handles spec-decode rows and mixed batches, and the MTP `lm_head` gets the
+quant config); the plugin maps the draft's shared `embed_tokens`/`lm_head` to
+the sidecar tables; and a k-sliced small-M tile (1 < M <= 8) in the int2
+kernel, because the plain M tile made the M=4 verify GEMMs 1.2-3.8x slower
+than the M=1 GEMV on the B70 (down_proj 202 vs 54 us; now 61). The tile has
+separate per-shape tables for the B70 and the Arc 140V (LNL).
+`XETLA_INT2_SMALLM_CFG=0` turns it off, `1..6` sweeps (WGN, LS).
 
-B70, 256 tokens, batch 1 (baseline 46.2 tok/s):
+256 tokens, batch 1, same prompt (tok/s; tok/step in parentheses, v0.30):
 
-| draft tokens | tok/step | tok/s | speedup |
-| --- | --- | --- | --- |
-| 1 | 1.79 | 61.2 | 1.32x |
-| 2 | 2.42 | 73.9 | 1.60x |
-| 3 | 2.88 | 80.2 | 1.73x |
+| draft tokens | B70 v0.21 | B70 v0.30 | LNL v0.21 | LNL v0.30 | LNL v0.30, LNL-tuned tile |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 45.5 | 46.1 | 7.66 | 8.25 | 8.25 |
+| 1 | 61.0 | 66.6 (1.79) | 9.94 | 12.08 (1.79) | 12.46 (1.82) |
+| 2 | 73.2 | 80.7 (2.39) | 10.87 | 15.55 (2.46) | 16.13 (2.46) |
+| 3 | 79.6 | **84.5** (2.75) | 11.06 | 16.03 (2.75) | **18.75** (2.98) |
+| 4 | 76.8 | 81.2 (2.88) | 10.59 | 14.65 (2.84) | 17.28 (3.12) |
+| 5 | 76.0 | 79.7 (3.05) | 10.56 | 14.86 (3.01) | 15.15 (3.05) |
+| 6 | 69.7 | 75.1 (3.08) | 9.79 | 13.60 (3.01) | 13.74 (3.08) |
+| 7 | 66.9 | 71.4 (3.12) | 9.22 | 12.70 (3.08) | 13.19 (3.12) |
 
-LNL (`UTIL=0.35 KVBYTES=$((2<<30))`), same prompt, baseline 7.66 tok/s,
-130 ms/step:
+B70 on pcl-zen4, LNL with `UTIL=0.35 KVBYTES=$((2<<30))` and a fresh
+allocation per run. k=3 is best everywhere: 1.83x on the B70, 2.27x on LNL.
+The LNL tile table (down_proj (32,8) 335 -> 309 us, qkv (64,4) 270 -> 257,
+out_proj plain 128 -> 115, gate_up (32,4)) cuts the k=3 step from 172 to
+159 ms; the rest of the 16.0 -> 18.8 gain on this prompt is the higher
+acceptance of the (equally valid) trajectory the new rounding picks.
 
-| draft tokens | tok/step | ms/step | tok/s | speedup |
-| --- | --- | --- | --- | --- |
-| 1 | 1.79 | 179 | 9.94 | 1.30x |
-| 2 | 2.37 | 216 | 10.87 | 1.42x |
-| 3 | 2.72 | 244 | 11.06 | 1.44x |
-| 4 | 2.84 | 266 | 10.59 | 1.38x |
-| 5 | 3.01 | 282 | 10.56 | 1.38x |
-| 6 | 3.05 | 308 | 9.79 | 1.28x |
-| 7 | 3.08 | 330 | 9.22 | 1.20x |
-
-Acceptance saturates at ~3 tokens/step beyond k=4 while the step keeps
-growing, so k=3 is best. The small-M tile is tuned on the B70 only; a k=3
-verify step costs 1.87x a decode step on LNL vs ~1.6x on the B70.
-
-Before the small-M tile the same runs gave 43.3 / 52.9 / 56.9 tok/s. GSM8K
-(`gsm8k_cot_llama`, 300 examples, thinking, batch 16): MTP k=3 97.7%
-against 98.0% without MTP (one question, within the 0.9% stderr), 1311 s
-against 1299 s. At batch 16 MTP brings no throughput gain because the
-verify GEMMs are M=64 and no longer bandwidth-bound. Without the small-M tile the MTP text is
-identical to the non-speculative run. With it, the tile's k-slices are
-summed in a different order (rel. err ~3e-4 against the GEMV tier), so the
-greedy trajectory drifts after a few tokens. k=1, 2 and 3 all produce the
-same text.
+GSM8K (`gsm8k_cot_llama`, thinking, batch 16), v0.30: B70 300 examples, MTP
+k=3 97.7% vs 98.0% without; LNL 64 examples, MTP k=3 (tuned tile) 96.9% vs
+96.9% without. At batch 16 MTP brings no throughput gain because the verify
+GEMMs are M=64 and no longer bandwidth-bound. The small-M tile sums k-slices
+in a different order than the M=1 GEMV (rel. err ~3e-4), so MTP text drifts
+from the non-speculative run after a few tokens; on the B70 k=1..7 all give
+the same text, on LNL k=1..4 do and k>=5 fork at the same near-tie.
 
 ## 5. Knobs
 
@@ -380,11 +374,10 @@ GSM8K score in the high 90s is what an intact model gives; a kernel or packing
 bug shows up as a collapse (the pre-fix norm-fold bug, for instance, produced
 fluent gibberish at 0%).
 
-Batched decode needed one vLLM-side fix (now in `vllm.patch`): the XPU GDN
-kernel asserts `rows == num_actual_tokens`, but with >2 sequences the model
-runner pads the batch to the graph capture size; the call is now sliced to the
-actual tokens. `python tests/batched_generate.py --model <packed> --n 16` is
-the quick check (16 prompts in one `generate`, ~170 tok/s aggregate on the B70).
+Batched decode on vLLM v0.21 needed a local fix to the XPU GDN kernel call
+(graph-padded batches); v0.30's GDN op handles it upstream.
+`python tests/batched_generate.py --model <packed> --n 16 --max-tokens 256
+--ignore-eos --warmup` is the quick check (242.9 tok/s aggregate on the B70).
 
 ## Files
 

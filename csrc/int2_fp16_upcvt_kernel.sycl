@@ -430,6 +430,17 @@ sycl::event int2_upcvt_gemm_run(
           //   gate_up  ( 5120,34816)  (32,4) 123 / 166 / 109
           //   qkv      ( 5120,14336)  (64,2)  48 /  60 / 43
           //   lm_head  ( 5120,248320) (32,2) 817 / 839 / 727
+          // Arc 140V (LNL), same sweep, us vs the plain M tile; qkvz and
+          // lm_head within noise of plain, out_proj best plain:
+          //   down     (17408, 5120)  (32,8) 309 / 328
+          //   qkv      ( 5120,14336)  (64,4) 257 / 277
+          //   gate_up  ( 5120,34816)  (32,4) 618 / 657
+          if (int2_is_integrated(q)) {
+            if (K == 17408 && N == 5120)        { DISPATCH_SM(32, 8); }
+            else if (K == 5120 && N == 14336)   { DISPATCH_SM(64, 4); }
+            else if (K == 5120 && N == 34816)   { DISPATCH_SM(32, 4); }
+            break;
+          }
           if (K == 5120 && N == 16384)        { DISPATCH_SM(64, 2); }
           else if (K == 5120 && N == 14336)   { DISPATCH_SM(64, 2); }
           else if (K == 5120 && N == 248320)  { DISPATCH_SM(32, 2); }

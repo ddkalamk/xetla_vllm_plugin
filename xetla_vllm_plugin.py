@@ -1531,6 +1531,8 @@ class XetlaLinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.prefix = prefix
         super().__init__()
+        # dense fallbacks call UnquantizedLinearMethod.apply, which needs its state (_gemm_impl)
+        UnquantizedLinearMethod.__init__(self)
 
     def create_weights(self, layer: torch.nn.Module,
                        input_size_per_partition: int,

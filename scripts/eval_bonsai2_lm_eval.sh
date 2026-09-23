@@ -18,6 +18,7 @@
 #   MAXLEN=N         max_model_len (default MAXGEN+2048)
 #   NSEQ=N           max_num_seqs (default 16)
 #   SPEC=N           MTP speculative decoding with N draft tokens (DRAFT dir)
+#   UTIL, KVBYTES    gpu_memory_utilization / pinned KV cache bytes (LNL: 0.35, 4 GiB)
 #   METHOD=int2|bitcos, BITCOS_SFX, MODELS, PACKED, SIDECAR as in run_bonsai2_gpu.sh
 ###############################################################################
 set -uo pipefail
@@ -54,6 +55,7 @@ fi
 MAXLEN=${MAXLEN:-$((MAXGEN + 2048))}
 NSEQ=${NSEQ:-16}
 UTIL=${UTIL:-0.78}
+KV_ARG=${KVBYTES:+kv_cache_memory_bytes: $KVBYTES}
 OUT=$PLUG/bonsai_logs/lm_eval_${TAG}
 mkdir -p "$OUT"
 SPEC_ARGS=""
@@ -73,6 +75,7 @@ model_args:
   max_model_len: $MAXLEN
   max_gen_toks: $MAXGEN
   gpu_memory_utilization: $UTIL
+  $KV_ARG
   max_num_seqs: $NSEQ
   max_num_batched_tokens: 2048
   enable_prefix_caching: false
@@ -93,7 +96,7 @@ echo ">>> $TAG: $TASKS limit=$LIMIT think=$THINK effort=$EFFORT maxgen=$MAXGEN -
 
 srun --jobid="$JOB" --overlap bash -lc "
 source /swtools/intel-gpu/latest/intel_gpu_vars.sh >/dev/null 2>&1
-source /swtools/intel/2025.3/oneapi-vars.sh >/dev/null 2>&1
+source ${ONEAPI_VARS:-/swtools/intel/2026.0/oneapi-vars.sh} >/dev/null 2>&1
 source $PLUG/.venv/bin/activate
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 export VLLM_XPU_ENABLE_XPU_GRAPH=${VLLM_XPU_ENABLE_XPU_GRAPH:-1}

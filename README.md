@@ -14,10 +14,10 @@ source /swtools/intel/<oneapi-ver>/oneapi-vars.sh --force
 ```
 
 > **The vendored vLLM.** The script clones upstream `vllm-project/vllm` at tag
-> `v0.21.0` and applies `vllm.patch` on top. That is exactly the
-> `xetla_v0.21.0` branch (v0.21.0 plus 15 changed lines across two files), so
-> no access to a private fork is needed. Override the source with `VLLM_REPO` /
-> `VLLM_BRANCH` if you have a prepared checkout.
+> `v0.30.0` (torch 2.13 xpu, triton-xpu 3.7.2, vllm-xpu-kernels 0.1.14.1). No
+> local patch is needed; a `vllm.patch` at the plugin root is still applied if
+> present. Build and run with oneAPI 2026.0 (torch 2.13 ships the 2026.0 SYCL
+> runtime). Override the source with `VLLM_REPO` / `VLLM_BRANCH`.
 
 If you only need the Python environment (no from-scratch clone):
 
@@ -242,23 +242,44 @@ REPL commands: `/exit`, `/reset` (clear chat history), `/system <text>` (set
 system prompt). After each turn a `[stats]` line reports tokens / wallclock /
 tok/s.
 
-## vLLM patches required for the GGUF + xetla path
+## vLLM version and patches
 
-The vendored `vllm/` copy is on branch **`xetla_v0.21.0`** (vLLM v0.21.0 plus
-`vllm.patch`). The bump to 0.21.0 was required for the 27B: earlier branches
-produced fluent-but-context-blind output on the hybrid GDN + attention path.
+The vendored `vllm/` is upstream **v0.30.0**, unpatched. The five-file
+`vllm.patch` that v0.21.0 needed is gone:
 
-Two minimal edits allow `--quantization xetla` against a `.gguf` file:
+| v0.21 patch | status on v0.30 |
+| --- | --- |
+| `arg_utils.py`: keep `--quantization xetla` for `.gguf` models | vLLM removed GGUF support; not applicable |
+| `weight_utils.py`: skip the HF quant-config lookup for xetla | `XetlaConfig.get_config_filenames()` is empty, so v0.30 already returns `XetlaConfig()` |
+| `platforms/xpu.py`: XPU graphs with TP=1 | upstream now only disables graphs when unsupported |
+| `parallel_state.py`: no CUDA-only assert in graph capture | upstream accepts `XpuCommunicator` |
+| `_xpu_ops.py`: GDN kernel on graph-padded batches | upstream GDN op takes `num_actual_tokens` (batched decode verified, 16 seqs) |
 
-1. `vllm/engine/arg_utils.py` — when the model path ends in `.gguf`, force
-   `load_format=gguf` but **don't** clobber a user-supplied `quantization`.
-2. `vllm/model_executor/model_loader/weight_utils.py` — short-circuit the
-   `snapshot_download(...)` call in `get_quant_config()` when
-   `model_config.quantization == "xetla"` (the GGUF is already local).
+Consequence: the GGUF-direct flow (`scripts/chat.sh`, `INT2_F16_DEMO.md`
+sections 3-5, `--model <file>.gguf --quantization xetla`) needs vLLM <= 0.21.
+Use a packed safetensors dir + sidecar instead (all Bonsai 2 / 27B flows).
 
-Both patches are no-ops for non-GGUF / non-xetla models. They're not needed
-if you switch to an HF safetensors checkout (e.g.
-`prism-ml/Ternary-Bonsai-8B-unpacked` or the 27B).
+Plugin-side changes for v0.30: `XetlaLinearMethod` initialises
+`UnquantizedLinearMethod` state (`_gemm_impl`) for its dense fallbacks, and
+the runners pass `--max-num-seqs` (v0.30 refuses `max_num_seqs` larger than
+the Mamba state cache; default 256).
+
+Bonsai 2 27B, v0.21.0 -> v0.30.0, same node and settings for both:
+
+| | B70 (pcl-zen4) | Arc 140V (LNL) |
+| --- | --- | --- |
+| int2 decode, 256 tok | 45.7 -> 46.1 tok/s | 7.78 -> 8.16 tok/s |
+| int2 TTFT | 176 -> 180 ms | 1001 -> 991 ms |
+| BITCOS decode | 47.3 -> 48.6 tok/s | 8.19 -> 9.33 tok/s |
+| batched 16x256 (`tests/batched_generate.py --ignore-eos --warmup`) | 241.7 -> 242.9 tok/s | 31.5 -> 31.3 tok/s |
+| GSM8K (`scripts/eval_bonsai2_lm_eval.sh`) | 98.0% -> 98.0% (300) | 95.3% -> 96.9% (64) |
+
+LNL needs `UTIL=0.35` plus a pinned KV cache (`KVBYTES=$((2<<30))` for the
+runner, `--kv-cache-memory-bytes` for `batched_generate.py`, `KVBYTES` for the
+eval), and a fresh allocation per engine start (a finished engine leaves
+~13 GiB of unified memory held until the job ends, on both versions). Greedy
+text is coherent but not byte-identical across the two versions (new
+torch/inductor and GDN kernel); it diverges after ~50 tokens.
 
 ## torch.compile cache
 

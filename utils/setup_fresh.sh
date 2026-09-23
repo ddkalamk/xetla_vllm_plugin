@@ -10,18 +10,19 @@
 # Requirements (must be loaded BEFORE running this script):
 #   - source /swtools/intel-gpu/<ver>/intel_gpu_vars.sh
 #   - source /swtools/intel/<oneapi>/oneapi-vars.sh --force
+#     (oneAPI 2026.0: torch 2.13 xpu ships the 2026.0 SYCL runtime)
 #   - python >= 3.10 in PATH (uv will prefer 3.12)
 #   - git, uv (or pip; uv is preferred)
 #
 # What this script does:
 #   1) Clones xetla_vllm_plugin (with the xetla submodule) into <DEST>/xetla_vllm_plugin
 #   2) Creates a fresh venv at <DEST>/xetla_vllm_plugin/.venv (Python 3.12 via uv)
-#   3) Clones upstream vllm-project/vllm at tag v0.21.0 into
-#      <DEST>/xetla_vllm_plugin/vllm and applies the vendored vllm.patch on
-#      top. That reproduces the xetla_v0.21.0 branch (v0.21.0 + 2 files,
-#      15 lines) without needing access to a private fork. Override with
-#      VLLM_REPO / VLLM_BRANCH.
-#   4) Installs vllm (XPU target) and triton-xpu into the venv
+#   3) Clones upstream vllm-project/vllm at tag v0.30.0 into
+#      <DEST>/xetla_vllm_plugin/vllm. v0.30 needs no local patch; a
+#      vllm.patch at the plugin root is still applied if one is present.
+#      Override with VLLM_REPO / VLLM_BRANCH.
+#   4) Installs vllm (XPU target; requirements/xpu.txt pulls torch 2.13 xpu
+#      and the triton-xpu shim) into the venv
 #   5) Builds the xetla plugin (PyTorch SYCL extension) into the venv
 
 set -euo pipefail
@@ -55,7 +56,7 @@ PLUGIN_REPO="${PLUGIN_REPO:-https://github.com/ddkalamk/xetla_vllm_plugin.git}"
 PLUGIN_BRANCH="${PLUGIN_BRANCH:-feature/catq-moe-int2}"
 
 VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
-VLLM_BRANCH="${VLLM_BRANCH:-v0.21.0}"
+VLLM_BRANCH="${VLLM_BRANCH:-v0.30.0}"
 
 # Optional: override the xetla submodule URL (useful for local file:// builds
 # when the plugin's .gitmodules points to a remote that doesn't yet have the
@@ -117,13 +118,8 @@ else
     log "vllm already present; leaving as-is"
 fi
 
-# Apply the vendored vllm.patch on top of the cloned upstream vllm. The
-# tracked copy lives at the plugin root (vllm.patch); an older layout kept it
-# next to the vllm/ snapshot.
+# Optional local vllm.patch at the plugin root (none is needed for v0.30.0).
 PATCH_FILE="$PLUGIN_DIR/vllm.patch"
-if [[ ! -f "$PATCH_FILE" ]]; then
-    [[ -f "$PLUGIN_DIR/vllm/vllm.patch" ]] && PATCH_FILE="$PLUGIN_DIR/vllm/vllm.patch"
-fi
 if [[ -f "$PATCH_FILE" ]]; then
     cp "$PATCH_FILE" "$VLLM_DIR/vllm.patch"
     if (cd "$VLLM_DIR" && git apply --check vllm.patch >/dev/null 2>&1); then
@@ -132,16 +128,19 @@ if [[ -f "$PATCH_FILE" ]]; then
     elif (cd "$VLLM_DIR" && git apply --reverse --check vllm.patch >/dev/null 2>&1); then
         log "vllm.patch already applied; skipping"
     else
-        err "vllm.patch FAILED to apply cleanly to $VLLM_DIR (xetla quant hooks and the batched XPU GDN fix would be missing)"
+        err "vllm.patch FAILED to apply cleanly to $VLLM_DIR"
         (cd "$VLLM_DIR" && git apply --check vllm.patch) || true
         exit 1
     fi
-else
-    err "FATAL: no vllm.patch found in plugin tree (looked in $PLUGIN_DIR/vllm/vllm.patch and $PLUGIN_DIR/vllm.patch); xetla quant hooks would be missing"
-    exit 1
 fi
 
-# ---- 4. install vllm + triton-xpu in the venv -------------------------------
+# ---- 4. install vllm in the venv --------------------------------------------
+# A stale libur_loader on LD_LIBRARY_PATH (e.g. from a conda env) breaks
+# torch 2.13's libsycl.so.9 (undefined symbol urDeviceWaitExp).
+unset LD_LIBRARY_PATH
+set +u
+source "${ONEAPI_VARS:-/swtools/intel/2026.0/oneapi-vars.sh}" --force >/dev/null 2>&1 || true
+set -u
 log "Installing vllm requirements (XPU)"
 pip install --upgrade pip
 pip install -v -r "$VLLM_DIR/requirements/xpu.txt"
@@ -149,9 +148,13 @@ pip install -v -r "$VLLM_DIR/requirements/xpu.txt"
 log "Installing vllm (editable, VLLM_TARGET_DEVICE=xpu)"
 VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -e "$VLLM_DIR" -v
 
-log "Replacing triton with triton-xpu==3.7.0"
-pip uninstall -y triton triton-xpu || true
-pip install triton-xpu==3.7.0 --extra-index-url https://download.pytorch.org/whl/xpu
+# vLLM >= 0.30 pulls triton-xpu through its triton==*+xpu shim; older tags
+# (VLLM_BRANCH=v0.21.0) install the CUDA triton and need the swap.
+if ! pip show triton-xpu >/dev/null 2>&1; then
+    log "Replacing triton with triton-xpu==3.7.0"
+    pip uninstall -y triton || true
+    pip install triton-xpu==3.7.0 --extra-index-url https://download.pytorch.org/whl/xpu
+fi
 
 # ---- 5. build the xetla plugin (PyTorch SYCL extension) ---------------------
 log "Building xetla_vllm_plugin (PyTorch SYCL ext)"
