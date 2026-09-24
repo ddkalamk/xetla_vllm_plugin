@@ -1,0 +1,17 @@
+// TernSYCL fused sign flip + blockwise-1024 Walsh-Hadamard transform
+// (ternsycl/hadamard) for Hadamard-folded checkpoints (Bonsai 2).
+
+#include "hadamard_fwht.hpp"
+
+#include <cstdint>
+
+// y = H(s * x) / 32 per 1024 block of the last dim; inverse: y = s * H(x) / 32.
+sycl::event ternsycl_hadamard_run(sycl::queue &q, bool bf16, const void *x, const int8_t *signs, void *y,
+        int64_t rows, int K, bool inverse) {
+    const sycl::nd_range<1> r((size_t)rows * (K / 1024) * 128, 128);
+    const auto *xs = (const unsigned short *)x;
+    auto *ys = (unsigned short *)y;
+    const auto *s = (const signed char *)signs;
+    return bf16 ? q.parallel_for(r, hadamard::Fwht1024<true>{xs, s, ys, K, inverse})
+                : q.parallel_for(r, hadamard::Fwht1024<false>{xs, s, ys, K, inverse});
+}

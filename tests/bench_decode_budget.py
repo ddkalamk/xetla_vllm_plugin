@@ -18,6 +18,7 @@ from xetla_vllm_plugin import (
 )
 
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 
 # (name, count per token, K, N)   -- Bonsai-27B: 64 layers, 48 GDN + 16 full attn
 LAYERS = [
@@ -46,7 +47,7 @@ def make_packed(K: int, N: int):
 def main() -> None:
     if not torch.xpu.is_available():
         raise SystemExit("XPU not available")
-    gemm = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
+    gemm = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
 
     total_us = 0.0
     total_bytes = 0

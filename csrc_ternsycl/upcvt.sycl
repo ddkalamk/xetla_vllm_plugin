@@ -1,0 +1,112 @@
+// TernSYCL int2 upcvt GEMM/GEMV (ternsycl/int2_fp16_upcvt) for the plugin:
+// launchers plus the (M, K, N) tile dispatch, tuned on the B70 with the
+// TernSYCL drivers (>= 2 GiB rotating weights, device-event times).
+
+#include "int2_fp16_upcvt.hpp"
+
+#include <cstdint>
+
+namespace {
+
+struct Args {
+    const unsigned short *A;
+    const unsigned *B;
+    const unsigned short *S;
+    void *C;
+    Epi epi;
+    int M, N, K;
+};
+
+template <bool BF, int SGM, int NSG, int LS, int U>
+sycl::event gemv(sycl::queue &q, const Args &a) {
+    using Kern = upcvt::Gemv<BF, SGM, NSG, LS, U>;
+    const size_t wgn = 16 * NSG;
+    const sycl::range<2> local(1, Kern::WG);
+    const sycl::range<2> global((a.M + SGM - 1) / SGM, (a.N + wgn - 1) / wgn * Kern::WG);
+    return q.parallel_for(sycl::nd_range<2>(global, local), Kern{a.A, a.B, a.S, a.C, a.epi, a.M, a.N, a.K});
+}
+
+template <bool BF, int MT_M, int MT_N, int WG_M, int WG_N>
+sycl::event mt(sycl::queue &q, const Args &a) {
+    using Kern = upcvt::GemmMT<BF, MT_M, MT_N, WG_M, WG_N>;
+    const size_t tm = MT_M * WG_M, tn = MT_N * WG_N;
+    const sycl::range<2> local(1, Kern::WG);
+    const sycl::range<2> global((a.M + tm - 1) / tm, (a.N + tn - 1) / tn * Kern::WG);
+    return q.parallel_for(sycl::nd_range<2>(global, local), Kern{a.A, a.B, a.S, a.C, a.epi, a.M, a.N, a.K});
+}
+
+// M = 1: best (NSG, LS, U) per Bonsai 2 27B shape (SGM 1).
+template <bool BF>
+sycl::event decode(sycl::queue &q, const Args &a) {
+    const int K = a.K, N = a.N;
+    if (K == 5120 && N == 34816) return gemv<BF, 1, 1, 8, 1>(q, a);   // gate_up
+    if (K == 5120 && N == 17408) return gemv<BF, 1, 1, 8, 1>(q, a);   // gate / up (fused SwiGLU)
+    if (K == 17408 && N == 5120) return gemv<BF, 1, 1, 6, 1>(q, a);   // down
+    if (K == 5120 && N == 16384) return gemv<BF, 1, 1, 2, 1>(q, a);   // in_proj_qkvz
+    if (K == 6144 && N == 5120) return gemv<BF, 1, 1, 6, 1>(q, a);    // out_proj
+    if (K == 5120 && N == 14336) return gemv<BF, 1, 1, 2, 1>(q, a);   // qkv
+    if (K == 5120 && N == 248320) return gemv<BF, 1, 2, 4, 2>(q, a);  // lm_head
+    if (N <= 8192) return gemv<BF, 1, 1, 6, 1>(q, a);
+    return gemv<BF, 1, 1, 4, 1>(q, a);
+}
+
+template <bool BF, int NSG, int LS>
+sycl::event gemv_rows(sycl::queue &q, const Args &a) {
+    if (a.M == 2) return gemv<BF, 2, NSG, LS, 1>(q, a);
+    if (a.M <= 4) return gemv<BF, 4, NSG, LS, 1>(q, a);
+    return gemv<BF, 8, NSG, LS, 1>(q, a);
+}
+
+// 1 < M < 64 (prompt lengths): B70 sweep of the 27B shapes at M = 8, 16, 24,
+// 32; SGM-row GEMV up to 8 rows, then 16- and 32-row M tiles.
+template <bool BF>
+sycl::event midm(sycl::queue &q, const Args &a) {
+    const int M = a.M, K = a.K, N = a.N;
+    const bool narrow = N == 5120;                                // down, out_proj
+    const bool qkv = K == 5120 && (N == 14336 || N == 16384);
+    if (M <= 8) {
+        if (qkv && M > 4) return N == 16384 ? mt<BF, 16, 16, 1, 8>(q, a) : mt<BF, 16, 16, 1, 4>(q, a);
+        if (K == 6144 && N == 5120) return gemv_rows<BF, 4, 4>(q, a);
+        if (N == 248320) return gemv_rows<BF, 1, 4>(q, a);
+        return gemv_rows<BF, 1, 8>(q, a);
+    }
+    if (M <= 16) {
+        if (narrow) return mt<BF, 16, 16, 2, 2>(q, a);
+        if (K == 5120 && N == 17408) return mt<BF, 16, 32, 1, 4>(q, a);
+        if (K == 5120 && N == 16384) return mt<BF, 16, 16, 1, 8>(q, a);
+        return mt<BF, 16, 16, 1, 4>(q, a);
+    }
+    if (narrow) return M <= 24 ? mt<BF, 32, 16, 2, 2>(q, a) : mt<BF, 32, 16, 2, 4>(q, a);
+    if (K == 5120 && N == 17408) return mt<BF, 32, 32, 1, 4>(q, a);
+    if (N == 248320) return mt<BF, 32, 32, 1, 8>(q, a);
+    return mt<BF, 32, 16, 1, 4>(q, a);
+}
+
+// M >= 64 (prefill)
+template <bool BF>
+sycl::event prefill(sycl::queue &q, const Args &a) {
+    const int K = a.K, N = a.N;
+    if (K == 17408 && N == 5120) return mt<BF, 64, 32, 2, 4>(q, a);
+    if (K == 6144 && N == 5120) return mt<BF, 64, 32, 1, 8>(q, a);
+    if (K == 5120 && N == 16384) return mt<BF, 64, 32, 8, 1>(q, a);
+    if (K == 5120 && N == 248320) return mt<BF, 64, 32, 4, 2>(q, a);
+    return mt<BF, 64, 32, 4, 4>(q, a);
+}
+
+template <bool BF>
+sycl::event run(sycl::queue &q, const Args &a) {
+    if (a.M == 1) return decode<BF>(q, a);
+    if (a.M < 64) return midm<BF>(q, a);
+    return prefill<BF>(q, a);
+}
+
+}  // namespace
+
+// C[M,N] = epi(A[M,K] x dequant(B[K/16,N] int2, S[K/128,N])), fp16 or bf16.
+// postop: 0 none, 1 silu(acc) * other, 2 acc + other (other is [M, N]).
+sycl::event ternsycl_upcvt_run(sycl::queue &q, bool bf16, const void *A, const int32_t *B, const void *S, void *C,
+        const void *other, int postop, int M, int N, int K) {
+    const Args a{(const unsigned short *)A, (const unsigned *)B, (const unsigned short *)S, C,
+            Epi{(const unsigned short *)other, nullptr, postop, 0}, M, N, K};
+    return bf16 ? run<true>(q, a) : run<false>(q, a);
+}

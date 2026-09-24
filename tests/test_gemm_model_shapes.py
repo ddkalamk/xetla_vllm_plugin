@@ -10,6 +10,7 @@ import argparse
 
 import torch
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 
 DEV = "xpu"
 GS = 128
@@ -50,8 +51,8 @@ def main():
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 8, 64])
     args = ap.parse_args()
 
-    gemm = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
-    dpas = torch.ops.xetla_int2.int2_fp16_dpas_gemm_run
+    gemm = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
+    dpas = torch.ops.ternsycl.int2_fp16_dpas_gemm_run
 
     print(f"{'shape':<34}{'M':>5}{'kernel':>8}{'mean_rel':>12}{'max_rel':>12}")
     bad = False

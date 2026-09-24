@@ -11,6 +11,7 @@ import time
 
 import torch
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 
 sys.path.insert(0, "/data/nfs_home/egeorgan/cpu_ternary_vllm/xetla_vllm_plugin")
 from xetla_vllm_plugin import (  # noqa: E402
@@ -82,7 +83,7 @@ def main():
 
         if cfg < 0:
             i_sets, i_big = sets_for(pack_ternary_to_int2(codes).to(DEV))
-            i2_op = (lambda b: torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
+            i2_op = (lambda b: torch.ops.ternsycl.int2_fp16_upcvt_gemm_run(
                 a_d, b, s_d, None))
             # Interleave so clock drift hits both sides equally.
             bc, i2 = [], []

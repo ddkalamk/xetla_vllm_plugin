@@ -18,6 +18,7 @@ from xetla_vllm_plugin import (
 )
 
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 
 ROWS = [
     # model, K, N, dispatch tier used by csrc/int2_fp16_upcvt_kernel.sycl
@@ -45,7 +46,7 @@ def packed(K: int, N: int):
 
 
 def bench(K: int, N: int, iters: int = 40):
-    up = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
+    up = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
     w, s = packed(K, N)
     x = (torch.randn(1, K, device="xpu") * 0.5).to(torch.float16)
     for _ in range(8):

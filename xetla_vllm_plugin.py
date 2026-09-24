@@ -392,7 +392,7 @@ def _xetla_pre_convert_bias(layer: torch.nn.Module) -> None:
 # (scripts/pack_bonsai2_gguf.py) carries the GGUF's prism.hadamard contract in
 # the sidecar metadata plus one `hadamard.signs.<K>` tensor per width.
 #
-# The transform runs as one fused SYCL kernel (csrc/hadamard_fwht_kernel.sycl)
+# The transform runs as one fused TernSYCL kernel (ternsycl/hadamard)
 # when the extension provides it; XETLA_HADAMARD_IMPL=matmul falls back to a
 # matmul with the (symmetric) H_block/sqrt(block) matrix, which is what the
 # PrismML llama.cpp fork does and serves as the reference here.
@@ -406,7 +406,7 @@ _xetla_hadamard_impl = os.environ.get("XETLA_HADAMARD_IMPL", "fused").lower()
 def _xetla_hadamard_fused_available() -> bool:
     if _xetla_hadamard_impl != "fused":
         return False
-    return hasattr(torch.ops.xetla_int2, "hadamard_fwht_run")
+    return hasattr(torch.ops.ternsycl, "hadamard_fwht_run")
 
 
 def _xetla_hadamard_matrix(block: int, device) -> torch.Tensor:
@@ -452,7 +452,7 @@ def _xetla_hadamard_attach(layer: torch.nn.Module, lookup_prefix: str,
     signs = signs.to(device=dev, dtype=_xetla_hadamard_dtype).contiguous()
     fused = _xetla_hadamard_fused_available() and block == 1024
     if fused:
-        signs = signs.to(torch.float16).contiguous()
+        signs = signs.to(torch.int8).contiguous()
     else:
         _xetla_hadamard_matrix(block, dev)   # materialise before graph capture
     layer.xetla_hadamard_fused = fused
@@ -475,7 +475,7 @@ def _xetla_hadamard_fwd(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor
         if _xetla_is_compiling():
             y = xetla_hadamard_fwht(x16, signs, block, False)
         else:
-            y = torch.ops.xetla_int2.hadamard_fwht_run(x16, signs, block, False)
+            y = torch.ops.ternsycl.hadamard_fwht_run(x16, signs, block, False)
         return y if y.dtype == x.dtype else y.to(x.dtype)
     h = _xetla_hadamard_matrix(block, x.device)
     y = (x.to(_xetla_hadamard_dtype) * signs).reshape(-1, block) @ h
@@ -495,7 +495,7 @@ def _xetla_hadamard_inv(layer: torch.nn.Module, e: torch.Tensor) -> torch.Tensor
         if _xetla_is_compiling():
             y = xetla_hadamard_fwht(e16, signs, block, True)
         else:
-            y = torch.ops.xetla_int2.hadamard_fwht_run(e16, signs, block, True)
+            y = torch.ops.ternsycl.hadamard_fwht_run(e16, signs, block, True)
         return y if y.dtype == e.dtype else y.to(e.dtype)
     h = _xetla_hadamard_matrix(block, e.device)
     y = (e.to(_xetla_hadamard_dtype).reshape(-1, block) @ h).reshape(e.shape)
@@ -582,11 +582,11 @@ def xetla_int2_fp16_upcvt_gemm(
     use_dpas = (not disable_dpas) and (m > 1) and (n % 256 == 0)
     with Timer(input, weight):
         if use_dpas:
-            out = torch.ops.xetla_int2.int2_fp16_dpas_gemm_run(
+            out = torch.ops.ternsycl.int2_fp16_dpas_gemm_run(
                 input, weight, scale, None
             )
         else:
-            out = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
+            out = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run(
                 input, weight, scale, None
             )
     if bias is not None:
@@ -613,7 +613,7 @@ def xetla_int2_fp16_upcvt_postop_gemm(
     that otherwise sit between the two MLP projections.
     """
     with Timer(input, weight):
-        return torch.ops.xetla_int2.int2_fp16_upcvt_gemm_postop_run(
+        return torch.ops.ternsycl.int2_fp16_upcvt_gemm_postop_run(
             input, weight, scale, other, postop
         )
 
@@ -635,7 +635,7 @@ def xetla_hadamard_fwht(
     forward: H(signs*x)/sqrt(block) per block of the last dim; inverse:
     signs*(H x)/sqrt(block). One launch, no Hadamard matrix reads.
     """
-    return torch.ops.xetla_int2.hadamard_fwht_run(x, signs, block, inverse)
+    return torch.ops.ternsycl.hadamard_fwht_run(x, signs, block, inverse)
 
 
 @xetla_hadamard_fwht.register_fake
@@ -1306,10 +1306,10 @@ class XetlaEmbeddingMethod(UnquantizedEmbeddingMethod):
             b16 = bias if bias is None or bias.dtype == torch.float16 else bias.to(torch.float16)
             if not _xetla_is_compiling():
                 if x16.shape[0] > 1 and getattr(layer, "_xetla_dpas_capable", False):
-                    out = torch.ops.xetla_int2.int2_fp16_dpas_gemm_run(
+                    out = torch.ops.ternsycl.int2_fp16_dpas_gemm_run(
                         x16, layer.weight, layer.scale, None)
                 else:
-                    out = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
+                    out = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run(
                         x16, layer.weight, layer.scale, None)
                 if b16 is not None:
                     out = out + b16
@@ -1451,7 +1451,7 @@ class XetlaFusedMoEMethod(_fused_moe_method_base()):
 
         orig_shape = x.shape
         x = x.reshape(-1, orig_shape[-1])
-        gemm = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
+        gemm = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
         w13_q, w13_s = packed["w13_q"], packed["w13_s"]
         w2_q, w2_s = packed["w2_q"], packed["w2_s"]
         tokens, top_k = x.shape[0], topk_ids.shape[1]
@@ -1681,10 +1681,10 @@ class XetlaLinearMethod(LinearMethodBase):
             # capability flag. Saves ~5us per call from the dispatcher frame.
             if not _xetla_is_compiling() and getattr(layer, "_xetla_dpas_capable", False) is not None:
                 if x16.shape[0] > 1 and layer._xetla_dpas_capable:
-                    c = torch.ops.xetla_int2.int2_fp16_dpas_gemm_run(
+                    c = torch.ops.ternsycl.int2_fp16_dpas_gemm_run(
                         x16, layer.weight, layer.scale, None)
                 else:
-                    c = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
+                    c = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run(
                         x16, layer.weight, layer.scale, None)
                 if b16 is not None:
                     c = c + b16
@@ -1837,16 +1837,15 @@ def _install_xetla_profile():
         return
     if int(os.environ.get("XETLA_PROFILE", "0")) <= 0:
         return
-    ns = torch.ops.xetla_int2
     candidates = [
-        "int2_fp16_upcvt_gemm_run",
-        "int2_fp16_dpas_gemm_run",
-        "int1_fp16_upcvt_gemm_run",
-        "bitcos_fp16_upcvt_gemm_run",
-        "int2_bf16_fused_gemm_run",
+        (torch.ops.ternsycl, "int2_fp16_upcvt_gemm_run"),
+        (torch.ops.ternsycl, "int2_fp16_dpas_gemm_run"),
+        (torch.ops.xetla_int2, "int1_fp16_upcvt_gemm_run"),
+        (torch.ops.xetla_int2, "bitcos_fp16_upcvt_gemm_run"),
+        (torch.ops.xetla_int2, "int2_bf16_fused_gemm_run"),
     ]
     installed = []
-    for name in candidates:
+    for ns, name in candidates:
         op = getattr(ns, name, None)
         if op is None:
             continue
@@ -2051,14 +2050,19 @@ def _xetla_fuse_swiglu(model: torch.nn.Module) -> None:
 def register():
     print("Hello xetla plugin!")
     _maybe_disable_triton_stride_versioning()
-    # Force-load the SYCL extension so its TORCH_LIBRARY / TORCH_LIBRARY_FRAGMENT
-    # blocks register `torch.ops.xetla_int2.*` in *every* process that loads
-    # the plugin (main + each engine worker). Without this the ops are missing
-    # in the spawned engine subprocess.
+    # Force-load the SYCL extensions so their TORCH_LIBRARY blocks register
+    # `torch.ops.xetla_int2.*` (xetla kernels) and `torch.ops.ternsycl.*`
+    # (TernSYCL kernels) in *every* process that loads the plugin (main + each
+    # engine worker). Without this the ops are missing in the spawned engine
+    # subprocess.
     try:
         import xetla_pt_ext  # noqa: F401
     except Exception as e:
         print(f"[xetla] WARNING: could not import xetla_pt_ext: {e}")
+    try:
+        import ternsycl_pt_ext  # noqa: F401
+    except Exception as e:
+        print(f"[xetla] WARNING: could not import ternsycl_pt_ext: {e}")
 
     # Optional GEMM profiling shim: set XETLA_PROFILE=1 to enable.
     try:

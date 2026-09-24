@@ -8,6 +8,7 @@ import time
 
 import torch
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 
 sys.path.insert(0, "/data/nfs_home/egeorgan/cpu_ternary_vllm/xetla_vllm_plugin")
 from xetla_vllm_plugin import (  # noqa: E402
@@ -58,7 +59,7 @@ def main():
         b_d = buf.to(DEV)
         r_d = ranks.to(DEV)
 
-        t_i2 = timeit(lambda: torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
+        t_i2 = timeit(lambda: torch.ops.ternsycl.int2_fp16_upcvt_gemm_run(
             a_d, i2, s_d, None))
         t_l1 = timeit(lambda: torch.ops.xetla_int2.bitcos_fp16_upcvt_gemm_run(
             a_d, b_d, s_d, None, None))

@@ -1,3 +1,6 @@
 [submodule "xetla"]
 	path = xetla
 	url = https://github.com/egeor/xetla.git
+[submodule "ternsycl"]
+	path = ternsycl
+	url = https://github.com/libxsmm/TernSYCL.git

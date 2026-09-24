@@ -8,10 +8,11 @@ import time
 
 import torch
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 
 DEV = "xpu"
 GS = 128
-gemm = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
+gemm = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
 moe = torch.ops.xetla_int2.int2_fp16_moe_gemv_run
 
 

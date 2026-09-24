@@ -1,0 +1,64 @@
+// TernSYCL int2 x int8 DPAS GEMM (ternsycl/int2_via_int2_x_int8_dpas) for the
+// plugin's prefill DPAS path: A quantized upfront per (row, 128-group) to int8
+// (qmode 0; same numerics as xetla's on-the-fly quantization), then the s8 x s2
+// DPAS GEMM. Tiles are the B70 bests of the TernSYCL driver.
+
+#include "int2_int8_dpas.hpp"
+
+#include <cstdint>
+
+namespace {
+
+struct Args {
+    const unsigned short *A;
+    const signed char *Aq;
+    const unsigned short *SA;
+    const unsigned *B;
+    const unsigned short *SB;
+    void *C;
+    Epi epi;
+    int M, N, K;
+};
+
+template <bool BF, int SGM, int NSG, int LS, int U>
+sycl::event gemv(sycl::queue &q, const Args &a) {
+    using Kern = int8dpas::Gemv<BF, 0, SGM, NSG, LS, U>;
+    const size_t wgn = 16 * NSG;
+    const sycl::range<2> local(1, Kern::WG);
+    const sycl::range<2> global((a.M + SGM - 1) / SGM, (a.N + wgn - 1) / wgn * Kern::WG);
+    return q.parallel_for(sycl::nd_range<2>(global, local),
+            Kern{a.A, a.Aq, a.SA, a.B, a.SB, a.C, a.epi, a.M, a.N, a.K});
+}
+
+template <bool BF, int MT_M, int MT_N, int WG_M, int WG_N>
+sycl::event mt(sycl::queue &q, const Args &a) {
+    const size_t tm = MT_M * WG_M, tn = MT_N * WG_N;
+    const sycl::range<2> local(1, 16 * WG_M * WG_N);
+    const sycl::range<2> global((a.M + tm - 1) / tm, (a.N + tn - 1) / tn * local[1]);
+    return q.parallel_for(sycl::nd_range<2>(global, local),
+            int8dpas::GemmMT<BF, 0, MT_M, MT_N, WG_M, WG_N, 0, false>{
+                    a.A, a.Aq, a.SA, a.B, a.SB, a.C, a.epi, a.M, a.N, a.K});
+}
+
+template <bool BF>
+sycl::event run(sycl::queue &q, const Args &a) {
+    q.parallel_for(sycl::nd_range<2>({(size_t)a.M, (size_t)(a.K / 128) * 16}, {1, 16}),
+            int8dpas::QuantA<BF, true>{a.A, const_cast<unsigned short *>(a.SA),
+                    const_cast<signed char *>(a.Aq), a.M, a.K});
+    if (a.M == 1) return gemv<BF, 1, 1, 4, 2>(q, a);
+    if (a.M <= 8) return gemv<BF, 8, 1, 4, 2>(q, a);
+    if (a.M <= 16) return mt<BF, 8, 128, 2, 4>(q, a);
+    return mt<BF, 16, 64, 8, 2>(q, a);
+}
+
+}  // namespace
+
+int ternsycl_int8_ldsa(int M) { return int8dpas::ldsa(M); }
+
+// SA: DT scratch [K/128, ldsa(M)], Aq: int8 scratch [M, K].
+sycl::event ternsycl_int8_run(sycl::queue &q, bool bf16, const void *A, const int32_t *B, const void *SB, void *C,
+        void *SA, int8_t *Aq, int M, int N, int K) {
+    const Args a{(const unsigned short *)A, (const signed char *)Aq, (const unsigned short *)SA, (const unsigned *)B,
+            (const unsigned short *)SB, C, Epi{nullptr, nullptr, 0, 0}, M, N, K};
+    return bf16 ? run<true>(q, a) : run<false>(q, a);
+}

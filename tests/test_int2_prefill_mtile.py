@@ -19,9 +19,10 @@ MS = [2, 4, 8, 16, 63, 128, 512]
 def worker(cfg: int):
     import torch
     import xetla_pt_ext  # noqa: F401
+    import ternsycl_pt_ext  # noqa: F401
     dev = "xpu"
     torch.manual_seed(0)
-    op = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
+    op = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
     out = {}
     for K, N, name in SHAPES:
         codes = torch.randint(0, 3, (K // 16, N, 16), device=dev, dtype=torch.int32)

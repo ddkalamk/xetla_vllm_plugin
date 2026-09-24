@@ -10,6 +10,7 @@ import time
 
 import torch
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 
 sys.path.insert(0, "/data/nfs_home/egeorgan/cpu_ternary_vllm/xetla_vllm_plugin")
 from xetla_vllm_plugin import (  # noqa: E402
@@ -65,7 +66,7 @@ def main():
         a_d, s_d = A.to(DEV), scale.to(DEV)
         i_sets, big = sets_for(pack_ternary_to_int2(codes).to(DEV))
         t = sorted(
-            rotate_time(lambda b: torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
+            rotate_time(lambda b: torch.ops.ternsycl.int2_fp16_upcvt_gemm_run(
                 a_d, b, s_d, None), i_sets) for _ in range(3))[1]
         # int2 is a flat 2 bits per weight, plus the fp16 group scales.
         gb = (K * N / 4 + (K // GS) * N * 2) / 1e9

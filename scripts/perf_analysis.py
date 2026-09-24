@@ -15,6 +15,7 @@ import time
 
 import torch
 import xetla_pt_ext  # noqa: F401  -- registers torch.ops.xetla_int2.*
+import ternsycl_pt_ext  # noqa: F401
 
 GS = 128  # scale group along K
 
@@ -79,7 +80,7 @@ def bench_int2(m, k, n, iters):
     a = torch.randn(m, k, device="xpu", dtype=torch.float16)
     packed = torch.randint(0, 255, (k // 16, n), dtype=torch.int32, device="xpu")
     scale = torch.rand(k // GS, n, device="xpu", dtype=torch.float16) + 0.5
-    op = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
+    op = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
     try:
         op(a, packed, scale, None)
     except Exception as e:  # shape guards (K divisibility, N alignment)

@@ -16,6 +16,7 @@ from xetla_vllm_plugin import (
 )
 
 import xetla_pt_ext  # noqa: F401  -- registers torch.ops.xetla_int2.*
+import ternsycl_pt_ext  # noqa: F401
 
 # (name, K, N) as seen by the kernel: weight is [K, N]
 SHAPES = [
@@ -57,10 +58,10 @@ def main() -> None:
 
             use_dpas = M > 1 and (N % 256 == 0)
             if use_dpas:
-                out = torch.ops.xetla_int2.int2_fp16_dpas_gemm_run(
+                out = torch.ops.ternsycl.int2_fp16_dpas_gemm_run(
                     a, packed, scale, None)
             else:
-                out = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(
+                out = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run(
                     a, packed, scale, None)
 
             diff = (out.float() - ref).abs()

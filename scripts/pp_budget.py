@@ -15,6 +15,7 @@ import time
 
 import torch
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 
 GS = 128
 LAYERS = 94
@@ -39,7 +40,7 @@ def dense(m, k, n):
     a = torch.randn(m, k, device="xpu", dtype=torch.float16)
     qw = torch.randint(0, 255, (k // 16, n), dtype=torch.int32, device="xpu")
     sc = torch.rand(k // GS, n, device="xpu", dtype=torch.float16) + 0.5
-    op = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
+    op = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
     return bench(lambda: op(a, qw, sc, None))
 
 

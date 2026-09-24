@@ -20,6 +20,7 @@ from xetla_vllm_plugin import (
 )
 
 import xetla_pt_ext  # noqa: F401  -- registers torch.ops.xetla_int2.*
+import ternsycl_pt_ext  # noqa: F401
 
 
 def make_ternary_weight(K: int, N: int, gs: int = INT2_F16_GROUP_SIZE,
@@ -50,7 +51,7 @@ def main() -> None:
     packed = pack_ternary_to_int2(codes.to("xpu"))
     scale_dev = scale_f16.to("xpu").contiguous()
 
-    out = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run(a, packed, scale_dev, None)
+    out = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run(a, packed, scale_dev, None)
 
     assert out.shape == (M, N), out.shape
     diff = (out.float() - ref.float()).abs()

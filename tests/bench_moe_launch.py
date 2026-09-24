@@ -15,12 +15,13 @@ import time
 
 import torch
 import xetla_pt_ext  # noqa: F401  (registers torch.ops.xetla_int2)
+import ternsycl_pt_ext  # noqa: F401
 
 DEV = "xpu"
 GS = 128
 TOPK = 8
 LAYERS = 48
-gemm = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
+gemm = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
 
 
 def make(k, n):

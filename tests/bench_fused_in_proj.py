@@ -19,6 +19,7 @@ from xetla_vllm_plugin import (
 )
 
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 
 K = 5120
 N_QKVZ = 16384
@@ -57,8 +58,8 @@ def main() -> None:
     w_f = torch.cat([w_q, w_b], dim=1).contiguous()
     s_f = torch.cat([s_q, s_b], dim=1).contiguous()
 
-    gemm = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
-    dpas = torch.ops.xetla_int2.int2_fp16_dpas_gemm_run
+    gemm = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
+    dpas = torch.ops.ternsycl.int2_fp16_dpas_gemm_run
 
     print(f"{'M':>6} {'separate':>12} {'fused':>10} {'fused+split':>13} "
           f"{'speedup':>9}")

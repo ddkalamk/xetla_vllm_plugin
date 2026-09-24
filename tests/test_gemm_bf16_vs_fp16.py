@@ -10,6 +10,7 @@ import argparse
 
 import torch
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 from safetensors import safe_open
 
 DEV = "xpu"
@@ -35,8 +36,8 @@ def main():
                     help="multiply activations, to probe fp16 range limits")
     args = ap.parse_args()
 
-    fp16_gemm = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
-    bf16_gemm = torch.ops.xetla_int2.int2_bf16_upcvt_gemm_run
+    fp16_gemm = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
+    bf16_gemm = torch.ops.ternsycl.int2_bf16_upcvt_gemm_run
 
     print(f"{'tensor':<40}{'M':>4}{'fp16 rel':>12}{'bf16 rel':>12}{'winner':>10}")
     fp16_wins = bf16_wins = 0

@@ -13,6 +13,7 @@ import os
 
 import torch
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 from safetensors import safe_open
 
 DEV = "xpu"
@@ -38,7 +39,7 @@ def main():
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 16])
     args = ap.parse_args()
 
-    gemm = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
+    gemm = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
     print(f"{'tensor':<44}{'M':>4}{'mean_rel':>12}{'max_rel':>12}{'zeros%':>9}{'scale_absmax':>14}")
     bad = False
 

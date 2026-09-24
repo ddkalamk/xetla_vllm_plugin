@@ -8,6 +8,7 @@ import time
 
 import torch
 import xetla_pt_ext  # noqa: F401  registers torch.ops.xetla_int2.*
+import ternsycl_pt_ext  # noqa: F401
 
 dev = torch.device("xpu")
 torch.manual_seed(0)
@@ -22,7 +23,7 @@ def h_matrix(block):
 
 
 H = h_matrix(BLOCK).to(dev)
-op = torch.ops.xetla_int2.hadamard_fwht_run
+op = torch.ops.ternsycl.hadamard_fwht_run
 
 for rows, K in [(1, 5120), (1, 6144), (1, 17408), (63, 5120), (63, 17408), (512, 5120)]:
     x = (torch.randn(rows, K, device=dev) * 3).to(torch.float16)

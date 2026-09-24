@@ -22,6 +22,7 @@ from xetla_vllm_plugin import (
 )
 
 import xetla_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401
 
 # (name, count per token, K, N) for Bonsai-27B
 SHAPES = [
@@ -68,8 +69,8 @@ def main() -> None:
     a = parse_args()
     if not torch.xpu.is_available():
         raise SystemExit("XPU not available")
-    upcvt = torch.ops.xetla_int2.int2_fp16_upcvt_gemm_run
-    dpas = torch.ops.xetla_int2.int2_fp16_dpas_gemm_run
+    upcvt = torch.ops.ternsycl.int2_fp16_upcvt_gemm_run
+    dpas = torch.ops.ternsycl.int2_fp16_dpas_gemm_run
 
     print(f"M = {a.m}\n")
     print(f"{'layer':26} {'N':>7} {'upcvt us':>9} {'dpas us':>9} {'speedup':>8} "
