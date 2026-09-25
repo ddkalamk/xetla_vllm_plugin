@@ -171,18 +171,20 @@ python tests/test_hadamard_xpu.py    # GPU: fused Hadamard vs the matmul referen
 LIMIT=1319 bash scripts/eval_bonsai2_lm_eval.sh <slurm-jobid> gsm8k    # GSM8K, see BONSAI2.md
 ```
 
-## Results (Bonsai 2 27B, Arc Pro B70)
+## Results (Bonsai 2 27B, Arc Pro B70 and Arc 140V)
 
-Greedy, photosynthesis prompt, 256 output tokens, same node settings for both
-backends (previous XeTLA-based plugin on `feature/vllm-v0.30` vs this branch):
+Greedy, photosynthesis prompt, 256 output tokens, same settings for both
+backends (previous XeTLA-based plugin on `feature/vllm-v0.30` vs this branch;
+Arc 140V with `UTIL=0.35 KVBYTES=2GiB`, two alternating runs each):
 
-| Backend | TTFT | Decode |
-| --- | --- | --- |
-| XeTLA kernels | 183 ms | 46.30 tok/s |
-| TernSYCL kernels | **111 ms** | **46.42 tok/s** |
+| Backend | B70 TTFT | B70 decode | Arc 140V TTFT | Arc 140V decode |
+| --- | --- | --- | --- | --- |
+| XeTLA kernels | 183 ms | 46.30 tok/s | 992-993 ms | 8.17 tok/s |
+| TernSYCL kernels | **107-111 ms** | **46.42-47.56 tok/s** | **656-657 ms** | **8.20-8.33 tok/s** |
 
-The text is coherent and matches the XeTLA run for the first 90 words; the
-kernels sum in a different order, so the greedy trajectories part after that.
+The TernSYCL text is identical on the two GPUs. It matches the XeTLA run for
+the first 90 words; the kernels sum in a different order, so the greedy
+trajectories part after that.
 
 GSM8K, all 1319 test problems (8-shot chain of thought, thinking mode,
 `scripts/eval_bonsai2_lm_eval.sh`):

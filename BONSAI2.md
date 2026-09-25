@@ -14,12 +14,12 @@ gibberish. Here the packer carries that contract into the sidecar, and the
 plugin runs the transform as one fused TernSYCL kernel in front of the int2
 GEMMs.
 
-Result (Arc Pro B70, greedy, photosynthesis prompt, 256 output tokens):
+Result (greedy, photosynthesis prompt, 256 output tokens):
 
-| | TTFT | decode | GSM8K (1319, thinking) |
-| --- | --- | --- | --- |
-| TernSYCL (this branch) | 107-111 ms | 46.4-47.6 tok/s | 96.9% (41 min) |
-| previous XeTLA kernels | 183 ms | 46.3 tok/s | 96.7% (90 min) |
+| | B70 TTFT | B70 decode | Arc 140V TTFT | Arc 140V decode | GSM8K (1319, thinking, B70) |
+| --- | --- | --- | --- | --- | --- |
+| TernSYCL (this branch) | 107-111 ms | 46.4-47.6 tok/s | 657 ms | 8.20-8.33 tok/s | 96.9% (41 min) |
+| previous XeTLA kernels | 183 ms | 46.3 tok/s | 993 ms | 8.17 tok/s | 96.7% (90 min) |
 
 ---
 
@@ -192,13 +192,22 @@ from run to run.
 ### Lunar Lake / Arc 140V
 
 The extension is built for `lnl-m` too, and the same runner applies with the
-LNL knobs below. The kernel tile tables were tuned on the B70 and this branch
-has not yet been measured end to end on LNL.
+LNL knobs below (the kernel tile tables were tuned on the B70).
 
 ```bash
 MODELS="$MODELS" UTIL=0.35 KVBYTES=$((2<<30)) MAXTOK=256 MAXLEN=512 \
     bash scripts/run_bonsai2_gpu.sh "$JOB" LNL "Tell me about photosynthesis in 200 words"
 ```
+
+Measured on the Arc 140V (fresh allocation per run, two alternating runs
+each):
+
+| Kernels | TTFT | decode |
+| --- | --- | --- |
+| TernSYCL (this branch) | 656-657 ms | 8.20-8.33 tok/s |
+| previous XeTLA kernels | 992-993 ms | 8.17 tok/s |
+
+The TernSYCL text on the Arc 140V is identical to the B70 text.
 
 * `UTIL=0.35` pins `--gpu-memory-utilization`; the sampled value over-reserves
   on unified memory.
