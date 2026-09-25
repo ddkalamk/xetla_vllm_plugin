@@ -123,6 +123,8 @@ fi
 # torch 2.13's libsycl.so.9 (undefined symbol urDeviceWaitExp).
 unset LD_LIBRARY_PATH
 set +u
+# re-add the GPU driver libs (ocloc needs neo/lib64/libocloc.so for the AOT link)
+source "${INTEL_GPU_VARS:-/swtools/intel-gpu/latest/intel_gpu_vars.sh}" >/dev/null 2>&1 || true
 source "${ONEAPI_VARS:-/swtools/intel/2026.0/oneapi-vars.sh}" --force >/dev/null 2>&1 || true
 set -u
 log "Installing vllm requirements (XPU)"

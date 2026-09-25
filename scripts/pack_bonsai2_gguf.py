@@ -48,6 +48,18 @@ chat_template.jinja / config.json as published in the MLX repo
 (prism-ml/Ternary-Bonsai-2-27B-mlx-2bit; only those small files are needed).
 Reading PQ2_0 needs the PrismML llama.cpp fork's gguf-py (``--gguf-py`` or
 ``$PRISM_GGUF_PY``; stock gguf does not know type id 142).
+
+Other Qwen3.5-architecture ternary GGUFs from stock llama.cpp (e.g.
+TernaryQuench-Qwen3.8-27B-Q2_0, see TERNARYQUENCH.md) are handled too:
+
+  * Q2_0 (group 64, same 2-bit codec) is merged into g128 when every pair of
+    g64 scales is equal or one half is all-zero (lossless; else the packer
+    refuses);
+  * without a prism.hadamard contract nothing is folded, and ssm_out is in
+    the stock tiled V order, so its K columns are permuted back as well;
+  * dense (BF16/F16/F32) block matrices and non-ternary embedding / lm_head
+    (e.g. Q4_1, dequantized to bf16) go to the residual checkpoint and the
+    plugin runs them dense.
 """
 from __future__ import annotations
 
@@ -72,6 +84,9 @@ FORK_GGUF_PY_CANDIDATES = (
 GROUP_SIZE = 128
 PACK_K = 16
 PQ2_0_BLOCK_BYTES = 2 + GROUP_SIZE // 4
+Q2_0_BLOCK_BYTES = 2 + 64 // 4
+TERNARY_TYPES = ("PQ2_0", "Q2_0")
+DENSE_TYPES = ("BF16", "F16", "F32")
 
 # GGUF stem -> (vLLM fused module, position). Positions follow vLLM's
 # stacked_params_mapping for Qwen3.5 (q,k,v | gate,up | qkv,z | b,a).
@@ -103,6 +118,14 @@ RESIDUAL_MAP = {
     "ssm_conv1d.weight": "linear_attn.conv1d.weight",
     "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
     "ssm_beta.weight": "linear_attn.in_proj_b.weight",
+}
+# GGUF stem -> HF leaf for block matrices left unquantized (dense) in the GGUF
+DENSE_MATRIX_MAP = {
+    "attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj",
+    "attn_v": "self_attn.v_proj", "attn_output": "self_attn.o_proj",
+    "ffn_gate": "mlp.gate_proj", "ffn_up": "mlp.up_proj",
+    "ffn_down": "mlp.down_proj", "attn_qkv": "linear_attn.in_proj_qkv",
+    "attn_gate": "linear_attn.in_proj_z", "ssm_out": "linear_attn.out_proj",
 }
 HF_LM_PREFIX = "model.language_model."       # checkpoint (HF) naming
 VLLM_LM_PREFIX = "language_model.model."     # vLLM module naming
@@ -240,6 +263,7 @@ def synth_config(ref_cfg: dict) -> dict:
             if not k.startswith("quantization")}
     text.setdefault("model_type", "qwen3_5_text")
     text.setdefault("dtype", "bfloat16")
+    text["mtp_num_hidden_layers"] = 0          # the GGUF has no MTP head
     cfg = {
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "model_type": "qwen3_5",
@@ -256,16 +280,46 @@ def synth_config(ref_cfg: dict) -> dict:
 
 
 # ---- PQ2_0 -> ternsycl int2 --------------------------------------------------
+def q2_0_to_pq2_0_blocks(t, n: int, k: int) -> np.ndarray:
+    """Merge pairs of Q2_0 (g64) blocks into PQ2_0 (g128) blocks. Lossless
+    only if both g64 scales are equal or one half is scale 0 (its weights are
+    all zero); that half's codes are then set to 0 so the shared scale does
+    not revive them. Anything else is refused."""
+    raw = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
+    if k % GROUP_SIZE or raw.nbytes != n * k // 64 * Q2_0_BLOCK_BYTES:
+        raise ValueError(f"{t.name}: Q2_0 shape/byte length mismatch")
+    pair = raw.reshape(-1, 2, Q2_0_BLOCK_BYTES)
+    d = pair[:, :, :2].copy().view("<f2")[..., 0].astype(np.float32)   # [B, 2]
+    qs = pair[:, :, 2:].copy()                                          # [B, 2, 16]
+    if (((qs[..., None] >> np.arange(0, 8, 2, dtype=np.uint8)) & 3) == 3).any():
+        raise ValueError(f"{t.name}: Q2_0 code +2 present, not ternary")
+    z0, z1 = d[:, 0] == 0, d[:, 1] == 0
+    clash = ~z0 & ~z1 & (d[:, 0] != d[:, 1])
+    if clash.any():
+        raise ValueError(f"{t.name}: {int(clash.sum())} g64 pairs with different "
+                         "nonzero scales; not representable at g128")
+    qs[z0 & ~z1, 0] = 0x55                     # code 01 = 0 in every lane
+    qs[z1 & ~z0, 1] = 0x55
+    merged = np.where(z0, d[:, 1], d[:, 0]).astype("<f2")
+    out = np.empty((pair.shape[0], PQ2_0_BLOCK_BYTES), dtype=np.uint8)
+    out[:, :2] = merged.view(np.uint8).reshape(-1, 2)
+    out[:, 2:] = qs.reshape(-1, 32)
+    return out
+
+
 def pq2_0_words_scales(t) -> tuple[np.ndarray, np.ndarray]:
     """Return (words uint32 [N, K/16], scale fp16 [N, K/128]) for a PQ2_0
-    tensor, with codes already remapped from ggml {0,1,2} = {-1,0,+1} to the
-    ternsycl two's-complement {3,0,1}."""
+    (or losslessly merged Q2_0) tensor, with codes already remapped from ggml
+    {0,1,2} = {-1,0,+1} to the ternsycl two's-complement {3,0,1}."""
     n, k = (int(x) for x in reversed(t.shape))
-    raw = np.ascontiguousarray(t.data).reshape(-1)
     blocks = n * k // GROUP_SIZE
-    if raw.nbytes != blocks * PQ2_0_BLOCK_BYTES:
-        raise ValueError(f"{t.name}: PQ2_0 byte length mismatch")
-    data = raw.view(np.uint8).reshape(blocks, PQ2_0_BLOCK_BYTES)
+    if getattr(getattr(t, "tensor_type", None), "name", "PQ2_0") == "Q2_0":
+        data = q2_0_to_pq2_0_blocks(t, n, k)
+    else:
+        raw = np.ascontiguousarray(t.data).reshape(-1)
+        if raw.nbytes != blocks * PQ2_0_BLOCK_BYTES:
+            raise ValueError(f"{t.name}: PQ2_0 byte length mismatch")
+        data = raw.view(np.uint8).reshape(blocks, PQ2_0_BLOCK_BYTES)
     scale = data[:, :2].copy().view("<f2").reshape(n, k // GROUP_SIZE)
     if not np.isfinite(scale.astype(np.float32)).all():
         raise ValueError(f"{t.name}: non-finite scale")
@@ -330,33 +384,41 @@ def main() -> None:
     g = lambda key: fields["qwen35." + key]  # noqa: E731
 
     # ---- Hadamard contract ------------------------------------------------
-    if int(fields.get("prism.hadamard.version", 0)) != 1:
-        sys.exit("GGUF has no prism.hadamard.version == 1 contract")
-    if fields["prism.hadamard.transform"] != "normalized-sylvester-walsh-hadamard" \
-            or fields["prism.hadamard.axis"] != "input-last-dimension" \
-            or fields["prism.hadamard.sign_mode"] != "explicit":
-        sys.exit("unexpected prism.hadamard transform/axis/sign_mode")
-    block = int(fields["prism.hadamard.block_size"])
-    folded = set(fields["prism.hadamard.weight_names"])
-    inverse = set(fields.get("prism.hadamard.inverse_weight_names", []))
-    if inverse - {"token_embd.weight"}:
-        sys.exit(f"unexpected inverse-lookup tensors: {inverse}")
-    if not fields.get("prism.hadamard.gdn_v_grouped", False):
-        sys.exit("ssm_out is in tiled V order; this packer assumes gdn_v_grouped")
     signs: dict[int, torch.Tensor] = {}
-    off = 0
-    vals = fields["prism.hadamard.sign_values"]
-    for w in fields["prism.hadamard.sign_widths"]:
-        w = int(w)
-        v = np.asarray(vals[off:off + w], dtype=np.float32)
-        if len(v) != w or not np.isin(v, [-1, 1]).all() or w % block:
-            sys.exit(f"bad sign vector for width {w}")
-        signs[w] = torch.from_numpy(v).to(torch.float16)
-        off += w
-    if off != len(vals):
-        sys.exit("trailing sign values")
-    print(f"[pack] hadamard: H{block}, {len(folded)} folded, {len(inverse)} inverse, "
-          f"sign widths {sorted(signs)}")
+    has_hadamard = "prism.hadamard.version" in fields
+    if not has_hadamard:
+        # stock llama.cpp GGUF: nothing folded, ssm_out in tiled V order
+        block, folded, inverse, v_grouped = 0, set(), set(), False
+        print("[pack] no prism.hadamard contract: plain (unrotated) weights")
+    elif int(fields["prism.hadamard.version"]) != 1:
+        sys.exit("GGUF has an unknown prism.hadamard.version")
+    if has_hadamard and (
+            fields["prism.hadamard.transform"] != "normalized-sylvester-walsh-hadamard"
+            or fields["prism.hadamard.axis"] != "input-last-dimension"
+            or fields["prism.hadamard.sign_mode"] != "explicit"):
+        sys.exit("unexpected prism.hadamard transform/axis/sign_mode")
+    if has_hadamard:
+        block = int(fields["prism.hadamard.block_size"])
+        folded = set(fields["prism.hadamard.weight_names"])
+        inverse = set(fields.get("prism.hadamard.inverse_weight_names", []))
+        if inverse - {"token_embd.weight"}:
+            sys.exit(f"unexpected inverse-lookup tensors: {inverse}")
+        v_grouped = bool(fields.get("prism.hadamard.gdn_v_grouped", False))
+        if not v_grouped:
+            sys.exit("folded ssm_out in tiled V order; this packer assumes gdn_v_grouped")
+        off = 0
+        vals = fields["prism.hadamard.sign_values"]
+        for w in fields["prism.hadamard.sign_widths"]:
+            w = int(w)
+            v = np.asarray(vals[off:off + w], dtype=np.float32)
+            if len(v) != w or not np.isin(v, [-1, 1]).all() or w % block:
+                sys.exit(f"bad sign vector for width {w}")
+            signs[w] = torch.from_numpy(v).to(torch.float16)
+            off += w
+        if off != len(vals):
+            sys.exit("trailing sign values")
+        print(f"[pack] hadamard: H{block}, {len(folded)} folded, {len(inverse)} inverse, "
+              f"sign widths {sorted(signs)}")
 
     nv, nk = int(g("ssm.time_step_rank")), int(g("ssm.group_count"))
     hd = int(g("ssm.inner_size")) // nv
@@ -364,6 +426,8 @@ def main() -> None:
     qk_rows = 2 * nk * hk
     n_layers = int(g("block_count"))
     perm_hd, perm_1 = vperm(nv, nk, hd), vperm(nv, nk, 1)
+    if not v_grouped and hd % GROUP_SIZE:
+        sys.exit(f"ssm_out K permutation needs head_v_dim % {GROUP_SIZE} == 0")
     print(f"[pack] GDN nv={nv} nk={nk} hd={hd} hk={hk}; layers={n_layers}")
 
     tensors = {t.name: t for t in r.tensors}
@@ -373,8 +437,15 @@ def main() -> None:
     residual_src: list[tuple[str, str]] = []   # (gguf name, hf name)
     embed_name = None
     for name in tensors:
-        if name == "output.weight":
+        if name == "output.weight" and tensors[name].tensor_type.name not in TERNARY_TYPES:
+            residual_src.append((name, "lm_head.weight"))
+        elif name == "output.weight":
             groups.setdefault("lm_head", []).append((0, name))
+        elif name == "token_embd.weight" and \
+                tensors[name].tensor_type.name not in TERNARY_TYPES:
+            if name in inverse:
+                sys.exit("rotated embedding must be ternary")
+            residual_src.append((name, f"{HF_LM_PREFIX}embed_tokens.weight"))
         elif name == "token_embd.weight":
             embed_name = name
         elif name == "output_norm.weight":
@@ -386,7 +457,8 @@ def main() -> None:
             leaf = stem[:-len(".weight")] if stem.endswith(".weight") else stem
             hf_layer = f"{HF_LM_PREFIX}layers.{layer}."
             vl_layer = f"{VLLM_LM_PREFIX}layers.{layer}."
-            if tensors[name].tensor_type.name == "PQ2_0":
+            ttype = tensors[name].tensor_type.name
+            if ttype in TERNARY_TYPES:
                 if leaf in FUSE_MAP:
                     mod, pos = FUSE_MAP[leaf]
                     groups.setdefault(vl_layer + mod, []).append((pos, name))
@@ -394,6 +466,10 @@ def main() -> None:
                     groups.setdefault(vl_layer + SINGLE_MAP[leaf], []).append((0, name))
                 else:
                     sys.exit(f"unmapped quantized tensor {name}")
+            elif leaf in DENSE_MATRIX_MAP and ttype in DENSE_TYPES:
+                if name in folded:
+                    sys.exit(f"{name}: dense Hadamard-folded matrix not supported")
+                residual_src.append((name, hf_layer + DENSE_MATRIX_MAP[leaf] + ".weight"))
             elif stem in RESIDUAL_MAP:
                 residual_src.append((name, hf_layer + RESIDUAL_MAP[stem]))
             else:
@@ -429,6 +505,10 @@ def main() -> None:
                 words, scale = words[perm_hd], scale[perm_hd]
             elif leaf in ("ssm_alpha", "ssm_beta"):
                 words, scale = words[perm_1], scale[perm_1]
+            elif leaf == "ssm_out" and not v_grouped:
+                # K columns tiled -> grouped, whole 128-wide heads at a time
+                words = words[:, vperm(nv, nk, hd // PACK_K)]
+                scale = scale[:, vperm(nv, nk, hd // GROUP_SIZE)]
             qw, sc = to_kn_layout(words, scale)
             q_parts.append(qw)
             s_parts.append(sc)
@@ -481,9 +561,23 @@ def main() -> None:
     # ---- residual (dense) tensors ------------------------------------------
     for name, hf in residual_src:
         t = tensors[name]
-        x = gguf_tensor_f32(t)
+        if t.tensor_type.name in DENSE_TYPES:
+            x = gguf_tensor_f32(t)
+        else:
+            # non-ternary quantized table (e.g. Q4_1 embedding / lm_head)
+            from gguf.quants import dequantize  # noqa: WPS433
+            x = torch.from_numpy(dequantize(t.data, t.tensor_type)).reshape(
+                tuple(int(s) for s in reversed(t.shape)))
+            print(f"[pack] {name}: {t.tensor_type.name} -> bf16 {tuple(x.shape)} (dense)")
         stem = name.split(".", 2)[2] if name.startswith("blk.") else name
-        if stem == "ssm_a":
+        if stem == "attn_qkv.weight":
+            idx = np.concatenate([np.arange(qk_rows), qk_rows + perm_hd])
+            x = x[torch.from_numpy(idx)]
+        elif stem == "attn_gate.weight":
+            x = x[torch.from_numpy(perm_hd)]
+        elif stem == "ssm_out.weight" and not v_grouped:
+            x = x[:, torch.from_numpy(perm_hd)]
+        elif stem == "ssm_a":
             if not (x < 0).all():
                 sys.exit(f"{name}: expected negative A = -exp(A_log)")
             x = torch.log(-x)[torch.from_numpy(perm_1)]
@@ -511,21 +605,23 @@ def main() -> None:
     from safetensors.torch import save_file  # noqa: WPS433
     for w, s in signs.items():
         out_tensors[f"hadamard.signs.{w}"] = s.contiguous()
+    extra = {
+        "layers": layers_meta,
+        "group_size": GROUP_SIZE,
+        "source_model": os.path.abspath(a.gguf),
+    }
+    if has_hadamard:
+        extra["hadamard"] = {
+            "block_size": block,
+            "transform": "normalized-sylvester-walsh-hadamard",
+            "sign_widths": sorted(signs),
+            "layers": had_layers,
+            "inverse_layers": had_inverse,
+        }
     meta = {
         "ternsycl_format_version": "1",
         "ternsycl_method": "int2_f16",
-        "ternsycl_meta": json.dumps({
-            "layers": layers_meta,
-            "group_size": GROUP_SIZE,
-            "source_model": os.path.abspath(a.gguf),
-            "hadamard": {
-                "block_size": block,
-                "transform": "normalized-sylvester-walsh-hadamard",
-                "sign_widths": sorted(signs),
-                "layers": had_layers,
-                "inverse_layers": had_inverse,
-            },
-        }),
+        "ternsycl_meta": json.dumps(extra),
     }
     out = os.path.abspath(a.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

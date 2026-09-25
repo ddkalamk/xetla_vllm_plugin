@@ -20,6 +20,7 @@ build/
 # Local clones / external repos checked out for convenience
 vllm/
 Bonsai-demo/
+third_party/
 
 # Local scratch
 scripts/test_ternsycl_ops.py

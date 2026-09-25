@@ -5,6 +5,10 @@ architecture, GGUF-only release) with vLLM v0.30 and the TernSYCL int2
 kernels on an Arc Pro B70. The expected outputs below are from the
 2026-09-24 verification on this cluster.
 
+Other ternary Qwen3.5-architecture GGUFs (plain llama.cpp Q2_0, dense tail
+layers, non-ternary embedding/lm_head) go through the same packer and runner:
+see [TERNARYQUENCH.md](TERNARYQUENCH.md) for TernaryQuench Qwen3.8-27B.
+
 Bonsai 2 stores its matrices in a **rotated basis**: before every folded GEMM
 the activation is multiplied by a fixed ±1 sign vector and passed through a
 blockwise (1024) normalised Walsh-Hadamard transform, and the token embedding
@@ -77,7 +81,7 @@ export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 python -c 'import torch, ternsycl_vllm_plugin, ternsycl_pt_ext; print(torch.xpu.get_device_name(0), hasattr(torch.ops.ternsycl, "hadamard_fwht_run"))'
 # -> Intel(R) Arc(TM) Pro B70 Graphics True
 python tests/test_ternsycl_ops.py
-# -> 438 "ok" lines, "all passed (0 failures)"
+# -> 497 "ok" lines, "all passed (0 failures)"
 ```
 
 ## 2. Download the model files

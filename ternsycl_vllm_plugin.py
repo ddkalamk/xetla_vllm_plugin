@@ -798,6 +798,12 @@ class TernsyclEmbeddingMethod(UnquantizedEmbeddingMethod):
             # Embedding alone.
             if not self.inplace:
                 return
+            if _ternsycl_prequant_load_path:
+                # Sidecar in use but no packed lm_head: the packer found it is
+                # not ternary (e.g. Q4_1), so re-quantizing would destroy it.
+                print(f"[ternsycl] {self.prefix}: not in sidecar, kept dense",
+                      flush=True)
+                return
             weight = layer.weight.data  # [vocab_size, hidden_size]
             dev = weight.device
             # The lm_head is huge (e.g. 151680x4096). Doing the float()
