@@ -9,7 +9,6 @@ which format actually tracks the ideal result more closely.
 import argparse
 
 import torch
-import xetla_pt_ext  # noqa: F401
 import ternsycl_pt_ext  # noqa: F401
 from safetensors import safe_open
 

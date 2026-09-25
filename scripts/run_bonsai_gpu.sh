@@ -30,10 +30,10 @@
 #   for M in 1.7B 4B; do
 #     python scripts/pack_bonsai_hf.py --tol 0.02 --no-embeddings \
 #       --model $MODELS/Bonsai-$M-untied \
-#       --out   $MODELS/Bonsai-$M-untied.xetla-int2_f16.safetensors
+#       --out   $MODELS/Bonsai-$M-untied.ternsycl-int2_f16.safetensors
 #     python scripts/make_packed_model.py \
 #       --model   $MODELS/Bonsai-$M-untied \
-#       --sidecar $MODELS/Bonsai-$M-untied.xetla-int2_f16.safetensors \
+#       --sidecar $MODELS/Bonsai-$M-untied.ternsycl-int2_f16.safetensors \
 #       --out     $MODELS/Bonsai-$M-untied-packed
 #   done
 #
@@ -84,10 +84,10 @@ declare -A SNAP=(
 # lm_head from the shared matrix (exactly ternary at GS=128) so every model here
 # runs a ternary head with dense embeddings, matching the CPU runs.
 declare -A SIDECAR=(
-  [1.7B]=$MODELS/Bonsai-1.7B-untied.xetla-int2_f16.safetensors
-  [4B]=$MODELS/Bonsai-4B-untied.xetla-int2_f16.safetensors
-  [8B]=$MODELS/Ternary-Bonsai-8B-unpacked.xetla-int2_f16.safetensors
-  [27B]=$MODELS/Bonsai-27B.xetla-int2_f16.safetensors
+  [1.7B]=$MODELS/Bonsai-1.7B-untied.ternsycl-int2_f16.safetensors
+  [4B]=$MODELS/Bonsai-4B-untied.ternsycl-int2_f16.safetensors
+  [8B]=$MODELS/Ternary-Bonsai-8B-unpacked.ternsycl-int2_f16.safetensors
+  [27B]=$MODELS/Bonsai-27B.ternsycl-int2_f16.safetensors
 )
 declare -A PACKED=(
   [1.7B]=$MODELS/Bonsai-1.7B-untied-packed
@@ -139,10 +139,10 @@ for M in 1.7B 4B 8B 27B; do
 
     LOG="$LOGD/gpu_${TAG}_${M}_${WD}.log"
     if [[ "$WD" == "int2" ]]; then
-      QENV="export XETLA_PREQUANT_PATH=${SIDECAR[$M]} XETLA_QUANT_METHOD=int2_f16"
-      ARGS="--model ${PACKED[$M]} --tokenizer ${SNAP[$M]} --quantization xetla"
+      QENV="export TERNSYCL_PREQUANT_PATH=${SIDECAR[$M]} TERNSYCL_QUANT_METHOD=int2_f16"
+      ARGS="--model ${PACKED[$M]} --tokenizer ${SNAP[$M]} --quantization ternsycl"
     else
-      QENV="unset XETLA_PREQUANT_PATH XETLA_QUANT_METHOD"
+      QENV="unset TERNSYCL_PREQUANT_PATH TERNSYCL_QUANT_METHOD"
       ARGS="--model ${SNAP[$M]} --quantization none"
     fi
 

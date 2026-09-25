@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start the Bonsai int2 chat studio (FastAPI + single-page UI) on an XPU node.
 #
-#   cd demo && ./serve.sh                     # 27B, xetla int2, port 8000
+#   cd demo && ./serve.sh                     # 27B, ternsycl int2, port 8000
 #   DEMO_MODEL=/path/to/8B ./serve.sh         # any model the plugin supports
 #   DEMO_TEXT_ONLY=1 ./serve.sh               # disable image input
 #   JOBID=<slurm jobid> ./serve.sh            # run inside an existing allocation
@@ -48,14 +48,13 @@ else
     export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
     export VLLM_ENABLE_V1_MULTIPROCESSING="${VLLM_ENABLE_V1_MULTIPROCESSING:-0}"
 fi
-export XETLA_QUANT_METHOD="${XETLA_QUANT_METHOD:-int2_f16}"
+export TERNSYCL_QUANT_METHOD="${TERNSYCL_QUANT_METHOD:-int2_f16}"
 
-# XPU graphs are worth ~2.6x decode (62 -> 159 tok/s on the CAT-Q MoE model),
-# but so far that is the only model they have been measured on, and capture is
+# XPU graphs remove kernel dispatch overhead from decode, but capture is
 # fragile: it aborts on any host sync or large allocation in the captured
 # region. Opt in with VLLM_XPU_ENABLE_XPU_GRAPH=1 once you have checked the
-# model you care about. Capture sizes are capped in server.py
-# (DEMO_CUDAGRAPH_SIZES) to stay inside the plugin's batched MoE path.
+# model you care about. Capture sizes are set in server.py
+# (DEMO_CUDAGRAPH_SIZES).
 export VLLM_XPU_ENABLE_XPU_GRAPH="${VLLM_XPU_ENABLE_XPU_GRAPH:-0}"
 
 # vLLM's AOT torch.compile cache is not keyed on every engine setting this demo
@@ -106,30 +105,30 @@ case "${DEMO_MODEL}" in
         ;;
 esac
 
-# Pre-quantized sidecar: <model>.xetla-<method>.safetensors next to the model
+# Pre-quantized sidecar: <model>.ternsycl-<method>.safetensors next to the model
 # directory, or the well-known 27B one.
-if [[ -z "${XETLA_PREQUANT_PATH:-}" ]]; then
+if [[ -z "${TERNSYCL_PREQUANT_PATH:-}" ]]; then
     for candidate in \
-        "${DEMO_MODEL}.xetla-${XETLA_QUANT_METHOD}.safetensors" \
-        "${DEMO_MODEL}/../model.xetla-${XETLA_QUANT_METHOD}.safetensors" \
-        "${ROOT_DIR}/../Ternary-Bonsai-27B.xetla-${XETLA_QUANT_METHOD}.safetensors" \
-        "${ROOT_DIR}/Ternary-Bonsai-27B.xetla-${XETLA_QUANT_METHOD}.safetensors"
+        "${DEMO_MODEL}.ternsycl-${TERNSYCL_QUANT_METHOD}.safetensors" \
+        "${DEMO_MODEL}/../model.ternsycl-${TERNSYCL_QUANT_METHOD}.safetensors" \
+        "${ROOT_DIR}/../Ternary-Bonsai-27B.ternsycl-${TERNSYCL_QUANT_METHOD}.safetensors" \
+        "${ROOT_DIR}/Ternary-Bonsai-27B.ternsycl-${TERNSYCL_QUANT_METHOD}.safetensors"
     do
         if [[ -f "${candidate}" ]]; then
-            export XETLA_PREQUANT_PATH="$(cd "$(dirname "${candidate}")" && pwd)/$(basename "${candidate}")"
-            echo "[serve.sh] xetla sidecar: ${XETLA_PREQUANT_PATH}"
+            export TERNSYCL_PREQUANT_PATH="$(cd "$(dirname "${candidate}")" && pwd)/$(basename "${candidate}")"
+            echo "[serve.sh] ternsycl sidecar: ${TERNSYCL_PREQUANT_PATH}"
             break
         fi
     done
 fi
-if [[ -z "${XETLA_PREQUANT_PATH:-}" ]]; then
+if [[ -z "${TERNSYCL_PREQUANT_PATH:-}" ]]; then
     echo "[serve.sh] WARNING: no int2 sidecar found; the 27B will try to load" >&2
     echo "[serve.sh]          dense (~54 GB) and will not fit. See" >&2
     echo "[serve.sh]          scripts/pack_bonsai_hf.py / scripts/make_bundle.py" >&2
 fi
 
 echo "[serve.sh] model   : ${DEMO_MODEL}"
-echo "[serve.sh] quant   : ${XETLA_QUANT_METHOD} (${DEMO_QUANT:-xetla})"
+echo "[serve.sh] quant   : ${TERNSYCL_QUANT_METHOD} (${DEMO_QUANT:-ternsycl})"
 echo "[serve.sh] serving : http://$(hostname):${PORT}"
 
 cd "${SCRIPT_DIR}"

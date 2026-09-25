@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# From-scratch build of xetla_vllm_plugin + vendored vllm + xetla kernels
+# From-scratch build of ternsycl_vllm_plugin + vendored vllm + ternsycl kernels
 # in a clean directory using a fresh venv.
 #
 # Usage:
@@ -15,15 +15,15 @@
 #   - git, uv (or pip; uv is preferred)
 #
 # What this script does:
-#   1) Clones xetla_vllm_plugin (with the xetla submodule) into <DEST>/xetla_vllm_plugin
-#   2) Creates a fresh venv at <DEST>/xetla_vllm_plugin/.venv (Python 3.12 via uv)
+#   1) Clones ternsycl_vllm_plugin (with the ternsycl submodule) into <DEST>/ternsycl_vllm_plugin
+#   2) Creates a fresh venv at <DEST>/ternsycl_vllm_plugin/.venv (Python 3.12 via uv)
 #   3) Clones upstream vllm-project/vllm at tag v0.30.0 into
-#      <DEST>/xetla_vllm_plugin/vllm. v0.30 needs no local patch; a
+#      <DEST>/ternsycl_vllm_plugin/vllm. v0.30 needs no local patch; a
 #      vllm.patch at the plugin root is still applied if one is present.
 #      Override with VLLM_REPO / VLLM_BRANCH.
 #   4) Installs vllm (XPU target; requirements/xpu.txt pulls torch 2.13 xpu
 #      and the triton-xpu shim) into the venv
-#   5) Builds the xetla plugin (PyTorch SYCL extension) into the venv
+#   5) Builds the ternsycl plugin (PyTorch SYCL extension) into the venv
 
 set -euo pipefail
 
@@ -53,47 +53,31 @@ if ! command -v uv >/dev/null; then
 fi
 
 PLUGIN_REPO="${PLUGIN_REPO:-https://github.com/ddkalamk/xetla_vllm_plugin.git}"
-PLUGIN_BRANCH="${PLUGIN_BRANCH:-feature/catq-moe-int2}"
+PLUGIN_BRANCH="${PLUGIN_BRANCH:-feature/vllm-v0.30-ternsycl}"
 
 VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
 VLLM_BRANCH="${VLLM_BRANCH:-v0.30.0}"
 
-# Optional: override the xetla submodule URL (useful for local file:// builds
+# Optional: override the ternsycl submodule URL (useful for local file:// builds
 # when the plugin's .gitmodules points to a remote that doesn't yet have the
 # required commits).
-XETLA_SUBMODULE_REPO="${XETLA_SUBMODULE_REPO:-}"
-
-# Fallback branch to check out if the pinned submodule commit is no longer
-# fetchable from the remote (the upstream fork sometimes rewrites history).
-# Empty => no fallback (fail hard like before).
-XETLA_SUBMODULE_FALLBACK_BRANCH="${XETLA_SUBMODULE_FALLBACK_BRANCH:-feature_int2_woq_f16_act_gs128}"
+TERNSYCL_SUBMODULE_REPO="${TERNSYCL_SUBMODULE_REPO:-}"
 
 # ---- 1. clone plugin --------------------------------------------------------
-PLUGIN_DIR="$DEST/xetla_vllm_plugin"
+PLUGIN_DIR="$DEST/ternsycl_vllm_plugin"
 if [[ ! -d "$PLUGIN_DIR/.git" ]]; then
     log "Cloning $PLUGIN_REPO ($PLUGIN_BRANCH) -> $PLUGIN_DIR"
     git clone -b "$PLUGIN_BRANCH" "$PLUGIN_REPO" "$PLUGIN_DIR"
 fi
 
-if [[ -n "$XETLA_SUBMODULE_REPO" ]]; then
-    log "Overriding xetla submodule URL -> $XETLA_SUBMODULE_REPO"
-    git -C "$PLUGIN_DIR" config -f .gitmodules submodule.xetla.url "$XETLA_SUBMODULE_REPO"
-    git -C "$PLUGIN_DIR" submodule sync xetla
+if [[ -n "$TERNSYCL_SUBMODULE_REPO" ]]; then
+    log "Overriding ternsycl submodule URL -> $TERNSYCL_SUBMODULE_REPO"
+    git -C "$PLUGIN_DIR" config -f .gitmodules submodule.ternsycl.url "$TERNSYCL_SUBMODULE_REPO"
+    git -C "$PLUGIN_DIR" submodule sync ternsycl
 fi
 
-log "Initialising xetla submodule"
-if ! git -C "$PLUGIN_DIR" -c protocol.file.allow=always submodule update --init --recursive xetla; then
-    if [[ -n "$XETLA_SUBMODULE_FALLBACK_BRANCH" ]]; then
-        XETLA_URL=$(git -C "$PLUGIN_DIR" config -f .gitmodules submodule.xetla.url)
-        err "Pinned xetla submodule commit not fetchable; falling back to branch '$XETLA_SUBMODULE_FALLBACK_BRANCH' from $XETLA_URL"
-        rm -rf "$PLUGIN_DIR/xetla" "$PLUGIN_DIR/.git/modules/xetla"
-        git clone -b "$XETLA_SUBMODULE_FALLBACK_BRANCH" "$XETLA_URL" "$PLUGIN_DIR/xetla"
-        log "xetla now at $(git -C "$PLUGIN_DIR/xetla" rev-parse HEAD) (branch $XETLA_SUBMODULE_FALLBACK_BRANCH)"
-    else
-        err "xetla submodule init failed and no XETLA_SUBMODULE_FALLBACK_BRANCH set"
-        exit 1
-    fi
-fi
+log "Initialising ternsycl submodule"
+git -C "$PLUGIN_DIR" -c protocol.file.allow=always submodule update --init --recursive ternsycl
 
 cd "$PLUGIN_DIR"
 
@@ -156,8 +140,8 @@ if ! pip show triton-xpu >/dev/null 2>&1; then
     pip install triton-xpu==3.7.0 --extra-index-url https://download.pytorch.org/whl/xpu
 fi
 
-# ---- 5. build the xetla plugin (PyTorch SYCL extension) ---------------------
-log "Building xetla_vllm_plugin (PyTorch SYCL ext)"
+# ---- 5. build the ternsycl plugin (PyTorch SYCL extension) ---------------------
+log "Building ternsycl_vllm_plugin (PyTorch SYCL ext)"
 cd "$PLUGIN_DIR"
 python setup.py install
 
@@ -165,7 +149,7 @@ log "Build complete."
 log ""
 log "Quick sanity check:"
 log "  source $PLUGIN_DIR/.venv/bin/activate"
-log "  python -c 'import torch, xetla_vllm_plugin, xetla_pt_ext; print(\"ok\")'"
+log "  python -c 'import torch, ternsycl_vllm_plugin, ternsycl_pt_ext; print(\"ok\")'"
 log ""
 log "To run the Bonsai chat demo (after placing the GGUF at $PLUGIN_DIR):"
 log "  cd $PLUGIN_DIR && bash scripts/chat.sh"

@@ -22,14 +22,12 @@
 #
 # Serving defaults, measured rather than assumed:
 #   * XPU graphs (VLLM_XPU_ENABLE_XPU_GRAPH=1) remove kernel dispatch overhead,
-#     which is most of a token at batch 1. The win scales with how many ops a
-#     layer issues, so it is largest on MoE: 2.6x on Qwen3-30B-A3B, 2.2x on
-#     235B-A22B under pp=4, but only 1.20x on the dense 1.7B (301 vs 251 tok/s)
-#     where there is less dispatch to remove. Pass --no-graphs to compare.
+#     which is most of a token at batch 1: 1.20x on the dense 1.7B (301 vs
+#     251 tok/s). Pass --no-graphs to compare.
 #   * repetition_penalty 1.1. Without it these checkpoints answer and then
 #     repeat the last sentence forever. 1.05 collapsed a long answer into
 #     "000000", so do not tune it blind.
-#   * XETLA_QUANTIZE_LM_HEADS=0. CAT-Q embeddings and lm_head are not ternary
+#   * TERNSYCL_QUANTIZE_LM_HEADS=0. CAT-Q embeddings and lm_head are not ternary
 #     and ternarizing them destroys the model. The packer already leaves them
 #     out; this stops the plugin quantizing them on the fly.
 #
@@ -40,7 +38,7 @@
 # Notes
 #   * Export is CPU and RAM bound, not GPU bound. A 32B needs ~70 GB resident,
 #     so run it somewhere with the memory - the login node, not a compute node
-#     that is already serving. The 30B MoE export was OOM-killed on a 94 GB node.
+#     that is already serving.
 #   * use_bfloat16 is forced off: the plugin's kernels are fp16, and packing a
 #     bf16 export loses the low mantissa bits of the scales.
 set -euo pipefail
@@ -65,7 +63,7 @@ while [[ $# -gt 0 ]]; do
         --no-graphs)     graphs=0 ;;
         --max-tokens)    MAXTOK="$2"; shift ;;
         --prompt)        PROMPT="$2"; shift ;;
-        -h|--help) sed -n '2,45p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '2,43p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) URL="$1" ;;
     esac
     shift
@@ -179,7 +177,7 @@ fi
 
 BASE_MODEL="$(sed -nE 's/^model:[[:space:]]*(.*)$/\1/p' "${CFG_DIR}/config.yaml" | tr -d '"'"'"' ')"
 MODEL_NAME="${BASE_MODEL##*/}"
-SIDECAR="${SIDECAR_DIR}/CAT-Q-${MODEL_NAME}.xetla-int2_f16.safetensors"
+SIDECAR="${SIDECAR_DIR}/CAT-Q-${MODEL_NAME}.ternsycl-int2_f16.safetensors"
 echo "[deploy] base model: ${BASE_MODEL}"
 echo "[deploy] sidecar   : ${SIDECAR}"
 
@@ -236,9 +234,9 @@ if [[ "${do_run}" == "1" ]]; then
     [[ -f "${ONEAPI}" ]] && source "${ONEAPI}" --force >/dev/null 2>&1
     set -eu
 
-    export XETLA_QUANT_METHOD=int2_f16
-    export XETLA_QUANTIZE_LM_HEADS=0
-    export XETLA_PREQUANT_PATH="${SIDECAR}"
+    export TERNSYCL_QUANT_METHOD=int2_f16
+    export TERNSYCL_QUANTIZE_LM_HEADS=0
+    export TERNSYCL_PREQUANT_PATH="${SIDECAR}"
     export VLLM_XPU_ENABLE_XPU_GRAPH="${graphs}"
     export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
     export VLLM_ENABLE_V1_MULTIPROCESSING=0
@@ -260,8 +258,8 @@ cat <<EOF
 
 Chat with it:
 
-  XETLA_QUANT_METHOD=int2_f16 XETLA_QUANTIZE_LM_HEADS=0 \\
-  XETLA_PREQUANT_PATH=${SIDECAR} \\
+  TERNSYCL_QUANT_METHOD=int2_f16 TERNSYCL_QUANTIZE_LM_HEADS=0 \\
+  TERNSYCL_PREQUANT_PATH=${SIDECAR} \\
   DEMO_MODEL=${EXPORT_DIR} DEMO_TEXT_ONLY=1 \\
   VLLM_XPU_ENABLE_XPU_GRAPH=1 PORT=8000 ./demo/serve.sh
 

@@ -47,7 +47,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--max-model-len", type=int, default=2048)
-    ap.add_argument("--quantization", default="xetla")
+    ap.add_argument("--quantization", default="ternsycl")
     ap.add_argument("--sidecar", default=None)
     args = ap.parse_args()
 
@@ -109,11 +109,11 @@ def main():
               f"quant_method={type(getattr(mod, 'quant_method', None)).__name__}) ---")
         for pname, p in list(mod.named_parameters(recurse=False)):
             print(f"    param {pname:<16} {describe(p)}")
-        for bname in ("qweight", "scale", "xetla_qweight", "xetla_scale"):
+        for bname in ("qweight", "scale", "ternsycl_qweight", "ternsycl_scale"):
             b = getattr(mod, bname, None)
             if isinstance(b, torch.Tensor):
                 print(f"    attr  {bname:<16} {describe(b)}")
-        print(f"    xetla_quantized={getattr(mod, 'xetla_quantized', False)}")
+        print(f"    ternsycl_quantized={getattr(mod, 'ternsycl_quantized', False)}")
     print("=" * 100)
     print("INSPECT_DONE")
 

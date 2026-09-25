@@ -30,7 +30,7 @@ elif python -c "import torch; print(torch.__version__);" |& grep "xpu" >& /dev/n
 	export NEOReadDebugKeys=1
 	export VLLM_XPU_ENABLE_XPU_GRAPH=1
 	export ONEAPI_DEVICE_SELECTOR="opencl:1;level_zero:0"
-	# export XETLA_QUANTIZE_LM_HEADS=1
+	# export TERNSYCL_QUANTIZE_LM_HEADS=1
 else
 	echo "Could not find torch version"
 	if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

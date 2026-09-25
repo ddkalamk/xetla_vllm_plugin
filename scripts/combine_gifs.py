@@ -4,7 +4,7 @@
 
 Usage:
     python scripts/combine_gifs.py INPUT.gif [INPUT.gif ...] OUT.gif \
-        [--label "fp16 baseline" --label "int2 (xetla)" ...]
+        [--label "fp16 baseline" --label "int2 (ternsycl)" ...]
 
 Legacy 2-input form is still supported via --label-left / --label-right.
 Inputs may have different durations and frame counts; shorter ones are held

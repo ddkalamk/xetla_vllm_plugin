@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Offline packer: HF (unpacked) ternary checkpoint -> xetla int2 sidecar.
+"""Offline packer: HF (unpacked) ternary checkpoint -> ternsycl int2 sidecar.
 
 The Bonsai releases ship an "unpacked" FP16/BF16 safetensors checkpoint in
 which the language-model weights are *already* ternary: every value is
 ``s_g * {-1, 0, +1}`` with one scale per group of 128 elements along the input
 dimension (see the Bonsai 27B whitepaper, sec. 4.1).  This script recovers that
-representation losslessly and stores it in the packed layout the xetla int2
+representation losslessly and stores it in the packed layout the ternsycl int2
 kernels consume:
 
     qweight : int32 [K/16, N]   (16 K-rows packed per int32, codes {0,+1,-1})
@@ -13,7 +13,7 @@ kernels consume:
 
 The result is a single safetensors "sidecar" keyed by *vLLM module prefixes*
 (fused ``qkv_proj`` / ``gate_up_proj`` / ``in_proj_qkvz`` / ``in_proj_ba``
-included), which the plugin loads through ``XETLA_PREQUANT_PATH``.  Because the
+included), which the plugin loads through ``TERNSYCL_PREQUANT_PATH``.  Because the
 plugin then allocates the dense fp16 weights on the ``meta`` device, the 27B
 model never materialises its ~54 GB fp16 form -- packing offline is what makes
 it fit on a single GPU.
@@ -25,14 +25,13 @@ dense.
 Usage:
     python scripts/pack_bonsai_hf.py \
         --model prism-ml/Ternary-Bonsai-27B-unpacked \
-        --out   Ternary-Bonsai-27B.xetla-int2_f16.safetensors
+        --out   Ternary-Bonsai-27B.ternsycl-int2_f16.safetensors
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import re
 import sys
 import time
 
@@ -68,12 +67,6 @@ EMBEDDINGS = {"embed_tokens"}
 # never even look at these (vision tower is HQQ-4bit, not ternary)
 SKIP_SUBSTR = ("visual.", "vision_tower.", "mmproj")
 
-# MoE experts: vLLM stacks them into FusedMoE params w13_weight [E, 2I, H] and
-# w2_weight [E, H, I], so gate/up/down of every expert are packed and stacked
-# under one <...>.experts.{w13,w2} key instead of per-expert modules.
-MOE_EXPERT_RE = re.compile(r"^(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)$")
-MOE_SHARD_POS = {"gate_proj": 0, "up_proj": 1}
-
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -89,8 +82,6 @@ def parse_args() -> argparse.Namespace:
                    help="Leave lm_head dense instead of packing it.")
     p.add_argument("--no-embeddings", action="store_true",
                    help="Leave embed_tokens dense instead of packing it.")
-    p.add_argument("--no-moe", action="store_true",
-                   help="Leave MoE expert weights dense instead of packing them.")
     p.add_argument("--threads", type=int, default=0,
                    help="torch CPU threads (0 = leave default).")
     p.add_argument("--limit-layers", type=int, default=0,
@@ -225,8 +216,6 @@ def main() -> None:
     # groups: vllm_module_prefix -> list of (position, checkpoint tensor name)
     groups: dict[str, list[tuple[int, str]]] = {}
     embeddings: dict[str, str] = {}
-    # (experts_prefix, "w13"|"w2") -> expert_id -> [(shard_pos, tensor name)]
-    moe: dict[tuple[str, str], dict[int, list[tuple[int, str]]]] = {}
     for name in shard_of:
         if not name.endswith(".weight"):
             continue
@@ -244,18 +233,6 @@ def main() -> None:
         if not body.startswith(src_prefix):
             continue
         rel_parent = parent[len(src_prefix):]
-
-        moe_match = MOE_EXPERT_RE.match(body)
-        if moe_match:
-            if args.no_moe:
-                continue
-            base, expert_id, moe_leaf = moe_match.groups()
-            rel_base = base[len(src_prefix):] if base.startswith(src_prefix) else base
-            target = f"{dst_prefix}{rel_base}.experts"
-            shard = "w2" if moe_leaf == "down_proj" else "w13"
-            pos = MOE_SHARD_POS.get(moe_leaf, 0)
-            moe.setdefault((target, shard), {}).setdefault(int(expert_id), []).append((pos, name))
-            continue
 
         if leaf in FUSE_MAP:
             fused, pos = FUSE_MAP[leaf]
@@ -348,67 +325,6 @@ def main() -> None:
     for fh in open_shards.values():
         fh.__exit__(None, None, None)
 
-    # ---- MoE experts (stacked to match FusedMoE w13/w2 params) ------------
-    if args.limit_layers:
-        keep = {f"layers.{i}." for i in range(args.limit_layers)}
-        moe = {k: v for k, v in moe.items() if any(s in k[0] for s in keep)}
-    moe_open: dict[str, object] = {}
-
-    def moe_tensor(name: str) -> torch.Tensor:
-        path = shard_of[name]
-        fh = moe_open.get(path)
-        if fh is None:
-            fh = safe_open(path, framework="pt")
-            fh.__enter__()
-            moe_open[path] = fh
-        return fh.get_tensor(name)
-
-    for j, (key, per_expert) in enumerate(sorted(moe.items())):
-        prefix, shard = key
-        q_stack, s_stack = [], []
-        bad = None
-        for expert_id in sorted(per_expert):
-            q_parts, s_parts = [], []
-            for _, name in sorted(per_expert[expert_id]):
-                w = moe_tensor(name)
-                packed, scale, dev = quantize_ternary(w, args.tol)
-                if packed is None:
-                    bad = (name, dev)
-                    break
-                q_parts.append(packed)
-                s_parts.append(scale)
-                dense_bytes += w.numel() * 2
-            if bad is not None:
-                break
-            q_stack.append(q_parts[0] if len(q_parts) == 1 else torch.cat(q_parts, dim=1))
-            s_stack.append(s_parts[0] if len(s_parts) == 1 else torch.cat(s_parts, dim=1))
-        if bad is not None:
-            skipped.append((f"{prefix}.{shard}", bad[1]))
-            print(f"[pack] SKIP  {prefix}.{shard} (not ternary, "
-                  f"max_dev={bad[1]:.3g})", flush=True)
-            continue
-
-        qw = torch.stack(q_stack, dim=0)
-        sc = torch.stack(s_stack, dim=0)
-        if not args.inspect:
-            tensors[f"{prefix}.{shard}.qweight"] = qw.contiguous()
-            tensors[f"{prefix}.{shard}.scale"] = sc.contiguous()
-        layers_meta[f"{prefix}.{shard}"] = {
-            "kind": f"moe_{shard}",
-            "num_experts": len(q_stack),
-            "qweight_shape": list(qw.shape),
-            "scale_shape": list(sc.shape),
-        }
-        packed_bytes += qw.numel() * 4 + sc.numel() * 2
-        if (j + 1) % 16 == 0 or j + 1 == len(moe):
-            el = time.perf_counter() - t0
-            print(f"[pack] moe {j + 1}/{len(moe)} packed "
-                  f"({packed_bytes / 1e9:.2f} GB out / "
-                  f"{dense_bytes / 1e9:.1f} GB in, {el:.0f}s)", flush=True)
-
-    for fh in moe_open.values():
-        fh.__exit__(None, None, None)
-
     # ---- embeddings (row-major layout, packed for lookup) -----------------
     for prefix, name in sorted(embeddings.items()):
         path = shard_of[name]
@@ -450,9 +366,9 @@ def main() -> None:
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     meta = {
-        "xetla_format_version": "1",
-        "xetla_method": args.method,
-        "xetla_meta": json.dumps({
+        "ternsycl_format_version": "1",
+        "ternsycl_method": args.method,
+        "ternsycl_meta": json.dumps({
             "layers": layers_meta,
             "group_size": GROUP_SIZE,
             "source_model": args.model,
@@ -462,8 +378,8 @@ def main() -> None:
     size_gb = os.path.getsize(out) / 1e9
     print(f"[pack] wrote {out} ({size_gb:.2f} GB, "
           f"{len(layers_meta)} modules, method={args.method})")
-    print(f"[pack] run with: XETLA_PREQUANT_PATH={out} "
-          f"XETLA_QUANT_METHOD={args.method}")
+    print(f"[pack] run with: TERNSYCL_PREQUANT_PATH={out} "
+          f"TERNSYCL_QUANT_METHOD={args.method}")
 
 
 if __name__ == "__main__":

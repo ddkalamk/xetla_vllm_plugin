@@ -1,4 +1,4 @@
-"""Check the int2 x fp16 xetla GEMM kernels on the exact layer shapes used by
+"""Check the int2 x fp16 ternsycl GEMM kernels on the exact layer shapes used by
 Bonsai-27B (Qwen3.5 hybrid attention), for both the decode (M=1, upcvt) and
 prefill (M>1, DPAS when N%256==0) dispatch paths.
 
@@ -9,14 +9,13 @@ from __future__ import annotations
 
 import torch
 
-from xetla_vllm_plugin import (
+from ternsycl_vllm_plugin import (
     INT2_F16_GROUP_SIZE,
     pack_ternary_to_int2,
     quantize_to_ternary_f16,
 )
 
-import xetla_pt_ext  # noqa: F401  -- registers torch.ops.xetla_int2.*
-import ternsycl_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401  -- registers torch.ops.ternsycl.*
 
 # (name, K, N) as seen by the kernel: weight is [K, N]
 SHAPES = [

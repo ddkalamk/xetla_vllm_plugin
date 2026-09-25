@@ -7,11 +7,11 @@ needed.  This validates that
 
   * vLLM's ``Qwen3_5ForConditionalGeneration`` (hybrid GDN linear attention +
     full attention + vision tower) actually runs on Intel XPU, and
-  * the xetla plugin's quant path binds to the expected Linear layers.
+  * the ternsycl plugin's quant path binds to the expected Linear layers.
 
 Usage:
     python scripts/smoke_qwen3_5_xpu.py --src-config <path to real config.json>
-                                        [--layers 8] [--quantization xetla]
+                                        [--layers 8] [--quantization ternsycl]
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--layers", type=int, default=8,
                    help="Number of decoder layers in the shrunken model.")
     p.add_argument("--quantization",
-                   default=os.environ.get("VLLM_QUANTIZATION", "xetla"))
+                   default=os.environ.get("VLLM_QUANTIZATION", "ternsycl"))
     p.add_argument("--dtype", default="float16")
     p.add_argument("--max-model-len", type=int, default=512)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FastAPI backend for the xetla int2 Bonsai chat studio (Intel XPU).
+"""FastAPI backend for the ternsycl int2 Bonsai chat studio (Intel XPU).
 
 Keeps one warm vLLM engine in-process and streams tokens to a single-page UI,
 reporting the observed decode throughput (tok/s) after every prompt.
@@ -16,7 +16,7 @@ model the plugin supports:
 
   DEMO_MODEL            HF dir or repo id                (required)
   DEMO_TOKENIZER        defaults to DEMO_MODEL
-  DEMO_QUANT            xetla | none                     (xetla)
+  DEMO_QUANT            ternsycl | none                     (ternsycl)
   DEMO_DTYPE            float16
   DEMO_MAX_MODEL_LEN    8192
   DEMO_GPU_MEM_UTIL     0.85
@@ -29,8 +29,8 @@ model the plugin supports:
   DEMO_CUDAGRAPH_SIZES  batch sizes to capture graphs    (1,2,4,8,16)
   DEMO_WARMUP           1 pays the first-token JIT cost  (1)
 
-The xetla plugin itself is configured as usual via XETLA_QUANT_METHOD /
-XETLA_PREQUANT_PATH; see demo/serve.sh.
+The ternsycl plugin itself is configured as usual via TERNSYCL_QUANT_METHOD /
+TERNSYCL_PREQUANT_PATH; see demo/serve.sh.
 
 NOTE: serve.sh sets VLLM_DISABLE_COMPILE_CACHE=1 by default. vLLM's AOT
 torch.compile artifacts are keyed in a way that does not capture every engine
@@ -82,7 +82,7 @@ class Config:
     def __init__(self) -> None:
         self.model = os.environ.get("DEMO_MODEL", "")
         self.tokenizer = os.environ.get("DEMO_TOKENIZER") or self.model
-        quant = os.environ.get("DEMO_QUANT", "xetla")
+        quant = os.environ.get("DEMO_QUANT", "ternsycl")
         self.quant = None if quant.lower() in ("", "none") else quant
         self.dtype = os.environ.get("DEMO_DTYPE", "float16")
         self.max_model_len = int(os.environ.get("DEMO_MAX_MODEL_LEN", "8192"))
@@ -96,9 +96,6 @@ class Config:
         self.pipeline_parallel_size = int(
             os.environ.get("DEMO_PIPELINE_PARALLEL_SIZE", "1"))
         self.warmup = _env_bool("DEMO_WARMUP", True)
-        # Capture sizes must stay under the plugin's batched MoE path
-        # (XETLA_MOE_EXPAND_MAX / top_k); above it the gathered path syncs to
-        # host and aborts the capture.
         self.cudagraph_sizes = os.environ.get("DEMO_CUDAGRAPH_SIZES",
                                               "1,2,4,8,16")
 
@@ -286,8 +283,7 @@ class ChatEngine:
         else:
             extra["limit_mm_per_prompt"] = {"image": cfg.max_images, "video": 0}
 
-        # XPU graphs were worth 2.6x decode on the CAT-Q MoE model (62 -> 159
-        # tok/s): almost everything here is small enough to be launch-bound.
+        # XPU graphs: almost everything here is small enough to be launch-bound.
         if (os.environ.get("VLLM_XPU_ENABLE_XPU_GRAPH") == "1"
                 and not cfg.enforce_eager and cfg.cudagraph_sizes):
             sizes = [int(s) for s in cfg.cudagraph_sizes.split(",") if s.strip()]
@@ -613,8 +609,8 @@ def config() -> dict[str, Any]:
     info: dict[str, Any] = {
         "model": CFG.model,
         "quantization": CFG.quant or "none",
-        "quant_method": os.environ.get("XETLA_QUANT_METHOD", "-"),
-        "prequantized": bool(os.environ.get("XETLA_PREQUANT_PATH")),
+        "quant_method": os.environ.get("TERNSYCL_QUANT_METHOD", "-"),
+        "prequantized": bool(os.environ.get("TERNSYCL_PREQUANT_PATH")),
         "dtype": CFG.dtype,
         "max_model_len": CFG.max_model_len,
         "device": _device_name(),

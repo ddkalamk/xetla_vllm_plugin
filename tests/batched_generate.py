@@ -1,4 +1,4 @@
-"""Batched generation smoke test for the xetla path (several prompts in one
+"""Batched generation smoke test for the ternsycl path (several prompts in one
 llm.generate call, i.e. multi-sequence prefill and batched decode).
 
     python tests/batched_generate.py --model <packed dir> --n 8 [--max-tokens 32]
@@ -29,7 +29,7 @@ def main():
     from vllm import LLM, SamplingParams
 
     sizes = [int(s) for s in a.cudagraph_sizes.split(",")]
-    llm = LLM(model=a.model, quantization="xetla", dtype="bfloat16",
+    llm = LLM(model=a.model, quantization="ternsycl", dtype="bfloat16",
               trust_remote_code=True, enable_prefix_caching=False,
               max_model_len=a.max_model_len,
               max_num_batched_tokens=a.max_num_batched_tokens,

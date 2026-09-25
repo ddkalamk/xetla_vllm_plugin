@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build a small checkpoint out of the first N decoder layers of a large HF
-model, so the dense (fp16) and xetla-packed paths can be compared on a GPU that
+model, so the dense (fp16) and ternsycl-packed paths can be compared on a GPU that
 cannot hold the full model.
 
     python scripts/make_subset_checkpoint.py --model <hf dir> --out <dir> --layers 4

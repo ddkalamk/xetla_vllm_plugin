@@ -15,22 +15,22 @@ export NEOReadDebugKeys=1
 export VLLM_XPU_ENABLE_XPU_GRAPH=1
 export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
 
-# Use the xetla plugin's int2 weight x fp16 act kernels (per-128 K-group fp16
+# Use the ternsycl plugin's int2 weight x fp16 act kernels (per-128 K-group fp16
 # scales) for the Ternary-Bonsai GGUF.
-export XETLA_QUANT_METHOD="${XETLA_QUANT_METHOD:-int2_f16}"
-export VLLM_QUANTIZATION="${VLLM_QUANTIZATION:-xetla}"
+export TERNSYCL_QUANT_METHOD="${TERNSYCL_QUANT_METHOD:-int2_f16}"
+export VLLM_QUANTIZATION="${VLLM_QUANTIZATION:-ternsycl}"
 
 MODEL="${BONSAI_GGUF:-${ROOT_DIR}/Ternary-Bonsai-8B-F16.gguf}"
 
-# If a pre-quantized xetla sidecar exists next to the model, use it to skip
+# If a pre-quantized ternsycl sidecar exists next to the model, use it to skip
 # the slow GGUF dequant + per-layer re-quant step on every load.
-# Convention: <model>.xetla-<method>.safetensors  (e.g.
-# Ternary-Bonsai-8B-F16.gguf.xetla-int2_f16.safetensors).
-if [[ -z "${XETLA_PREQUANT_PATH:-}" ]]; then
-    candidate="${MODEL}.xetla-${XETLA_QUANT_METHOD}.safetensors"
+# Convention: <model>.ternsycl-<method>.safetensors  (e.g.
+# Ternary-Bonsai-8B-F16.gguf.ternsycl-int2_f16.safetensors).
+if [[ -z "${TERNSYCL_PREQUANT_PATH:-}" ]]; then
+    candidate="${MODEL}.ternsycl-${TERNSYCL_QUANT_METHOD}.safetensors"
     if [[ -f "${candidate}" ]]; then
-        export XETLA_PREQUANT_PATH="${candidate}"
-        echo "[chat.sh] using xetla sidecar: ${XETLA_PREQUANT_PATH}"
+        export TERNSYCL_PREQUANT_PATH="${candidate}"
+        echo "[chat.sh] using ternsycl sidecar: ${TERNSYCL_PREQUANT_PATH}"
     fi
 fi
 

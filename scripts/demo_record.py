@@ -5,8 +5,8 @@ The model is loaded silently first; the cast recording starts at the moment we
 begin "typing" the prompt and stops after the final tok/s line is printed.
 
 Usage:
-    python scripts/demo_record.py --label "int2 (xetla)" --out demo_int2.cast \
-        [--quantization xetla] [--model PATH] [--prompt "..."]
+    python scripts/demo_record.py --label "int2 (ternsycl)" --out demo_int2.cast \
+        [--quantization ternsycl] [--model PATH] [--prompt "..."]
 """
 
 from __future__ import annotations
@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
-    p.add_argument("--quantization", default=os.environ.get("VLLM_QUANTIZATION", "xetla"),
-                   help="'xetla' for int2 path, 'none' for fp16 baseline.")
+    p.add_argument("--quantization", default=os.environ.get("VLLM_QUANTIZATION", "ternsycl"),
+                   help="'ternsycl' for int2 path, 'none' for fp16 baseline.")
     p.add_argument("--label", required=True,
                    help="Banner shown at the top of the recording.")
     p.add_argument("--prompt", default="Tell me what is photosynthesis")

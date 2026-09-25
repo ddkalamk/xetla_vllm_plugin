@@ -1,6 +1,6 @@
 #!/bin/bash
 ###############################################################################
-# Correctness check of Bonsai 2 27B on the xetla int2 path with the standard
+# Correctness check of Bonsai 2 27B on the ternsycl int2 path with the standard
 # lm-evaluation-harness (vLLM backend), on the GPU node.
 #
 #   bash scripts/eval_bonsai2_lm_eval.sh <slurm-jobid> <TAG> [lm_eval args...]
@@ -18,22 +18,14 @@
 #   MAXLEN=N         max_model_len (default MAXGEN+2048)
 #   NSEQ=N           max_num_seqs (default 16)
 #   UTIL, KVBYTES    gpu_memory_utilization / pinned KV cache bytes (LNL: 0.35, 4 GiB)
-#   METHOD=int2|bitcos, BITCOS_SFX, MODELS, PACKED, SIDECAR as in run_bonsai2_gpu.sh
+#   MODELS, PACKED, SIDECAR as in run_bonsai2_gpu.sh
 ###############################################################################
 set -uo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PLUG=${PLUG:-$(cd -- "$HERE/.." && pwd)}
 MODELS=${MODELS:-$PLUG/../models}
 PACKED=${PACKED:-$MODELS/Ternary-Bonsai-2-27B-packed}
-METHOD=${METHOD:-int2}
-BITCOS_SFX=${BITCOS_SFX:-.b70}
-if [[ "$METHOD" == "bitcos" ]]; then
-  SIDECAR=${SIDECAR:-$MODELS/Ternary-Bonsai-2-27B.xetla-bitcos_f16${BITCOS_SFX}.safetensors}
-  QMETHOD=bitcos_f16
-else
-  SIDECAR=${SIDECAR:-$MODELS/Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors}
-  QMETHOD=int2_f16
-fi
+SIDECAR=${SIDECAR:-$MODELS/Ternary-Bonsai-2-27B.ternsycl-int2_f16.safetensors}
 JOB=${1:?usage: $0 <slurm-jobid> <TAG> [lm_eval args...]}
 TAG=${2:?usage: $0 <slurm-jobid> <TAG> [lm_eval args...]}
 shift 2
@@ -62,7 +54,7 @@ cat > "$OUT/config.yaml" <<EOF
 model: vllm
 model_args:
   pretrained: $PACKED
-  quantization: xetla
+  quantization: ternsycl
   dtype: bfloat16
   trust_remote_code: true
   max_model_len: $MAXLEN
@@ -92,8 +84,8 @@ source ${ONEAPI_VARS:-/swtools/intel/2026.0/oneapi-vars.sh} >/dev/null 2>&1
 source $PLUG/.venv/bin/activate
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 export VLLM_XPU_ENABLE_XPU_GRAPH=${VLLM_XPU_ENABLE_XPU_GRAPH:-1}
-export XETLA_PREQUANT_PATH=$SIDECAR XETLA_QUANT_METHOD=$QMETHOD
-export XETLA_HADAMARD_DTYPE=${XETLA_HADAMARD_DTYPE:-fp32}
+export TERNSYCL_PREQUANT_PATH=$SIDECAR TERNSYCL_QUANT_METHOD=int2_f16
+export TERNSYCL_HADAMARD_DTYPE=${TERNSYCL_HADAMARD_DTYPE:-fp32}
 export HF_DATASETS_OFFLINE=\${HF_DATASETS_OFFLINE:-0}
 ${RUN_ENV:-}
 pids=\$(ps -u \$USER -o pid=,comm= | awk '\$2 ~ /^(vllm|VLLM::EngineCor|lm_eval|lm-eval)\$/ {print \$1}')

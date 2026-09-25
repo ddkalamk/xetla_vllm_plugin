@@ -136,7 +136,7 @@ for PREC in bf16 int2 ; do
 LOG_DIR=${BASE_LOG_DIR}_${PREC}
 mkdir -p ${LOG_DIR}
 if [ $PREC == "int2" ] ; then
-	EXTRA_VLLM_ARGS=" -q xetla "
+	EXTRA_VLLM_ARGS=" -q ternsycl "
 else
 	EXTRA_VLLM_ARGS=""
 fi

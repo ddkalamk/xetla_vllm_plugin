@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Zero density of an int2_f16 sidecar (fraction of ternary codes that are 0),
-overall and per module kind. BITCOS packs zeros as one bit with no sign, so
-this is what sets its size and decode traffic.
+overall and per module kind.
 
     python scripts/zero_density.py <sidecar.safetensors> [more sidecars...]
 """
@@ -30,7 +29,7 @@ def code_counts(qw: torch.Tensor) -> tuple[int, int, int]:
 def main():
     for path in sys.argv[1:]:
         with safe_open(path, framework="pt") as f:
-            meta = json.loads((f.metadata() or {}).get("xetla_meta", "{}"))
+            meta = json.loads((f.metadata() or {}).get("ternsycl_meta", "{}"))
             layers = meta.get("layers", {})
             tot = defaultdict(lambda: [0, 0, 0])
             for prefix, info in layers.items():

@@ -1,5 +1,5 @@
 // Torch ops for the TernSYCL kernels: torch.ops.ternsycl.*. Same signatures,
-// layouts and dtypes as the xetla ops they replace. The registration sits in a
+// layouts and dtypes as the ternsycl ops they replace. The registration sits in a
 // .cpp: global ctors of .sycl TUs are not always run at .so load time.
 
 #include <ATen/record_function.h>

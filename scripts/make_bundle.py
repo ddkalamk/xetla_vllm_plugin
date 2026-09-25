@@ -9,18 +9,18 @@ checkpoint takes the 27B from ~51 GiB to ~7.6 GiB.
 
     python scripts/make_bundle.py \
         --model prism-ml/Ternary-Bonsai-27B-unpacked \
-        --sidecar Ternary-Bonsai-27B.xetla-int2_f16.safetensors \
+        --sidecar Ternary-Bonsai-27B.ternsycl-int2_f16.safetensors \
         --out bonsai27b-int2-bundle
 
 Layout produced:
 
     <out>/model/                            <- point DEMO_MODEL / --model here
-    <out>/model.xetla-int2_f16.safetensors  <- found automatically by serve.sh
+    <out>/model.ternsycl-int2_f16.safetensors  <- found automatically by serve.sh
 
 On the target node:
 
-    export XETLA_QUANT_METHOD=int2_f16
-    export XETLA_PREQUANT_PATH=<out>/model.xetla-int2_f16.safetensors
+    export TERNSYCL_QUANT_METHOD=int2_f16
+    export TERNSYCL_PREQUANT_PATH=<out>/model.ternsycl-int2_f16.safetensors
     python scripts/bench_model.py --model <out>/model
 """
 from __future__ import annotations
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sidecar", required=True, help="packed .safetensors sidecar")
     p.add_argument("--out", required=True, help="bundle directory to create")
     p.add_argument("--method", default="int2_f16",
-                   help="names the sidecar <model>.xetla-<method>.safetensors")
+                   help="names the sidecar <model>.ternsycl-<method>.safetensors")
     p.add_argument("--copy-sidecar", action="store_true",
                    help="copy the sidecar instead of hard-linking it")
     return p.parse_args()
@@ -138,7 +138,7 @@ def main() -> None:
     print(f"[bundle] residual weights: {total / 1024**3:.2f} GiB -> {shard_name}")
 
     # --- place the sidecar so serve.sh finds it automatically --------------
-    dst_sidecar = os.path.join(a.out, f"model.xetla-{a.method}.safetensors")
+    dst_sidecar = os.path.join(a.out, f"model.ternsycl-{a.method}.safetensors")
     if os.path.exists(dst_sidecar):
         os.remove(dst_sidecar)
     linked = False

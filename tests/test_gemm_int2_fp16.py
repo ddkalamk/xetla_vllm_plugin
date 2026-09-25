@@ -1,5 +1,5 @@
 """Smoke test for the int2 x fp16 upcvt GEMM kernel and the int2_f16 quantize
-helpers in xetla_vllm_plugin.
+helpers in ternsycl_vllm_plugin.
 
 Run after building the extension:
 
@@ -13,14 +13,13 @@ from __future__ import annotations
 
 import torch
 
-from xetla_vllm_plugin import (
+from ternsycl_vllm_plugin import (
     INT2_F16_GROUP_SIZE,
     pack_ternary_to_int2,
     quantize_to_ternary_f16,
 )
 
-import xetla_pt_ext  # noqa: F401  -- registers torch.ops.xetla_int2.*
-import ternsycl_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401  -- registers torch.ops.ternsycl.*
 
 
 def make_ternary_weight(K: int, N: int, gs: int = INT2_F16_GROUP_SIZE,

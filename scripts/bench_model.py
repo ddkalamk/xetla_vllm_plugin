@@ -1,6 +1,6 @@
-"""Report load-time and decode performance for a xetla-quantized model.
+"""Report load-time and decode performance for a ternsycl-quantized model.
 
-    XETLA_QUANT_METHOD=int2_f16 XETLA_PREQUANT_PATH=... \
+    TERNSYCL_QUANT_METHOD=int2_f16 TERNSYCL_PREQUANT_PATH=... \
         python scripts/bench_model.py --model <hf dir or gguf> [--text-only]
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--tokenizer", default=None)
-    p.add_argument("--quantization", default="xetla")
+    p.add_argument("--quantization", default="ternsycl")
     p.add_argument("--dtype", default="float16")
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
@@ -117,19 +117,19 @@ def main():
 
     # Arm the GEMM profiler only now: its per-call sync perturbs vLLM's memory
     # profiling badly enough to zero out the KV cache.
-    if int(os.environ.get("XETLA_PROFILE", "0")) > 0:
+    if int(os.environ.get("TERNSYCL_PROFILE", "0")) > 0:
         try:
-            import xetla_vllm_plugin
-            xetla_vllm_plugin.xprof_start()
+            import ternsycl_vllm_plugin
+            ternsycl_vllm_plugin.xprof_start()
         except Exception as e:
-            print(f"[xetla] could not arm profiler: {e}")
+            print(f"[ternsycl] could not arm profiler: {e}")
 
     engine = llm.llm_engine
 
     print("\n" + "=" * 70)
     print(f"model                : {a.model}")
-    print(f"quantization         : {quant} ({os.environ.get('XETLA_QUANT_METHOD', '-')})"
-          f"{'  [sidecar]' if os.environ.get('XETLA_PREQUANT_PATH') else ''}")
+    print(f"quantization         : {quant} ({os.environ.get('TERNSYCL_QUANT_METHOD', '-')})"
+          f"{'  [sidecar]' if os.environ.get('TERNSYCL_PREQUANT_PATH') else ''}")
     print(f"tensor parallel      : {a.tensor_parallel_size}")
     print(f"pipeline parallel    : {a.pipeline_parallel_size}")
     print(f"engine load          : {load_s:.1f} s")

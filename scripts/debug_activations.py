@@ -5,7 +5,7 @@ Registers forward hooks on every leaf module and reports the first modules
 whose output contains NaN/Inf (or a suspiciously large magnitude), which is
 what you need when a quantized model emits garbage tokens.
 
-    python scripts/debug_activations.py --model <hf dir> [--quantization xetla]
+    python scripts/debug_activations.py --model <hf dir> [--quantization ternsycl]
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def parse_args():
     p.add_argument("--model", required=True)
     p.add_argument("--tokenizer", default=None)
     p.add_argument("--prompt", default="What is photosynthesis?")
-    p.add_argument("--quantization", default="xetla")
+    p.add_argument("--quantization", default="ternsycl")
     p.add_argument("--dtype", default="float16")
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85)

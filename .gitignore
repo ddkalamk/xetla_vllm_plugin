@@ -22,7 +22,7 @@ vllm/
 Bonsai-demo/
 
 # Local scratch
-scripts/test_xetla_ops.py
+scripts/test_ternsycl_ops.py
 
 # demo/launch_demo.sh runtime state (job id, node, logs)
 demo/.run/

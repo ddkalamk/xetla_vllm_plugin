@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline packer: Bonsai 2 (Hadamard-folded) PQ2_0 GGUF -> xetla int2 sidecar.
+"""Offline packer: Bonsai 2 (Hadamard-folded) PQ2_0 GGUF -> ternsycl int2 sidecar.
 
 Bonsai 2 ships only as GGUF (PQ2_0 / PTQ1_0 / F16) from the PrismML llama.cpp
 fork. Its weights are ternary g128 like Bonsai 1, but stored in a *rotated
@@ -7,7 +7,7 @@ basis*: every folded matrix expects its input to be passed through a fixed sign
 flip followed by a blockwise (1024) normalised Walsh-Hadamard transform, and the
 token embedding is stored rotated too (inverse transform after lookup). The
 GGUF carries this contract in ``prism.hadamard.*`` metadata; this script moves
-it into the xetla sidecar so the plugin can apply the same transform on XPU.
+it into the ternsycl sidecar so the plugin can apply the same transform on XPU.
 
 What comes out:
 
@@ -15,7 +15,7 @@ What comes out:
      <prefix>.qweight  int32 [K/16, N]  (vnni16: 16 K-rows per word, -1 -> 3)
      <prefix>.scale    fp16  [K/128, N]
      hadamard.signs.<K> fp16 [K]       sign vectors, one per folded width
-     metadata.xetla_meta.hadamard      block size + which prefixes are folded
+     metadata.ternsycl_meta.hadamard      block size + which prefixes are folded
   <packed-dir>/                    compact HF-style model dir for vLLM
      model-residual.safetensors    norms, A_log, dt_bias, conv1d, in_proj_a/b,
                                    plus the vision tower from the mmproj GGUF
@@ -40,7 +40,7 @@ Usage:
         --gguf    models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf \
         --mmproj  models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-mmproj-BF16.gguf \
         --ref-dir models/Ternary-Bonsai-2-27B-mlx-ref \
-        --out     models/Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors \
+        --out     models/Ternary-Bonsai-2-27B.ternsycl-int2_f16.safetensors \
         --packed  models/Ternary-Bonsai-2-27B-packed
 
 ``--ref-dir`` holds the model's tokenizer.json / tokenizer_config.json /
@@ -255,11 +255,11 @@ def synth_config(ref_cfg: dict) -> dict:
     return cfg
 
 
-# ---- PQ2_0 -> xetla int2 --------------------------------------------------
+# ---- PQ2_0 -> ternsycl int2 --------------------------------------------------
 def pq2_0_words_scales(t) -> tuple[np.ndarray, np.ndarray]:
     """Return (words uint32 [N, K/16], scale fp16 [N, K/128]) for a PQ2_0
     tensor, with codes already remapped from ggml {0,1,2} = {-1,0,+1} to the
-    xetla two's-complement {3,0,1}."""
+    ternsycl two's-complement {3,0,1}."""
     n, k = (int(x) for x in reversed(t.shape))
     raw = np.ascontiguousarray(t.data).reshape(-1)
     blocks = n * k // GROUP_SIZE
@@ -279,7 +279,7 @@ def pq2_0_words_scales(t) -> tuple[np.ndarray, np.ndarray]:
 
 
 def to_kn_layout(words: np.ndarray, scale: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
-    """[N, K/16] words / [N, K/128] scales -> xetla [K/16, N] int32, [K/128, N] fp16."""
+    """[N, K/16] words / [N, K/128] scales -> ternsycl [K/16, N] int32, [K/128, N] fp16."""
     qw = torch.from_numpy(words.view(np.int32)).t().contiguous()
     sc = torch.from_numpy(scale.view(np.float16)).t().contiguous()
     return qw, sc
@@ -512,9 +512,9 @@ def main() -> None:
     for w, s in signs.items():
         out_tensors[f"hadamard.signs.{w}"] = s.contiguous()
     meta = {
-        "xetla_format_version": "1",
-        "xetla_method": "int2_f16",
-        "xetla_meta": json.dumps({
+        "ternsycl_format_version": "1",
+        "ternsycl_method": "int2_f16",
+        "ternsycl_meta": json.dumps({
             "layers": layers_meta,
             "group_size": GROUP_SIZE,
             "source_model": os.path.abspath(a.gguf),

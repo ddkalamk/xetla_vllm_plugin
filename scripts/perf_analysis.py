@@ -1,6 +1,6 @@
 """Roofline analysis for the int2 kernels at real model shapes.
 
-    python scripts/perf_analysis.py [--model 235b|30b] [--iters 50]
+    python scripts/perf_analysis.py [--model 8b] [--iters 50]
 
 Decode is weight-stationary and memory bound: every token streams the whole
 weight matrix once, so the figure of merit is achieved read bandwidth, not
@@ -14,21 +14,12 @@ import argparse
 import time
 
 import torch
-import xetla_pt_ext  # noqa: F401  -- registers torch.ops.xetla_int2.*
-import ternsycl_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401  -- registers torch.ops.ternsycl.*
 
 GS = 128  # scale group along K
 
-# (label, K, N) for one card, tp=1. Qwen3-235B-A22B: hidden 4096, 64 q heads,
-# 4 kv heads, head_dim 128, moe_intermediate 1536, 128 experts, top-8.
+# (label, K, N) for one card, tp=1.
 SHAPES = {
-    "235b": [
-        ("qkv_proj", 4096, 9216),
-        ("o_proj", 8192, 4096),
-        ("expert_w13", 4096, 3072),
-        ("expert_w2", 1536, 4096),
-        ("lm_head_fp16", 4096, 151936),
-    ],
     "8b": [
         # Qwen3-8B: hidden 4096, 32 q heads, 8 kv heads, head_dim 128,
         # intermediate 12288, 36 layers.
@@ -38,12 +29,6 @@ SHAPES = {
         ("down_proj", 12288, 4096),
         # CAT-Q leaves lm_head in fp16, so the fp16 column is the real cost
         ("lm_head", 4096, 151936),
-    ],
-    "30b": [
-        ("qkv_proj", 2048, 4096),
-        ("o_proj", 4096, 2048),
-        ("expert_w13", 2048, 1536),
-        ("expert_w2", 768, 2048),
     ],
 }
 
@@ -98,7 +83,7 @@ def bench_fp16_gemm(m, k, n, iters):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="235b", choices=sorted(SHAPES))
+    p.add_argument("--model", default="8b", choices=sorted(SHAPES))
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--batch", type=int, default=1, help="decode batch (M)")
     p.add_argument("--tp", type=int, default=1,
@@ -118,7 +103,7 @@ def main():
     for label, k, n in SHAPES[a.model]:
         # column-parallel layers split N, row-parallel split K
         if a.tp > 1:
-            if label in ("o_proj", "expert_w2"):
+            if label in ("o_proj", "down_proj"):
                 k //= a.tp
             else:
                 n //= a.tp

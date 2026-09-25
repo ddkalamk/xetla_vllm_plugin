@@ -18,7 +18,7 @@ import torch.distributed as dist
 
 HIDDEN = 4096
 LAYERS = 94  # Qwen3-235B-A22B
-ALLREDUCE_PER_LAYER = 2  # after attention o_proj and after the MoE
+ALLREDUCE_PER_LAYER = 2  # after attention o_proj and after the MLP
 
 
 def bench(fn, iters=200, warmup=30):

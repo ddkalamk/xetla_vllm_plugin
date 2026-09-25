@@ -7,8 +7,7 @@ import math
 import time
 
 import torch
-import xetla_pt_ext  # noqa: F401  registers torch.ops.xetla_int2.*
-import ternsycl_pt_ext  # noqa: F401
+import ternsycl_pt_ext  # noqa: F401  registers torch.ops.ternsycl.*
 
 dev = torch.device("xpu")
 torch.manual_seed(0)

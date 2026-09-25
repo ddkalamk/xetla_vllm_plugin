@@ -1,4 +1,4 @@
-import torch, time, xetla_pt_ext, ternsycl_pt_ext
+import torch, time, ternsycl_pt_ext, ternsycl_pt_ext
 dev='xpu'
 def bench(fn,n=100):
     for _ in range(5): fn()

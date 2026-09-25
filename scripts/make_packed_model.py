@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a compact model directory for the xetla packed paths.
+"""Build a compact model directory for the ternsycl packed paths.
 
 vLLM re-reads the whole fp16 checkpoint on every load even when a prequant
 sidecar already supplies every linear weight, which for Bonsai 8B means 15.25
@@ -9,18 +9,17 @@ up with no room for a KV cache at all.
 
 The linear weights can simply be left out: vLLM only requires that every
 parameter be *accounted* for, and it already exempts modules whose quant_method
-defines process_weights_after_loading, which is exactly the xetla linear and
+defines process_weights_after_loading, which is exactly the ternsycl linear and
 embedding methods. So this writes a directory holding only the tensors the
 sidecar does not replace (embedding, norms), which for Bonsai 8B is ~1.25 GiB.
 
     python scripts/make_packed_model.py \
         --model  models/Ternary-Bonsai-8B-unpacked \
-        --sidecar models/....xetla-bitcos_f16.safetensors \
+        --sidecar models/....ternsycl-int2_f16.safetensors \
         --out    models/Ternary-Bonsai-8B-packed
 
-The result is format independent: the same directory serves int2_f16 and
-bitcos_f16, since only the sidecar differs. Point XETLA_PREQUANT_PATH at
-whichever sidecar you want.
+The result does not depend on the sidecar contents; point
+TERNSYCL_PREQUANT_PATH at the sidecar you want.
 """
 from __future__ import annotations
 
@@ -50,7 +49,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True, help="source HF model directory")
     p.add_argument("--sidecar", required=True,
-                   help="xetla prequant sidecar whose layers to drop")
+                   help="ternsycl prequant sidecar whose layers to drop")
     p.add_argument("--out", required=True)
     p.add_argument("--link-sidecar", action="store_true",
                    help="also symlink the sidecar into the output directory")

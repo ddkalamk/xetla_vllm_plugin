@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Run a one-shot vLLM model load on XPU and dump the xetla-quantized
+"""Run a one-shot vLLM model load on XPU and dump the ternsycl-quantized
 (qweight, scale) pairs to a single safetensors sidecar.
 
-The sidecar can later be loaded directly via ``XETLA_PREQUANT_PATH=...``,
+The sidecar can later be loaded directly via ``TERNSYCL_PREQUANT_PATH=...``,
 which lets ``process_weights_after_loading`` skip the slow GGUF dequant +
 per-layer CPU re-quant step on subsequent runs.
 
 Usage:
     python scripts/prequantize_gguf.py \\
         --model Ternary-Bonsai-8B-F16.gguf \\
-        --out   Ternary-Bonsai-8B.xetla-int2.safetensors
+        --out   Ternary-Bonsai-8B.ternsycl-int2.safetensors
 
-Environment is the same as ``scripts/chat.sh`` (``XETLA_QUANT_METHOD``,
+Environment is the same as ``scripts/chat.sh`` (``TERNSYCL_QUANT_METHOD``,
 ``VLLM_QUANTIZATION``, etc.).
 """
 from __future__ import annotations
@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-model-len", type=int, default=512)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--quantization",
-                   default=os.environ.get("VLLM_QUANTIZATION", "xetla"))
+                   default=os.environ.get("VLLM_QUANTIZATION", "ternsycl"))
     p.add_argument("--dtype", default="float16")
     return p.parse_args()
 
@@ -50,16 +50,16 @@ def main() -> None:
     # Tell the plugin to capture every layer it quantizes and flush to disk
     # right after model load. This must be set BEFORE importing vllm so the
     # plugin's register() picks it up.
-    os.environ["XETLA_PREQUANT_DUMP_PATH"] = out
+    os.environ["TERNSYCL_PREQUANT_DUMP_PATH"] = out
     # And make sure we are NOT also loading from a sidecar (would short-
     # circuit and leave the dump buffer empty).
-    os.environ.pop("XETLA_PREQUANT_PATH", None)
+    os.environ.pop("TERNSYCL_PREQUANT_PATH", None)
 
     print(f"[prequantize] model     : {args.model}", flush=True)
     print(f"[prequantize] out       : {out}", flush=True)
     print(f"[prequantize] quant     : {args.quantization}", flush=True)
     print(f"[prequantize] method    : "
-          f"{os.environ.get('XETLA_QUANT_METHOD', 'int2')}", flush=True)
+          f"{os.environ.get('TERNSYCL_QUANT_METHOD', 'int2')}", flush=True)
 
     # Import after env is set.
     from vllm import LLM, SamplingParams  # noqa: WPS433

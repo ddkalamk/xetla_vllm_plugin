@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import torch
 
-from xetla_vllm_plugin import (
+from ternsycl_vllm_plugin import (
     INT2_F16_GROUP_SIZE,
     pack_ternary_to_int2,
     quantize_to_ternary_f16,
 )
 
-import xetla_pt_ext  # noqa: F401
 import ternsycl_pt_ext  # noqa: F401
 
 K = 5120

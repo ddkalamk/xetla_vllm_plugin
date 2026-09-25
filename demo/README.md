@@ -12,7 +12,7 @@ browser  ──►  demo/static/index.html   (single page, SSE)
               demo/server.py           (FastAPI, port 8000)
                     │
                     ▼
-              vLLM engine  +  xetla int2 plugin  ──►  Intel GPU
+              vLLM engine  +  ternsycl int2 plugin  ──►  Intel GPU
 ```
 
 ---
@@ -34,7 +34,7 @@ cd demo
 [demo] node     : pcl-zen4
 [demo] backend already serving on pcl-zen4:8000, reusing it
 [demo] model        : Ternary-Bonsai-27B-unpacked
-[demo] quantization : xetla / int2_f16 (sidecar)
+[demo] quantization : ternsycl / int2_f16 (sidecar)
 [demo] device       : Intel(R) Graphics [0xe223]
 [demo] context      : 8192
 [demo] KV cache     : 257,088 tokens
@@ -75,8 +75,8 @@ and troubleshooting.
 |---|---|
 | Intel GPU (Battlemage/Xe2 class, e.g. B70) | ~30 GiB VRAM for the 27B |
 | oneAPI + Intel GPU driver | `/swtools/intel/2025.3`, `/swtools/intel-gpu/26.05.37020.3` on this cluster |
-| Python venv at `<repo>/.venv` | torch-xpu, vLLM (vendored, branch `xetla_v0.21.0`), fastapi, uvicorn, pillow |
-| xetla plugin built into the venv | provides `torch.ops.xetla_int2.*` |
+| Python venv at `<repo>/.venv` | torch-xpu, vLLM (vendored, branch `ternsycl_v0.21.0`), fastapi, uvicorn, pillow |
+| ternsycl plugin built into the venv | provides `torch.ops.ternsycl.*` |
 | Model checkpoint | e.g. `prism-ml/Ternary-Bonsai-27B-unpacked` |
 | int2 sidecar | pre-packed weights, see step 2 |
 
@@ -87,8 +87,8 @@ machine) or `utils/setup_vllm_xpu.sh`, then install the plugin:
 source .venv/bin/activate
 pip install -q --no-build-isolation --no-deps .
 # The install replaces the plugin symlink with a copy — restore it so edits to
-# xetla_vllm_plugin.py take effect without reinstalling:
-ln -sf "$PWD/xetla_vllm_plugin.py" .venv/lib/python3.12/site-packages/xetla_vllm_plugin.py
+# ternsycl_vllm_plugin.py take effect without reinstalling:
+ln -sf "$PWD/ternsycl_vllm_plugin.py" .venv/lib/python3.12/site-packages/ternsycl_vllm_plugin.py
 ```
 
 ---
@@ -119,26 +119,26 @@ tensors on the `meta` device and the checkpoint copies become no-ops.
 srun --jobid="$JOBID" --overlap bash -lc '
 source /swtools/intel-gpu/26.05.37020.3/intel_gpu_vars.sh
 source /swtools/intel/2025.3/oneapi-vars.sh --force
-source ~/FRESH/xetla_vllm_plugin/.venv/bin/activate
-cd ~/FRESH/xetla_vllm_plugin
+source ~/FRESH/ternsycl_vllm_plugin/.venv/bin/activate
+cd ~/FRESH/ternsycl_vllm_plugin
 python scripts/pack_bonsai_hf.py \
     --model prism-ml/Ternary-Bonsai-27B-unpacked \
-    --out   ~/FRESH/Ternary-Bonsai-27B.xetla-int2_f16.safetensors'
+    --out   ~/FRESH/Ternary-Bonsai-27B.ternsycl-int2_f16.safetensors'
 ```
 
 Produces ~7.1 GB from a 51 GB checkpoint (306 modules, including `lm_head` and
 `embed_tokens`), round-trip error 0. Skip this step if the sidecar already
 exists — `serve.sh` finds it automatically at either of:
 
-* `<model dir>.xetla-int2_f16.safetensors`
-* `<repo>/../Ternary-Bonsai-27B.xetla-int2_f16.safetensors`
+* `<model dir>.ternsycl-int2_f16.safetensors`
+* `<repo>/../Ternary-Bonsai-27B.ternsycl-int2_f16.safetensors`
 
 ---
 
 ## 3. Start the backend
 
 ```bash
-cd ~/FRESH/xetla_vllm_plugin/demo
+cd ~/FRESH/ternsycl_vllm_plugin/demo
 JOBID=<your job id> ./serve.sh
 ```
 
@@ -148,9 +148,9 @@ the sidecar, and launches uvicorn on `0.0.0.0:8000`.
 To keep it running after you close the terminal:
 
 ```bash
-cd ~/FRESH/xetla_vllm_plugin/demo
+cd ~/FRESH/ternsycl_vllm_plugin/demo
 setsid nohup srun --jobid=<your job id> --overlap bash -lc \
-  'cd ~/FRESH/xetla_vllm_plugin/demo && PORT=8000 ./serve.sh' \
+  'cd ~/FRESH/ternsycl_vllm_plugin/demo && PORT=8000 ./serve.sh' \
   > ~/FRESH/demo_server.log 2>&1 < /dev/null & disown
 tail -f ~/FRESH/demo_server.log
 ```
@@ -188,7 +188,7 @@ VS Code forwards ports from the **login node**, which cannot see the compute
 node's port. Run the bundled relay on the login node:
 
 ```bash
-cd ~/FRESH/xetla_vllm_plugin/demo
+cd ~/FRESH/ternsycl_vllm_plugin/demo
 setsid nohup python port_relay.py 8765 <node> 8000 > ~/FRESH/demo_relay.log 2>&1 < /dev/null & disown
 ```
 
@@ -243,7 +243,7 @@ All knobs are environment variables read by `demo/server.py`; set them before
 |---|---|---|
 | `DEMO_MODEL` | Ternary-Bonsai-27B snapshot | HF dir or repo id |
 | `DEMO_TOKENIZER` | `DEMO_MODEL` | override if the checkpoint has no tokenizer |
-| `DEMO_QUANT` | `xetla` | `none` disables the plugin (dense baseline) |
+| `DEMO_QUANT` | `ternsycl` | `none` disables the plugin (dense baseline) |
 | `DEMO_DTYPE` | `float16` | |
 | `DEMO_MAX_MODEL_LEN` | `8192` | context window |
 | `DEMO_GPU_MEM_UTIL` | `0.85` | lower it on integrated GPUs |
@@ -252,8 +252,8 @@ All knobs are environment variables read by `demo/server.py`; set them before
 | `DEMO_TEXT_ONLY` | `0` | `1` disables the vision tower (saves ~0.9 GiB) |
 | `DEMO_ENFORCE_EAGER` | `0` | `1` skips `torch.compile` (faster startup) |
 | `DEMO_WARMUP` | `1` | pays the first-token JIT cost at startup |
-| `XETLA_QUANT_METHOD` | `int2_f16` | plugin kernel family |
-| `XETLA_PREQUANT_PATH` | auto-detected | explicit sidecar path |
+| `TERNSYCL_QUANT_METHOD` | `int2_f16` | plugin kernel family |
+| `TERNSYCL_PREQUANT_PATH` | auto-detected | explicit sidecar path |
 | `PORT` / `HOST` | `8000` / `0.0.0.0` | uvicorn bind |
 
 Examples:
@@ -261,7 +261,7 @@ Examples:
 ```bash
 # 8B instead of 27B (text-only model, so no image input)
 DEMO_MODEL=prism-ml/Bonsai-8B-unpacked \
-XETLA_PREQUANT_PATH=~/FRESH/Bonsai-8B.xetla-int2_f16.safetensors ./serve.sh
+TERNSYCL_PREQUANT_PATH=~/FRESH/Bonsai-8B.ternsycl-int2_f16.safetensors ./serve.sh
 
 # text-only (frees the ~0.9 GiB vision tower)
 DEMO_TEXT_ONLY=1 ./serve.sh
@@ -314,7 +314,7 @@ Images are sent as `data:` URLs in `messages[].images`.
 | Preview pane is blank | The server is on the compute node; VS Code forwards the login node. Start `port_relay.py` (step 4b) and use a free port. |
 | `curl` returns `403` on localhost | The cluster `http_proxy` intercepts localhost. Add `--noproxy '*'`. |
 | `Unable to confirm allocation for job N` | The Slurm job expired; get a new one with `squeue -u $USER`. |
-| Loads slowly / uses ~54 GB and OOMs | The sidecar was not found, so weights loaded dense. Check the `[serve.sh] xetla sidecar:` line and `/config` → `"prequantized": true`. |
+| Loads slowly / uses ~54 GB and OOMs | The sidecar was not found, so weights loaded dense. Check the `[serve.sh] ternsycl sidecar:` line and `/config` → `"prequantized": true`. |
 | Model badge shows a hex hash | HF cache path; cosmetic only, the UI now resolves the repo name. |
 | Startup takes ~100 s every time | `torch.compile` cache is cold or unwritable; check `~/.cache/vllm/torch_compile_cache`. Use `DEMO_ENFORCE_EAGER=1` to skip compilation. |
 | Image button disabled | `/config` reports `supports_images: false` — either `DEMO_TEXT_ONLY=1` or the model has no vision tower. |

@@ -48,8 +48,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trust-remote-code", action="store_true", default=True)
     p.add_argument(
         "--quantization",
-        default=os.environ.get("VLLM_QUANTIZATION", "xetla"),
-        help="vLLM quantization scheme. Use 'xetla' to enable the int2 plugin "
+        default=os.environ.get("VLLM_QUANTIZATION", "ternsycl"),
+        help="vLLM quantization scheme. Use 'ternsycl' to enable the int2 plugin "
              "(default), or 'none' to disable.",
     )
     p.add_argument("--dtype", default="float16")
@@ -82,7 +82,7 @@ def main() -> None:
 
     print(f"Loading {args.model} (tokenizer={args.tokenizer}) ...", flush=True)
     quant = args.quantization if args.quantization and args.quantization.lower() != "none" else None
-    print(f"  quantization={quant} XETLA_QUANT_METHOD={os.environ.get('XETLA_QUANT_METHOD')}", flush=True)
+    print(f"  quantization={quant} TERNSYCL_QUANT_METHOD={os.environ.get('TERNSYCL_QUANT_METHOD')}", flush=True)
     llm = LLM(
         model=args.model,
         tokenizer=args.tokenizer,

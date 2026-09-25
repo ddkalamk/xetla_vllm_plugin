@@ -1,6 +1,6 @@
 // TernSYCL int2 x int8 DPAS GEMM (ternsycl/int2_via_int2_x_int8_dpas) for the
 // plugin's prefill DPAS path: A quantized upfront per (row, 128-group) to int8
-// (qmode 0; same numerics as xetla's on-the-fly quantization), then the s8 x s2
+// (qmode 0; same numerics as ternsycl's on-the-fly quantization), then the s8 x s2
 // DPAS GEMM. Tiles are the B70 bests of the TernSYCL driver.
 
 #include "int2_int8_dpas.hpp"

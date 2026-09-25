@@ -1,303 +1,212 @@
-# Fresh setup (from scratch)
+# TernSYCL vLLM plugin for Intel Xe2 GPUs
 
-`utils/setup_fresh.sh` does the whole thing: clones this repo with the `xetla`
-submodule, creates a Python 3.12 venv, clones the vendored vLLM, installs it
-for XPU, and builds the plugin extension.
+A vLLM general plugin that serves ternary checkpoints (weights in
+`{-1, 0, +1}` × one fp16 scale per 128 input elements) on Intel Xe2 GPUs
+(Arc Pro B70 / BMG, Arc 140V / Lunar Lake) with the
+[TernSYCL](https://github.com/libxsmm/TernSYCL) kernels. It registers the
+quantization method `ternsycl` (`--quantization ternsycl`).
 
-```bash
-# Prerequisites, loaded BEFORE running the script:
-source /swtools/intel-gpu/<ver>/intel_gpu_vars.sh
-source /swtools/intel/<oneapi-ver>/oneapi-vars.sh --force
-# plus: python >= 3.10, git, and uv (preferred) in PATH
+Models covered: **Bonsai 2 27B** (Hadamard-rotated basis, step-by-step guide in
+[BONSAI2.md](BONSAI2.md)), Bonsai 1 27B / 8B, and dense CAT-Q ternary exports
+(`scripts/deploy_catq.sh`).
 
-./utils/setup_fresh.sh /path/to/empty/build/dir
+## Architecture
+
+```mermaid
+flowchart TD
+    V["vLLM v0.30 engine<br/>(--quantization ternsycl)"] --> P["ternsycl_vllm_plugin.py<br/>TernsyclConfig / LinearMethod / EmbeddingMethod"]
+    S["sidecar<br/>&lt;model&gt;.ternsycl-int2_f16.safetensors"] --> P
+    P --> O["torch.ops.ternsycl.*<br/>csrc/ternsycl_ops.cpp"]
+    O --> U["csrc/upcvt.sycl<br/>int2 upcvt GEMV / GEMM + tile dispatch"]
+    O --> D["csrc/int8_dpas.sycl<br/>int2 x int8 DPAS (opt-in prefill)"]
+    O --> H["csrc/hadamard.sycl<br/>sign flip + blockwise WHT"]
+    U --> K["ternsycl/ submodule<br/>kernel headers"]
+    D --> K
+    H --> K
 ```
 
-> **The vendored vLLM.** The script clones upstream `vllm-project/vllm` at tag
-> `v0.30.0` (torch 2.13 xpu, triton-xpu 3.7.2, vllm-xpu-kernels 0.1.14.1). No
-> local patch is needed; a `vllm.patch` at the plugin root is still applied if
-> present. Build and run with oneAPI 2026.0 (torch 2.13 ships the 2026.0 SYCL
-> runtime). Override the source with `VLLM_REPO` / `VLLM_BRANCH`.
-
-If you only need the Python environment (no from-scratch clone):
-
-```bash
-bash utils/setup_vllm_xpu.sh          # vLLM Python uv env
-```
-
-# Install oneAPI Deep Learning Essentials
-```bash
-wget https://registrationcenter-download.intel.com/akdlm/IRC_NAS/56f7923a-adb8-43f3-8b02-2b60fcac8cab/intel-deep-learning-essentials-2025.3.3.16_offline.sh
-bash ./intel-deep-learning-essentials-2025.3.3.16_offline.sh -a --silent --eula accept
-```
-
-> After any `pip install .` of the plugin, re-create the symlink so edits to
-> `xetla_vllm_plugin.py` take effect without reinstalling:
-> ```bash
-> ln -sf "$PWD/xetla_vllm_plugin.py" .venv/lib/python3.12/site-packages/xetla_vllm_plugin.py
-> ```
-
-# Models
-
-| Model | Format | Notes |
+| Layer | Files | Role |
 | --- | --- | --- |
-| `Ternary-Bonsai-8B` | GGUF or `prism-ml/Bonsai-8B-unpacked` | text-only |
-| `prism-ml/Ternary-Bonsai-27B-unpacked` | HF safetensors | vision-language, **needs a pre-packed sidecar** (below) |
-| `prism-ml/Ternary-Bonsai-2-27B-gguf` | GGUF (PQ2_0 + mmproj) | Hadamard **rotated basis**; packed by `scripts/pack_bonsai2_gguf.py`, see [BONSAI2.md](BONSAI2.md) |
+| vLLM glue | [ternsycl_vllm_plugin.py](ternsycl_vllm_plugin.py) | quantization config, linear / lm_head / embedding methods, sidecar loader, Hadamard pre-transform, fused SwiGLU, tensor-parallel sharding, profiler |
+| Torch ops | [csrc/ternsycl_ops.cpp](csrc/ternsycl_ops.cpp) | shape and dtype checks, output and scratch allocation, `TORCH_LIBRARY(ternsycl)` |
+| Launchers + dispatch | [csrc/upcvt.sycl](csrc/upcvt.sycl), [csrc/int8_dpas.sycl](csrc/int8_dpas.sycl), [csrc/hadamard.sycl](csrc/hadamard.sycl) | pick a compiled tile per (M, K, N) and launch it on the current XPU stream |
+| Kernels | [ternsycl/](ternsycl) (submodule) | SIMT SYCL kernels for Xe2: DPAS, 2D block I/O, fused epilogues |
 
-## Bonsai 2 27B (rotated basis)
+### Ops
 
-Bonsai 2 stores its ternary matrices in a Hadamard-rotated basis and ships only
-as GGUF. [BONSAI2.md](BONSAI2.md) is the from-scratch, step-by-step guide
-(build, download, pack, run, expected numbers). Short version:
-
-```bash
-python scripts/pack_bonsai2_gguf.py --gguf <PQ2_0.gguf> --mmproj <mmproj-BF16.gguf> \
-    --ref-dir <dir with tokenizer.json/config.json> \
-    --out Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors --packed Ternary-Bonsai-2-27B-packed
-bash scripts/run_bonsai2_gpu.sh <slurm-jobid> B70 "Tell me about photosynthesis in 200 words"
-```
-
-The sign flip + blockwise Walsh-Hadamard transform runs as one fused SYCL kernel
-(`csrc/hadamard_fwht_kernel.sycl`) in front of every folded int2 GEMM; B70
-decode is 46 tok/s vs 47.9 for the un-rotated Bonsai 1 27B, and the greedy text
-is bit-identical on B70 and LNL.
-
-**Prefill.** For M>1 the fp16 upcvt kernel now runs with a real M tile
-(WGM 8/16/32 by M, SGM 8, one pass over the weights per row tile) instead of
-looping the M=1 GEMV tiers: B70 TTFT 966 -> 179 ms, LNL 6.6 s -> 1.0 s, decode
-unchanged, per-GEMM results bit-exact with the old path. `XETLA_INT2_PREFILL_CFG`
-(-1 = old GEMV tiers, 1..5 = alternative tiles) is a sweep hook;
-`tests/test_int2_prefill_mtile.py` sweeps and checks them.
-
-**Prefill DPAS option.** `XETLA_DISABLE_DPAS=0` switches prefill to the DPAS
-(XMX) int2 kernel, which quantises activations to int8 (B70 TTFT ~391 ms; it
-predates the M-tiled fp16 path above and is now slower than it). The output
-remains coherent and on-topic but is not bit-identical to the fp16-activation
-path (greedy argmax flips at some token). Default is off (`XETLA_DISABLE_DPAS=1`).
-
-**BITCOS.** `scripts/transcode_int2_to_bitcos.py` carries the `hadamard.*`
-tensors over, so the Bonsai 2 sidecar transcodes like Bonsai 1
-(`METHOD=bitcos BITCOS_SFX=.b70|.lnl` in `scripts/run_bonsai2_gpu.sh`). Zero
-density is 0.328 (`scripts/zero_density.py`), sidecar 6.19 GB vs 7.14 GB int2;
-B70 47.8 tok/s / TTFT 151 ms, LNL 8.31 tok/s / 969 ms, text identical on both.
-
-## Bonsai-27B: pack the int2 sidecar first
-
-The 27B never fits in its dense fp16 form (~54 GB). `scripts/pack_bonsai_hf.py`
-recovers the already-ternary weights losslessly into the packed layout the
-xetla kernels consume; the plugin then allocates the dense tensors on the
-`meta` device so they are never materialised.
-
-```bash
-python scripts/pack_bonsai_hf.py \
-    --model prism-ml/Ternary-Bonsai-27B-unpacked \
-    --out   Ternary-Bonsai-27B.xetla-int2_f16.safetensors
-```
-
-~7.1 GB out of a 51 GB checkpoint (306 modules incl. `lm_head` and
-`embed_tokens`), round-trip error 0. Point the plugin at it:
-
-```bash
-export XETLA_QUANT_METHOD=int2_f16
-export XETLA_PREQUANT_PATH=/path/to/Ternary-Bonsai-27B.xetla-int2_f16.safetensors
-```
-
-On a single B70 this gives 6.85 GiB of weights and ~48 tok/s decode.
-
-# Interactive demo (chat GUI, text + images)
-
-A FastAPI backend plus single-page UI that streams tokens and reports the
-observed decode throughput after every prompt. One command, whose only
-argument is the Slurm partition:
-
-```bash
-cd demo && ./launch_demo.sh zen5
-```
-
-Full instructions — prerequisites, sidecar, remote access, configuration,
-HTTP API and troubleshooting — are in [demo/README.md](demo/README.md).
-
-
-# Running latency benchmark
-```bash
-# activate uv env
-source .venv/bin/activate
-
-MODEL_NAME="Qwen/Qwen2.5-1.5B"
-# example bf16 command line
-vllm bench latency --model "$MODEL_NAME"  --batch-size 1 --num-iters 10 --num-iters-warmup 3 --gpu_memory_util=0.7 --input-len 32 --output-len 128 --max-model-len 2048
-
-# use fp8 quantized gemms
-vllm bench latency --model "$MODEL_NAME"  --batch-size 1 --num-iters 10 --num-iters-warmup 3 --gpu_memory_util=0.7 --input-len 32 --output-len 128 --max-model-len 2048 -q fp8
-
-# use xetla int2-bf16 gemms
-vllm bench latency --model "$MODEL_NAME"  --batch-size 1 --num-iters 10 --num-iters-warmup 3 --gpu_memory_util=0.7 --input-len 32 --output-len 128 --max-model-len 2048 -q xetla
-
-```
-
----
-
-# int2 × fp16 weight-only quantized GEMMs (`int2_f16` mode)
-
-In addition to the original `int2 × bf16` path, the plugin now supports an
-**int2 weights × fp16 activations** kernel with **per-128-K-group fp16 scales**
-(no zero-point, no scale-A). This is the variant used by the
-`Ternary-Bonsai-8B` ternary GGUF.
-
-The kernel itself lives in the xetla submodule on the
-[`feature_int2_woq_f16_act_gs128`](https://github.com/egeor/xetla/tree/feature_int2_woq_f16_act_gs128)
-branch (file: `int2_fp16_upcvt_dpas_fast_test/src/main.cpp` plus the headers
-under `include/experimental/{group,kernel}/gemm/impl/int2_fp16_upcvt_*`). To
-make it available to the build, check out that branch in the submodule:
-
-```bash
-git submodule update --init xetla
-( cd xetla && git fetch origin feature_int2_woq_f16_act_gs128 \
-            && git checkout feature_int2_woq_f16_act_gs128 )
-```
-
-Then build the plugin extension:
-
-```bash
-source /swtools/intel-gpu/<ver>/intel_gpu_vars.sh
-source /swtools/intel/<ver>/oneapi-vars.sh --force
-source .venv/bin/activate
-python setup.py build_ext --inplace
-```
-
-## What was added
-
-* `csrc/int2_fp16_upcvt_kernel.sycl` — SYCL host-side wrapper around the new
-  `int2_fp16_upcvt_gemm` kernel. Pre-instantiates a small set of
-  `(WGN, KS, LS, kUnaligned)` template variants and exposes one entry point.
-  Includes a **shape-keyed dispatch** for the GEMV shapes that arise during
-  Bonsai-8B decode, sourced from the autotuner's
-  `bonsai_8B_run1/best.csv`:
-
-  | (K, N)            | (WGN, KS, LS) | layer        |
-  | ----------------- | ------------- | ------------ |
-  | (4096,   6144)    | (32, 1, 4)    | qkv_proj     |
-  | (4096,  12288)    | (32, 1, 2)    | (fused)      |
-  | (4096,  24576)    | (32, 1, 4)    | gate_up_proj |
-  | (4096, 151680)    | (32, 1, 4)    | lm_head      |
-  | (12288,  4096)    | (32, 1, 8)    | down_proj    |
-
-  Other shapes fall back to the generic N-tier policy.
-
-* `csrc/int2_kernel_wrapper.cpp` — single TU that registers both
-  `xetla_int2::int2_bf16_fused_gemm_run` and the new
-  `xetla_int2::int2_fp16_upcvt_gemm_run` ops with `TORCH_LIBRARY`. Op
-  registration **must** live in a regular `.cpp` (the static ctor inside a
-  `.sycl` TU does not reliably run at `.so` load with oneAPI 2025.3).
-
-* `xetla_vllm_plugin.py`
-  * Adds `XETLA_QUANT_METHOD=int2_f16` mode (existing `int2_bf16` is
-    untouched). Selected by env var.
-  * `quantize_to_ternary_f16()` and `pack_ternary_to_int2()` helpers — pack
-    a dense fp16 tensor (with values in `{-s, 0, +s}` per group) into the
-    int2x16 layout the kernel expects, with per-128 fp16 scales.
-  * `XetlaLinearMethod` and `XetlaEmbeddingMethod` quantize-on-load paths
-    for `int2_f16`. lm_head/embedding is quantized **on CPU** to avoid
-    `UR_RESULT_ERROR_DEVICE_LOST` on large `[151680, 4096]` matrices.
-  * Custom op `xetla_vllm::xetla_int2_fp16_upcvt_gemm` that wraps the
-    Torch op, with proper meta-tensor fake registration so dynamic-shape
-    tracing (`torch.compile`) works.
-  * Optional debug print toggled by `XETLA_DEBUG=1` (silent by default).
-
-## End-to-end Bonsai-8B chat REPL
-
-`scripts/chat.sh` + `scripts/chat.py` give you an interactive REPL that runs
-the local `Ternary-Bonsai-8B-F16.gguf` through vLLM with the int2 × fp16
-kernels active end-to-end (linear projections **and** lm_head). On Xe2 with
-the tunings above we measure ~138 tok/s decode for a single-batch, M=1
-prompt.
-
-```bash
-# Default: stream tokens, 128 max output, level_zero device 0
-./scripts/chat.sh
-
-# Longer responses, no streaming
-./scripts/chat.sh --max-tokens 512 --no-stream
-
-# Override device selector
-ONEAPI_DEVICE_SELECTOR="opencl:1;level_zero:0" ./scripts/chat.sh
-```
-
-Environment variables consumed by `chat.sh`:
-
-| Var                        | Default                       | Purpose                                    |
-| -------------------------- | ----------------------------- | ------------------------------------------ |
-| `BONSAI_GGUF`              | `<repo>/Ternary-Bonsai-8B-F16.gguf` | Path to the GGUF                     |
-| `BONSAI_TOKENIZER`         | `Qwen/Qwen3-8B`               | HF tokenizer (GGUF tokenizer is unusable)  |
-| `XETLA_QUANT_METHOD`       | `int2_f16`                    | `int2_f16` or `int2_bf16`                  |
-| `VLLM_QUANTIZATION`        | `xetla`                       | Forwarded as `--quantization xetla`        |
-| `VLLM_XPU_ENABLE_XPU_GRAPH`| `1`                           | Enable XPU graph capture                   |
-| `ONEAPI_DEVICE_SELECTOR`   | `level_zero:0`                | SYCL device selector                       |
-| `CHAT_MAX_TOKENS`          | `128`                         | Default for `--max-tokens`                 |
-| `CHAT_MAX_MODEL_LEN`       | `2048`                        | Default for `--max-model-len`              |
-| `CHAT_NO_STREAM`           | `0`                           | Set to `1` to disable token streaming      |
-
-REPL commands: `/exit`, `/reset` (clear chat history), `/system <text>` (set
-system prompt). After each turn a `[stats]` line reports tokens / wallclock /
-tok/s.
-
-## vLLM version and patches
-
-The vendored `vllm/` is upstream **v0.30.0**, unpatched. The five-file
-`vllm.patch` that v0.21.0 needed is gone:
-
-| v0.21 patch | status on v0.30 |
-| --- | --- |
-| `arg_utils.py`: keep `--quantization xetla` for `.gguf` models | vLLM removed GGUF support; not applicable |
-| `weight_utils.py`: skip the HF quant-config lookup for xetla | `XetlaConfig.get_config_filenames()` is empty, so v0.30 already returns `XetlaConfig()` |
-| `platforms/xpu.py`: XPU graphs with TP=1 | upstream now only disables graphs when unsupported |
-| `parallel_state.py`: no CUDA-only assert in graph capture | upstream accepts `XpuCommunicator` |
-| `_xpu_ops.py`: GDN kernel on graph-padded batches | upstream GDN op takes `num_actual_tokens` (batched decode verified, 16 seqs) |
-
-Consequence: the GGUF-direct flow (`scripts/chat.sh`, `INT2_F16_DEMO.md`
-sections 3-5, `--model <file>.gguf --quantization xetla`) needs vLLM <= 0.21.
-Use a packed safetensors dir + sidecar instead (all Bonsai 2 / 27B flows).
-
-Plugin-side changes for v0.30: `XetlaLinearMethod` initialises
-`UnquantizedLinearMethod` state (`_gemm_impl`) for its dense fallbacks, and
-the runners pass `--max-num-seqs` (v0.30 refuses `max_num_seqs` larger than
-the Mamba state cache; default 256).
-
-Bonsai 2 27B, v0.21.0 -> v0.30.0, same node and settings for both:
-
-| | B70 (pcl-zen4) | Arc 140V (LNL) |
+| `torch.ops.ternsycl.` | Computes | Used for |
 | --- | --- | --- |
-| int2 decode, 256 tok | 45.7 -> 46.1 tok/s | 7.78 -> 8.16 tok/s |
-| int2 TTFT | 176 -> 180 ms | 1001 -> 991 ms |
-| BITCOS decode | 47.3 -> 48.6 tok/s | 8.19 -> 9.33 tok/s |
-| batched 16x256 (`tests/batched_generate.py --ignore-eos --warmup`) | 241.7 -> 242.9 tok/s | 31.5 -> 31.3 tok/s |
-| GSM8K (`scripts/eval_bonsai2_lm_eval.sh`) | 98.0% -> 98.0% (300) | 95.3% -> 96.9% (64) |
+| `int2_fp16_upcvt_gemm_run(A, B, S, C?)` | `C = A · dequant(B, S)`, fp16 | every ternary linear layer and the lm_head |
+| `int2_fp16_upcvt_gemm_postop_run(A, B, S, other, postop)` | same, epilogue `silu(acc)·other` (1) or `acc + other` (2) | SwiGLU folded into the gate projection |
+| `int2_bf16_upcvt_gemm_run(A, B, S, C?)` | bf16 variant | natively bf16 checkpoints |
+| `int2_fp16_dpas_gemm_run(A, B, S, C?)` | A quantized to int8 per (row, 128-group), s8 × s2 DPAS | prefill with `TERNSYCL_DISABLE_DPAS=0` |
+| `hadamard_fwht_run(x, signs?, 1024, inverse)` | `H(s·x)/32` per 1024 block, or `s·H(x)/32` | rotated-basis checkpoints (Bonsai 2) |
 
-LNL needs `UTIL=0.35` plus a pinned KV cache (`KVBYTES=$((2<<30))` for the
-runner, `--kv-cache-memory-bytes` for `batched_generate.py`, `KVBYTES` for the
-eval), and a fresh allocation per engine start (a finished engine leaves
-~13 GiB of unified memory held until the job ends, on both versions). Greedy
-text is coherent but not byte-identical across the two versions (new
-torch/inductor and GDN kernel); it diverges after ~50 tokens.
+The Python custom ops `torch.ops.ternsycl.{int2_fp16_upcvt_gemm,
+int2_fp16_upcvt_postop_gemm, hadamard_fwht}` wrap them with fake (meta)
+implementations, so the model graph compiles with `torch.compile`.
 
-## torch.compile cache
+### Data layout
 
-All entry points set `VLLM_DISABLE_COMPILE_CACHE=1`. vLLM's AOT compile
-artifacts are not keyed on every engine setting these scripts vary (context
-length, multimodal on/off, eager), and loading a mismatched one either raises
-`'NoneType' object has no attribute 'size'` inside the compiled graph or
-silently produces degenerate output. Recompiling costs ~60 s per start; set
-`VLLM_DISABLE_COMPILE_CACHE=0` (or `DEMO_COMPILE_CACHE=1` for the demo) to opt
-back in.
+| Tensor | Type | Layout |
+| --- | --- | --- |
+| A (activations) | fp16 (bf16) | `[M, K]` row-major |
+| B (`qweight`) | int32 | `[K/16, N]`: 2-bit codes `{0, 1, 3} = {0, +1, -1}` of K rows `16kp..16kp+15` of column n |
+| S (`scale`) | fp16 (bf16) | `[K/128, N]` |
+| C | fp16 (bf16) | `[M, N]` |
 
+`K % 128 == 0` and `N % 16 == 0`; any M. The packed embedding table is row-major
+(`[vocab, hidden/16]` words, `[vocab, hidden/128]` scales) and is unpacked per
+looked-up token.
 
-## Numerical-correctness smoke test
+### Kernel dispatch
+
+Tiles are compile-time template instances; [csrc/upcvt.sycl](csrc/upcvt.sycl)
+selects one per call. The table was tuned on the B70 with the TernSYCL drivers
+(≥ 2 GiB rotating weights, device-event times):
+
+| M | Kernel | Tile |
+| --- | --- | --- |
+| 1 (decode) | GEMV, 1 row | per shape (NSG, LS, U), e.g. gate/up 5120×17408: 16 columns × 8-way K split |
+| 2 – 8 | GEMV, SGM = 2/4/8 rows | per shape; qkv shapes switch to a 16-row M tile at M > 4 |
+| 9 – 16 | M-tiled GEMM | 16 × 16 or 16 × 32 sub-group tile |
+| 17 – 63 | M-tiled GEMM | 32 × 16 or 32 × 32 |
+| ≥ 64 (prefill) | M-tiled GEMM, 256 GRF | 64 × 32, work-group shape per shape |
+
+The int8 DPAS path quantizes A with a pre-kernel, then uses a GEMV (M ≤ 8) or
+an 8 × 128 / 16 × 64 M tile. The Hadamard kernel is one work-group of 128
+items per 1024-wide block.
+
+### Weight flow
+
+1. `create_weights`: for layers found in the sidecar, the dense parameter is a
+   `meta` placeholder, so the fp16 model (~54 GB for 27B) is never allocated.
+2. `process_weights_after_loading`: loads `qweight` / `scale` from the sidecar
+   (sliced per tensor-parallel rank), attaches the Hadamard signs of folded
+   layers, and splits `gate_up_proj` into gate and up for the fused SwiGLU.
+   Layers not in the sidecar stay dense. Without a sidecar, ternary fp16
+   weights are packed losslessly on load.
+3. `apply`: optional Hadamard pre-transform, then the int2 GEMM. The lm_head
+   and the input embedding are quantized as well (`TERNSYCL_QUANTIZE_LM_HEADS`).
+
+The sidecar is a safetensors file with `<prefix>.qweight` and `<prefix>.scale`
+per module, `hadamard.signs.<K>` tensors, and metadata keys `ternsycl_method`
+(`int2_f16`), `ternsycl_format_version` and `ternsycl_meta` (JSON, including
+the `prism.hadamard` contract).
+
+## Build
+
+Requirements: Intel GPU driver with Level Zero, oneAPI 2026.0 (`icpx`; it must
+match the SYCL runtime that torch 2.13 xpu ships), Python ≥ 3.10, git, uv.
+
+From scratch (clones this branch with the `ternsycl` submodule, creates
+`.venv`, builds vLLM v0.30.0 for XPU and the plugin):
 
 ```bash
-python tests/test_gemm_int2_fp16.py
+unset LD_LIBRARY_PATH
+source /swtools/intel-gpu/latest/intel_gpu_vars.sh
+source /swtools/intel/2026.0/oneapi-vars.sh --force
+PLUGIN_BRANCH=feature/vllm-v0.30-ternsycl ./utils/setup_fresh.sh /path/to/empty/dir
 ```
 
-Generates a random ternary weight, runs the int2 × fp16 GEMM, compares to a
-reference fp16 matmul, and verifies the round-trip of `quantize_to_ternary_f16`
-+ `pack_ternary_to_int2`.
+Rebuilding the extension in an existing checkout:
+
+```bash
+git submodule update --init --recursive ternsycl
+source .venv/bin/activate
+python setup.py build_ext --inplace     # -> ternsycl_pt_ext.*.so
+```
+
+The kernels are compiled ahead of time for `TERNSYCL_AOT_DEVICES` (default
+`bmg-g31,lnl-m`; e.g. `bmg-g21` for other BMG parts), one device image per
+kernel. `TERNSYCL_ROOT` builds against another TernSYCL checkout. Do not
+switch to JIT compilation: some bf16 kernels then run slower and change speed
+from process to process. The link warns "Undefined function
+intel_sub_group_..." for each IGC builtin; this is expected.
+
+## Run
+
+```bash
+export TERNSYCL_PREQUANT_PATH=/path/to/<model>.ternsycl-int2_f16.safetensors
+export VLLM_XPU_ENABLE_XPU_GRAPH=1 ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+python scripts/bench_model.py --model /path/to/<model>-packed --quantization ternsycl \
+    --dtype bfloat16 --max-model-len 512 --cudagraph-sizes 1,2,4,8 --max-num-batched-tokens 512 \
+    --deterministic-compile --max-tokens 256 --temperature 0.0 --full \
+    --prompt "Tell me about photosynthesis in 200 words"
+```
+
+`scripts/run_bonsai2_gpu.sh` wraps this for a SLURM allocation (page-cache
+eviction, stale-engine cleanup, memory-utilization choice); see
+[BONSAI2.md](BONSAI2.md). Sidecars are produced by `scripts/pack_bonsai2_gguf.py`
+(Bonsai 2 GGUF), `scripts/pack_bonsai_hf.py` (Bonsai 1 unpacked HF checkpoints)
+and `scripts/deploy_catq.sh` (CAT-Q).
+
+### Environment
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `TERNSYCL_PREQUANT_PATH` | unset | sidecar to load the packed weights from |
+| `TERNSYCL_QUANT_METHOD` | from the sidecar, else `int2_f16` | `int2_f16`, or `bf16` (no quantization) |
+| `TERNSYCL_PREQUANT_DUMP_PATH` | unset | write the weights packed on load to this sidecar |
+| `TERNSYCL_QUANTIZE_LM_HEADS` | `1` | also pack the lm_head and the input embedding |
+| `TERNSYCL_FUSE_SWIGLU` | `1` | split gate_up and fold `silu(gate)·up` into the gate GEMM epilogue |
+| `TERNSYCL_DISABLE_DPAS` | `1` | `0` runs prefill (M > 1) on the int8 DPAS kernel; ~1.3% relative error per GEMM, which some models do not tolerate |
+| `TERNSYCL_HADAMARD_IMPL` | `fused` | `matmul`: reference implementation (signs × dense H_1024 matmul) |
+| `TERNSYCL_HADAMARD_DTYPE` | `fp32` | precision of the matmul reference |
+| `TERNSYCL_PROFILE` | `0` | `1`: per-op and per-shape GEMM time and bandwidth table at exit |
+| `TERNSYCL_DEBUG`, `TERNSYCL_TIMINGS` | `0` | load-time logging, per-call host timings |
+| `TERNSYCL_TRITON_DISABLE_STRIDE_VERSIONING` | `0` | work around a triton-xpu 3.7 crash on hybrid models |
+
+All entry points set `VLLM_DISABLE_COMPILE_CACHE=1`: vLLM's compile cache is
+not keyed on every engine setting the scripts vary (context length,
+multimodal on/off), and a mismatched artifact fails or produces degenerate
+output. Recompiling costs about 60 s per start.
+
+## Validate
+
+```bash
+python tests/test_ternsycl_ops.py    # GPU: every op vs an fp32 reference, 27B shapes, M = 1..100
+python tests/test_hadamard_cpu.py    # CPU: Hadamard helper math
+python tests/test_hadamard_xpu.py    # GPU: fused Hadamard vs the matmul reference
+LIMIT=1319 bash scripts/eval_bonsai2_lm_eval.sh <slurm-jobid> gsm8k    # GSM8K, see BONSAI2.md
+```
+
+## Results (Bonsai 2 27B, Arc Pro B70)
+
+Greedy, photosynthesis prompt, 256 output tokens, same node settings for both
+backends (previous XeTLA-based plugin on `feature/vllm-v0.30` vs this branch):
+
+| Backend | TTFT | Decode |
+| --- | --- | --- |
+| XeTLA kernels | 183 ms | 46.30 tok/s |
+| TernSYCL kernels | **111 ms** | **46.42 tok/s** |
+
+The text is coherent and matches the XeTLA run for the first 90 words; the
+kernels sum in a different order, so the greedy trajectories part after that.
+
+GSM8K, all 1319 test problems (8-shot chain of thought, thinking mode,
+`scripts/eval_bonsai2_lm_eval.sh`):
+
+| Backend | exact match | wall time |
+| --- | --- | --- |
+| XeTLA kernels | 96.7% (1276/1319) | 90 min |
+| TernSYCL kernels | **96.9%** (1278/1319, ±0.5) | **41 min** |
+
+## vLLM version
+
+`vllm/` is upstream **v0.30.0**, unpatched (`utils/setup_fresh.sh` still
+applies a `vllm.patch` at the plugin root if one exists). vLLM 0.30 no longer
+loads GGUF files directly, so every flow uses a packed safetensors model
+directory plus a sidecar. The runners pass `--max-num-seqs` (vLLM 0.30 refuses
+`max_num_seqs` larger than the Mamba state cache).
+
+## Interactive demo
+
+A FastAPI backend and single-page chat UI that streams tokens and reports the
+decode rate: `cd demo && ./launch_demo.sh <partition>`. See
+[demo/README.md](demo/README.md).
+
+## License
+
+The TernSYCL kernels are BSD 3-Clause
+([ternsycl/LICENSE.md](ternsycl/LICENSE.md)).

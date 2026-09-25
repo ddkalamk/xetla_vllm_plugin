@@ -9,7 +9,6 @@ matter at both decode (M=1) and prefill (M>1).
 import argparse
 
 import torch
-import xetla_pt_ext  # noqa: F401
 import ternsycl_pt_ext  # noqa: F401
 
 DEV = "xpu"

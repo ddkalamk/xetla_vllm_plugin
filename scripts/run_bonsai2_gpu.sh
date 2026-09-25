@@ -7,7 +7,7 @@
 # Same machinery as run_bonsai_gpu.sh (see the notes there on graph sizes,
 # page cache and stale EngineCores), for the one model this covers:
 #
-#   sidecar : $MODELS/Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors
+#   sidecar : $MODELS/Ternary-Bonsai-2-27B.ternsycl-int2_f16.safetensors
 #   packed  : $MODELS/Ternary-Bonsai-2-27B-packed
 #
 # both produced by scripts/pack_bonsai2_gguf.py from the PQ2_0 GGUF. The
@@ -15,8 +15,8 @@
 # flip + blockwise WHT to activations before every folded GEMM.
 #
 # Env knobs:
-#   METHOD=int2|bitcos, BITCOS_SFX=.b70|.lnl  which sidecar (see below)
-#   XETLA_HADAMARD_DTYPE=fp16|fp32  transform precision (default fp32)
+#   SIDECAR, PACKED  override the paths above
+#   TERNSYCL_HADAMARD_DTYPE=fp16|fp32  transform precision (default fp32)
 #   UTIL=0.35   pin gpu-memory-utilization (LNL BKM: unified memory, the
 #               sampled value over-reserves; 0.35 is what the 27B runs used)
 #   KVBYTES=N   pin the KV cache size (bytes). On LNL a fresh torch.compile
@@ -33,18 +33,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PLUG=${PLUG:-$(cd -- "$HERE/.." && pwd)}
 MODELS=${MODELS:-$PLUG/../models}
 PACKED=${PACKED:-$MODELS/Ternary-Bonsai-2-27B-packed}
-# METHOD=int2 (default) | bitcos. BITCOS sidecars bake in a per-device slice
-# count, so BITCOS_SFX picks the file: .b70 or .lnl (transcode with
-# XETLA_BITCOS_SLICE_TARGET=b70|lnl).
-METHOD=${METHOD:-int2}
-BITCOS_SFX=${BITCOS_SFX:-.b70}
-if [[ "$METHOD" == "bitcos" ]]; then
-  SIDECAR=${SIDECAR:-$MODELS/Ternary-Bonsai-2-27B.xetla-bitcos_f16${BITCOS_SFX}.safetensors}
-  QMETHOD=bitcos_f16
-else
-  SIDECAR=${SIDECAR:-$MODELS/Ternary-Bonsai-2-27B.xetla-int2_f16.safetensors}
-  QMETHOD=int2_f16
-fi
+SIDECAR=${SIDECAR:-$MODELS/Ternary-Bonsai-2-27B.ternsycl-int2_f16.safetensors}
 
 JOB=${1:?usage: $0 <slurm-jobid> <TAG> [prompt ...]}
 TAG=${2:?usage: $0 <slurm-jobid> <TAG> [prompt ...]}
@@ -72,15 +61,15 @@ source /swtools/intel/2026.0/oneapi-vars.sh >/dev/null 2>&1
 source $PLUG/.venv/bin/activate
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 export VLLM_XPU_ENABLE_XPU_GRAPH=${VLLM_XPU_ENABLE_XPU_GRAPH:-1}
-export XETLA_PREQUANT_PATH=$SIDECAR XETLA_QUANT_METHOD=$QMETHOD
-export XETLA_HADAMARD_DTYPE=${XETLA_HADAMARD_DTYPE:-fp32}
+export TERNSYCL_PREQUANT_PATH=$SIDECAR TERNSYCL_QUANT_METHOD=int2_f16
+export TERNSYCL_HADAMARD_DTYPE=${TERNSYCL_HADAMARD_DTYPE:-fp32}
 ${RUN_ENV:-}
 "
 
 LOGD=$PLUG/bonsai_logs
 mkdir -p "$LOGD"
-LOG="$LOGD/gpu_${TAG}_B2-27B_${METHOD}.log"
-echo ">>> $TAG Bonsai-2-27B $METHOD (hadamard) -> $LOG"
+LOG="$LOGD/gpu_${TAG}_B2-27B_int2.log"
+echo ">>> $TAG Bonsai-2-27B int2 (hadamard) -> $LOG"
 
 srun --jobid="$JOB" --overlap bash -lc "$ENV_SETUP
   pids=\$(ps -u \$USER -o pid=,comm= | awk '\$2 ~ /^(vllm|VLLM::EngineCor)\$/ {print \$1}')
@@ -91,7 +80,7 @@ srun --jobid="$JOB" --overlap bash -lc "$ENV_SETUP
   [[ -n \"\$U\" ]] || U=\$(python -c 'import torch;f,t=torch.xpu.mem_get_info();print(f\"{max(0.20,min(0.78,(f-4*2**30)/t)):.2f}\")')
   echo \"[util] \$U\"
   B=/tmp/bonsai2_bench.\$\$.log
-  python -u $HERE/bench_model.py --model $PACKED --quantization xetla --dtype bfloat16 \
+  python -u $HERE/bench_model.py --model $PACKED --quantization ternsycl --dtype bfloat16 \
     --max-model-len $MAXLEN --gpu-memory-utilization \$U \
     --cudagraph-sizes $CGSIZES --max-num-batched-tokens $MAXBATCHTOK --max-num-seqs $MAXSEQS \
     --max-tokens $MAXTOK --temperature 0.0 --full $EXTRA $PROMPT_ARGS > \$B 2>&1 &
@@ -113,7 +102,7 @@ srun --jobid="$JOB" --overlap bash -lc "$ENV_SETUP
   exit \$RC" > "$LOG" 2>&1
 RC=$?
 
-grep -aE 'sidecar loaded|inverse-hadamard|TTFT|decode +:|repetition|Error|error' "$LOG" | grep -v "^\[xetla\] sidecar hit" | head -40
+grep -aE 'sidecar loaded|inverse-hadamard|TTFT|decode +:|repetition|Error|error' "$LOG" | grep -v "^\[ternsycl\] sidecar hit" | head -40
 echo "--- output ---"
 awk '/^prompt +:/{p=1} p' "$LOG" | head -60
 echo "rc=$RC log=$LOG"
