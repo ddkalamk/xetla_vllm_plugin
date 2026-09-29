@@ -8,6 +8,7 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 
 sycl::event ternsycl_upcvt_run(sycl::queue &q, bool bf16, const void *A, const int32_t *B, const void *S, void *C,
@@ -15,12 +16,37 @@ sycl::event ternsycl_upcvt_run(sycl::queue &q, bool bf16, const void *A, const i
 sycl::event ternsycl_int8_run(sycl::queue &q, bool bf16, const void *A, const int32_t *B, const void *SB, void *C,
         void *SA, int8_t *Aq, int M, int N, int K);
 int ternsycl_int8_ldsa(int M);
+sycl::event ternsycl_int8_prefill_run(sycl::queue &q, bool bf16, const void *A, const int32_t *B, const void *SB,
+        void *C, const void *other, int postop, void *SA, int M, int N, int K);
 sycl::event ternsycl_hadamard_run(sycl::queue &q, bool bf16, const void *x, const int8_t *signs, void *y,
         int64_t rows, int K, bool inverse);
 
 namespace {
 
 sycl::queue &queue_of(const torch::Tensor &t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+// TERNSYCL_INT8_PREFILL=1 (as OpenVINO's OV_TERNOCL_INT2_INT8_PREFILL): M > 8 runs the
+// int2 x int8 DPAS GEMM, activations quantized to int8 per (row, 128-group).
+bool int8_prefill(int64_t m) {
+    static const bool on = [] {
+        const char *e = std::getenv("TERNSYCL_INT8_PREFILL");
+        return e && std::atoi(e) > 0;
+    }();
+    return on && m > 8;
+}
+
+void gemm(const torch::Tensor &A, const torch::Tensor &B, const torch::Tensor &S, torch::Tensor &C,
+        const void *other, int postop, bool bf16) {
+    const int64_t m = A.size(0), n = B.size(1), k = A.size(1);
+    if (int8_prefill(m)) {
+        auto SA = A.new_empty({k / 128 * ternsycl_int8_ldsa((int)m)});
+        ternsycl_int8_prefill_run(queue_of(A), bf16, A.data_ptr(), B.data_ptr<int32_t>(), S.data_ptr(),
+                C.data_ptr(), other, postop, SA.data_ptr(), m, n, k);
+    } else {
+        ternsycl_upcvt_run(queue_of(A), bf16, A.data_ptr(), B.data_ptr<int32_t>(), S.data_ptr(), C.data_ptr(), other,
+                postop, m, n, k);
+    }
+}
 
 // A [M, K] DT, B [K/16, N] int32, S [K/128, N] DT; N % 16, K % 128.
 void check_gemm(const torch::Tensor &A, const torch::Tensor &B, const torch::Tensor &S, at::ScalarType dt) {
@@ -50,8 +76,7 @@ torch::Tensor upcvt(torch::Tensor A, torch::Tensor B, torch::Tensor S, std::opti
         at::ScalarType dt) {
     check_gemm(A, B, S, dt);
     auto C = out_like(A, B.size(1), C_out);
-    ternsycl_upcvt_run(queue_of(A), dt == torch::kBFloat16, A.data_ptr(), B.data_ptr<int32_t>(), S.data_ptr(),
-            C.data_ptr(), nullptr, 0, A.size(0), B.size(1), A.size(1));
+    gemm(A, B, S, C, nullptr, 0, dt == torch::kBFloat16);
     return C;
 }
 
@@ -79,8 +104,7 @@ torch::Tensor int2_fp16_upcvt_gemm_postop_run(torch::Tensor A, torch::Tensor B, 
             "other must be a contiguous fp16 tensor on A's device");
     TORCH_CHECK(other.numel() == A.size(0) * B.size(1), "other must have M*N elements");
     auto C = A.new_empty({A.size(0), B.size(1)});
-    ternsycl_upcvt_run(queue_of(A), false, A.data_ptr(), B.data_ptr<int32_t>(), scale_B.data_ptr(), C.data_ptr(),
-            other.data_ptr(), (int)postop, A.size(0), B.size(1), A.size(1));
+    gemm(A, B, scale_B, C, other.data_ptr(), (int)postop, false);
     return C;
 }
 

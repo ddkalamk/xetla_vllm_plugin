@@ -6,6 +6,8 @@
 #include "int2_int8_dpas.hpp"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 namespace {
 
@@ -51,9 +53,83 @@ sycl::event run(sycl::queue &q, const Args &a) {
     return mt<BF, 16, 64, 8, 2>(q, a);
 }
 
+// int8 prefill as in OpenVINO's OV_TERNOCL_INT2_INT8_PREFILL: QMODE 1 (A quantized
+// to int8 per (row, 128-group) in registers, only the scales come from QuantA),
+// epilogue P fixed at compile time.
+template <bool BF, int MT_M, int MT_N, int WG_M, int WG_N, int P>
+sycl::event mt_q1(sycl::queue &q, const Args &a) {
+    const size_t tm = MT_M * WG_M, tn = MT_N * WG_N;
+    const sycl::range<2> local(1, 16 * WG_M * WG_N);
+    const sycl::range<2> global((a.M + tm - 1) / tm, (a.N + tn - 1) / tn * local[1]);
+    return q.parallel_for(sycl::nd_range<2>(global, local),
+            int8dpas::GemmMT<BF, 1, MT_M, MT_N, WG_M, WG_N, P, false>{
+                    a.A, nullptr, a.SA, a.B, a.SB, a.C, a.epi, a.M, a.N, a.K});
+}
+
+struct Tile {
+    int mt_m, mt_n, wg_m, wg_n;
+};
+
+// OpenVINO's int8_tile(): Arc Pro B70 sweep of the Bonsai 27B shapes per M band
+// (<= 16, <= 32, < 64, >= 64). TERNSYCL_INT8_MT="mt_m,mt_n,wg_m,wg_n" overrides it.
+Tile int8_tile(int K, int N, int M) {
+    static const char *env = std::getenv("TERNSYCL_INT8_MT");
+    Tile t{};
+    if (env && std::sscanf(env, "%d,%d,%d,%d", &t.mt_m, &t.mt_n, &t.wg_m, &t.wg_n) == 4) return t;
+    const int band = M <= 16 ? 0 : (M <= 32 ? 1 : (M < 64 ? 2 : 3));
+    struct Entry {
+        int k, n;
+        Tile t[4];
+    };
+    static const Entry table[] = {
+            {5120, 34816, {{8, 128, 1, 4}, {8, 64, 4, 1}, {8, 128, 8, 2}, {8, 128, 8, 2}}},    // gate_up
+            {17408, 5120, {{8, 32, 2, 4}, {8, 32, 2, 4}, {8, 64, 8, 2}, {8, 128, 8, 2}}},      // down
+            {5120, 16384, {{8, 32, 2, 4}, {8, 64, 2, 2}, {8, 128, 2, 4}, {8, 128, 16, 1}}},    // in_proj_qkvz
+            {6144, 5120, {{8, 32, 2, 4}, {8, 32, 2, 4}, {8, 64, 8, 2}, {8, 128, 8, 2}}},       // out_proj
+            {5120, 14336, {{8, 32, 2, 4}, {8, 64, 2, 2}, {8, 128, 8, 2}, {8, 128, 4, 2}}},     // qkv
+            {5120, 248320, {{8, 128, 2, 4}, {8, 128, 4, 4}, {8, 128, 8, 2}, {8, 128, 16, 1}}},  // lm_head
+    };
+    for (const auto &e : table)
+        if (e.k == K && e.n == N) return e.t[band];
+    static const Tile fallback[4] = {{8, 32, 2, 4}, {8, 64, 2, 2}, {8, 128, 8, 2}, {8, 128, 8, 2}};
+    return fallback[band];
+}
+
+template <bool BF, int P>
+sycl::event prefill(sycl::queue &q, const Args &a) {
+    q.parallel_for(sycl::nd_range<2>({(size_t)a.M, (size_t)(a.K / 128) * 16}, {1, 16}),
+            int8dpas::QuantA<BF, false>{a.A, const_cast<unsigned short *>(a.SA), nullptr, a.M, a.K});
+    const Tile t = int8_tile(a.K, a.N, a.M);
+#define TERNSYCL_INT8_TILE(A, B, C, D) \
+    if (t.mt_m == A && t.mt_n == B && t.wg_m == C && t.wg_n == D) return mt_q1<BF, A, B, C, D, P>(q, a);
+    TERNSYCL_INT8_TILE(8, 32, 2, 4)
+    TERNSYCL_INT8_TILE(8, 64, 2, 2)
+    TERNSYCL_INT8_TILE(8, 64, 4, 1)
+    TERNSYCL_INT8_TILE(8, 64, 8, 2)
+    TERNSYCL_INT8_TILE(8, 128, 1, 4)
+    TERNSYCL_INT8_TILE(8, 128, 2, 4)
+    TERNSYCL_INT8_TILE(8, 128, 4, 2)
+    TERNSYCL_INT8_TILE(8, 128, 4, 4)
+    TERNSYCL_INT8_TILE(8, 128, 16, 1)
+#undef TERNSYCL_INT8_TILE
+    return mt_q1<BF, 8, 128, 8, 2, P>(q, a);
+}
+
 }  // namespace
 
 int ternsycl_int8_ldsa(int M) { return int8dpas::ldsa(M); }
+
+// int8 prefill: C = epi(A x dequant(B)); SA: DT scratch [K/128, ldsa(M)].
+// postop 0 none (fp16 or bf16), 1 silu(acc) * other, 2 acc + other (fp16).
+sycl::event ternsycl_int8_prefill_run(sycl::queue &q, bool bf16, const void *A, const int32_t *B, const void *SB,
+        void *C, const void *other, int postop, void *SA, int M, int N, int K) {
+    const Args a{(const unsigned short *)A, nullptr, (const unsigned short *)SA, (const unsigned *)B,
+            (const unsigned short *)SB, C, Epi{(const unsigned short *)other, nullptr, postop, 0}, M, N, K};
+    if (bf16) return prefill<true, 0>(q, a);
+    if (postop == 1) return prefill<false, 1>(q, a);
+    if (postop == 2) return prefill<false, 2>(q, a);
+    return prefill<false, 0>(q, a);
+}
 
 // SA: DT scratch [K/128, ldsa(M)], Aq: int8 scratch [M, K].
 sycl::event ternsycl_int8_run(sycl::queue &q, bool bf16, const void *A, const int32_t *B, const void *SB, void *C,

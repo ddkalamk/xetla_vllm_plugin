@@ -2,7 +2,9 @@
 Bonsai 2 27B GEMM shapes and prompt-length M.
 
     python tests/test_ternsycl_ops.py
+    TERNSYCL_INT8_PREFILL=1 python tests/test_ternsycl_ops.py   # M > 8 on the int8 prefill GEMM
 """
+import os
 import sys
 
 import torch
@@ -16,6 +18,7 @@ ts = torch.ops.ternsycl
 SHAPES = [(5120, 34816), (5120, 17408), (17408, 5120), (5120, 16384), (6144, 5120), (5120, 14336),
           (5120, 248320), (256, 48), (5120, 96)]
 MS = [1, 2, 3, 5, 8, 13, 16, 24, 31, 33, 64, 100]
+INT8_PREFILL = int(os.environ.get("TERNSYCL_INT8_PREFILL", "0")) > 0
 
 
 def pack(k, n):
@@ -48,8 +51,10 @@ for k, n in SHAPES:
     for dt in (torch.float16, torch.bfloat16):
         s = (torch.rand(k // 128, n, device=dev) * 0.02 + 0.005).to(dt)
         wf = vals * s.float().repeat_interleave(128, 0)
-        tol = 2e-3 if dt == torch.float16 else 1e-2
+        tol0 = 2e-3 if dt == torch.float16 else 1e-2
         for m in MS if n != 248320 else (1, 8, 33, 100):
+            # int8 activations: ~1.3% relative error of their own
+            tol = 3e-2 if INT8_PREFILL and m > 8 else tol0
             a = torch.randn(m, k, device=dev).to(dt)
             ref = a.float() @ wf
             tag = f"K={k} N={n} M={m} {str(dt)[6:]}"

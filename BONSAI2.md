@@ -263,6 +263,7 @@ once per row tile. The tile table is in `csrc/upcvt.sycl`.
 | `TERNSYCL_HADAMARD_DTYPE` | `fp32` | precision of the matmul reference only |
 | `TERNSYCL_FUSE_SWIGLU` | `1` | SwiGLU folded into the gate GEMM epilogue |
 | `TERNSYCL_DISABLE_DPAS` | `1` | `0` runs prefill on the int2 x int8 DPAS kernel (activations quantized to int8 per row and 128-group); the output stays coherent but is not identical to the fp16 path |
+| `TERNSYCL_INT8_PREFILL` | `0` | `1`: M > 8 (prompts, decode batches of 9+) on the int2 x int8 DPAS GEMM with in-register int8 quantization of A (QMODE 1), epilogues kept, OpenVINO's per-shape tile table (`OV_TERNOCL_INT2_INT8_PREFILL`); `TERNSYCL_INT8_MT="mt_m,mt_n,wg_m,wg_n"` overrides the tile. M <= 8 is unchanged |
 | `TERNSYCL_PROFILE` | `0` | `1` prints a per-shape GEMM time and bandwidth table at exit |
 | `--deterministic-compile` (`DETERMINISTIC=1` in the runner) | on | disables inductor's benchmark-selected combo kernels, so the greedy text does not depend on which fusions a fresh compile picked |
 | `KVBYTES`, `UTIL`, `MAXLEN`, `MAXTOK`, `CGSIZES`, `MAXSEQS`, `RUN_ENV` | | runner knobs, see the header of `scripts/run_bonsai2_gpu.sh` |
@@ -301,6 +302,7 @@ Bonsai 2 27B, B70, all 1319 GSM8K test problems:
 | Kernels | exact match (strict) | flexible extract | wall time |
 | --- | --- | --- | --- |
 | TernSYCL `feature_cleanup_sycl` (this branch) | **96.66%** (1275/1319, ±0.49) | 96.66% | 44 min |
+| same, `TERNSYCL_INT8_PREFILL=1` | 96.82% (1277/1319, ±0.48) | 96.74% | 29 min |
 | TernSYCL 35fb3e8 (IGC builtins) | 96.89% (1278/1319, ±0.48) | 96.82% | 41 min |
 | previous XeTLA kernels | 96.7% (1276/1319) | | 90 min |
 

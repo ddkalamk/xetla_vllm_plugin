@@ -180,7 +180,7 @@ Arc 140V with `UTIL=0.35 KVBYTES=2GiB`, two alternating runs each):
 | Backend | B70 TTFT | B70 decode | Arc 140V TTFT | Arc 140V decode |
 | --- | --- | --- | --- | --- |
 | XeTLA kernels | 183 ms | 46.30 tok/s | 992-993 ms | 8.17 tok/s |
-| TernSYCL kernels | **107-111 ms** | **46.42-47.56 tok/s** | **656-657 ms** | **8.20-8.33 tok/s** |
+| TernSYCL kernels | **107-108 ms** | **47.46-47.56 tok/s** | **665-666 ms** | **8.30-8.36 tok/s** |
 
 The TernSYCL text is identical on the two GPUs. It matches the XeTLA run for
 the first 90 words; the kernels sum in a different order, so the greedy
@@ -192,7 +192,24 @@ GSM8K, all 1319 test problems (8-shot chain of thought, thinking mode,
 | Backend | exact match | wall time |
 | --- | --- | --- |
 | XeTLA kernels | 96.7% (1276/1319) | 90 min |
-| TernSYCL kernels | **96.9%** (1278/1319, ±0.5) | **41 min** |
+| TernSYCL kernels | **96.7%** (1275/1319, ±0.5) | 44 min |
+| TernSYCL, `TERNSYCL_INT8_PREFILL=1` | **96.8%** (1277/1319, ±0.5) | **29 min** |
+
+### int8 prefill (`TERNSYCL_INT8_PREFILL=1`)
+
+As OpenVINO's `OV_TERNOCL_INT2_INT8_PREFILL`: M > 8 runs the int2 x int8 DPAS
+GEMM, activations quantized to int8 per (row, 128-group) in registers, same
+weights, fused epilogues kept; decode (M = 1) is unchanged. B70, TTFT of one
+prompt (warm, prefill chunks of 8192 tokens), decode 47.2-47.4 tok/s either way:
+
+| Input tokens | 512 | 1k | 2k | 4k | 8k | 16k | 32k |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| default | 508 ms | 779 ms | 1.41 s | 2.64 s | 5.08 s | 10.44 s | 22.33 s |
+| `TERNSYCL_INT8_PREFILL=1` | 257 ms | 464 ms | 0.88 s | 1.72 s | 3.54 s | 7.37 s | 16.20 s |
+| speedup | x1.98 | x1.68 | x1.59 | x1.53 | x1.44 | x1.42 | x1.38 |
+
+The GEMM time saved grows linearly with the prompt (0.25 s at 512, 6.1 s at
+32k); attention grows faster, so the relative gain falls with length.
 
 ## vLLM version
 
