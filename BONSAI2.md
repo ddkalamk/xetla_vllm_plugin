@@ -22,8 +22,14 @@ Result (greedy, photosynthesis prompt, 256 output tokens):
 
 | | B70 TTFT | B70 decode | Arc 140V TTFT | Arc 140V decode | GSM8K (1319, thinking, B70) |
 | --- | --- | --- | --- | --- | --- |
-| TernSYCL (this branch) | 107-111 ms | 46.4-47.6 tok/s | 657 ms | 8.20-8.33 tok/s | 96.9% (41 min) |
+| TernSYCL `feature_cleanup_sycl` (this branch) | 107-108 ms | 47.5 tok/s | 665 ms | 8.30-8.36 tok/s | 96.7% (44 min) |
+| TernSYCL 35fb3e8 (IGC builtins) | 107-111 ms | 46.4-47.6 tok/s | 657 ms | 8.20-8.33 tok/s | 96.9% (41 min) |
 | previous XeTLA kernels | 183 ms | 46.3 tok/s | 993 ms | 8.17 tok/s | 96.7% (90 min) |
+
+The `ternsycl` submodule tracks TernSYCL's `feature_cleanup_sycl`: pure SYCL
+kernels whose Xe2 instructions (DPAS, 2D block I/O) are inline-vISA helpers, no
+OpenCL / IGC builtins. Run in the same session, 35fb3e8 and
+`feature_cleanup_sycl` give byte-identical text.
 
 ---
 
@@ -61,7 +67,8 @@ bash "$DEST/ternsycl_vllm_plugin/utils/setup_fresh.sh" "$DEST"
 `setup_fresh.sh` (re-runnable, skips finished steps):
 
 1. initialises the `ternsycl` submodule
-   ([libxsmm/TernSYCL](https://github.com/libxsmm/TernSYCL): kernel headers);
+   ([libxsmm/TernSYCL](https://github.com/libxsmm/TernSYCL) `feature_cleanup_sycl`:
+   kernel headers);
 2. creates `ternsycl_vllm_plugin/.venv` (Python 3.12 via uv);
 3. clones upstream `vllm-project/vllm` at **v0.30.0** into
    `ternsycl_vllm_plugin/vllm` (no patch needed);
@@ -71,6 +78,19 @@ bash "$DEST/ternsycl_vllm_plugin/utils/setup_fresh.sh" "$DEST"
    launchers and the TernSYCL kernels, compiled ahead of time for
    `bmg-g31,lnl-m`) and the `vllm.general_plugins` entry point
    `ternsycl_model`.
+
+After the submodule moves to another TernSYCL commit, rebuild from a clean
+tree: setuptools does not track the headers, so `python setup.py install`
+reuses the old objects otherwise.
+
+```bash
+cd "$DEST/ternsycl_vllm_plugin" && git submodule update --init ternsycl
+rm -rf build && .venv/bin/python setup.py install
+```
+
+Do not link with TernSYCL's `-ze-opt-large-register-file`: in this extension it
+applies to every kernel (the Hadamard kernel too) and costs ~9% decode on the
+B70.
 
 Sanity check (needs a GPU; on SLURM prefix with `srun --jobid=<id> --overlap`):
 
@@ -208,7 +228,8 @@ each):
 
 | Kernels | TTFT | decode |
 | --- | --- | --- |
-| TernSYCL (this branch) | 656-657 ms | 8.20-8.33 tok/s |
+| TernSYCL `feature_cleanup_sycl` (this branch) | 665-666 ms | 8.30-8.36 tok/s |
+| TernSYCL 35fb3e8 (IGC builtins) | 652-657 ms | 8.20-8.45 tok/s |
 | previous XeTLA kernels | 992-993 ms | 8.17 tok/s |
 
 The TernSYCL text on the Arc 140V is identical to the B70 text.
@@ -279,7 +300,8 @@ Bonsai 2 27B, B70, all 1319 GSM8K test problems:
 
 | Kernels | exact match (strict) | flexible extract | wall time |
 | --- | --- | --- | --- |
-| TernSYCL (this branch) | **96.89%** (1278/1319, ±0.48) | 96.82% | 41 min |
+| TernSYCL `feature_cleanup_sycl` (this branch) | **96.66%** (1275/1319, ±0.49) | 96.66% | 44 min |
+| TernSYCL 35fb3e8 (IGC builtins) | 96.89% (1278/1319, ±0.48) | 96.82% | 41 min |
 | previous XeTLA kernels | 96.7% (1276/1319) | | 90 min |
 
 The model card reports the math group (GSM8K/MATH-500/AIME, thinking mode) at

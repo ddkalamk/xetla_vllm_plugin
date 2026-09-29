@@ -1,3 +1,4 @@
 [submodule "ternsycl"]
 	path = ternsycl
 	url = https://github.com/libxsmm/TernSYCL.git
+	branch = feature_cleanup_sycl
